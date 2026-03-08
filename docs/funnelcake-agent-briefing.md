@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-27
 **Service:** `divine-moderation-service` (Cloudflare Worker, deployed)
-**Base URL:** `https://moderation.admin.divine.video`
+**Base URL:** `https://moderation-api.divine.video`
 
 ---
 
@@ -18,7 +18,7 @@ The divine-moderation-service now produces three layers of classification data f
 
 Pre-formatted for gorse/funnelcake. Returns labels, features, description, and safety info in one call.
 
-**Auth:** Cloudflare Zero Trust JWT (`cf-access-client-id` + `cf-access-client-secret` headers), or set `ALLOW_DEV_ACCESS=true` on the worker for local dev.
+**Auth:** `Authorization: Bearer $SERVICE_API_TOKEN`. Requests forwarded through Cloudflare Access may also use `cf-access-jwt-assertion`. For local dev, set `ALLOW_DEV_ACCESS=true`.
 
 **Response:**
 ```json
@@ -221,13 +221,12 @@ When funnelcake sees a new kind 34236 video event on `wss://relay.divine.video`:
 
 ## Authentication
 
-All `/api/v1/*` endpoints (except `/check-result`) require Cloudflare Zero Trust JWT.
+All `/api/v1/*` endpoints (except `/check-result`) require a bearer token or a Cloudflare Access JWT.
 
-For service-to-service auth, use a Cloudflare Access service token:
+For service-to-service auth, use the worker's bearer token:
 ```bash
-curl -H "cf-access-client-id: $CF_CLIENT_ID" \
-     -H "cf-access-client-secret: $CF_CLIENT_SECRET" \
-     "https://moderation.admin.divine.video/api/v1/classifier/{sha256}/recommendations"
+curl -H "Authorization: Bearer $SERVICE_API_TOKEN" \
+     "https://moderation-api.divine.video/api/v1/classifier/{sha256}/recommendations"
 ```
 
 For local development with `ALLOW_DEV_ACCESS=true`:

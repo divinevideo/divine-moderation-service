@@ -10,6 +10,10 @@ import path from 'path';
 
 const CHECKPOINT_FILE = '.backfill-checkpoint.json';
 
+function getApiToken(options = {}) {
+  return options.apiToken || process.env.MODERATION_API_TOKEN || process.env.SERVICE_API_TOKEN || null;
+}
+
 /**
  * Load checkpoint from disk
  */
@@ -151,16 +155,23 @@ async function checkModerated(sha256, workerUrl) {
   }
 
   const data = await response.json();
-  return data.moderation !== null;
+  return data.moderated === true;
 }
 
 /**
  * Queue video for moderation
  */
-async function queueModeration(sha256, workerUrl) {
+async function queueModeration(sha256, workerUrl, apiToken) {
+  if (!apiToken) {
+    throw new Error('Missing API token. Set SERVICE_API_TOKEN or pass --token before queueing moderation.');
+  }
+
   const response = await fetch(`${workerUrl}/test-moderate`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiToken}`
+    },
     body: JSON.stringify({ sha256 })
   });
 
@@ -177,7 +188,7 @@ async function queueModeration(sha256, workerUrl) {
 async function backfillModeration(options = {}) {
   const {
     relayUrl = 'wss://relay.divine.video',
-    workerUrl = 'https://divine-moderation-service.protestnet.workers.dev',
+    workerUrl = 'https://moderation-api.divine.video',
     batchSize = 100,
     maxTotal = null,
     since = null,
@@ -186,6 +197,11 @@ async function backfillModeration(options = {}) {
     resume = true,
     countOnly = false
   } = options;
+  const apiToken = getApiToken(options);
+
+  if (!dryRun && !countOnly && !apiToken) {
+    throw new Error('Missing API token. Set SERVICE_API_TOKEN or MODERATION_API_TOKEN, or pass --token.');
+  }
 
   // Try to load checkpoint
   let checkpoint = null;
@@ -273,7 +289,7 @@ async function backfillModeration(options = {}) {
             globalStats.needsModeration++;
 
             if (!dryRun) {
-              await queueModeration(video.sha256, workerUrl);
+              await queueModeration(video.sha256, workerUrl, apiToken);
               globalStats.queued++;
               console.log(`[BACKFILL] ⏩ ${video.sha256.substring(0, 16)}... queued for moderation`);
 
@@ -391,6 +407,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     } else if (args[i] === '--worker' && args[i + 1]) {
       options.workerUrl = args[i + 1];
       i++;
+    } else if (args[i] === '--token' && args[i + 1]) {
+      options.apiToken = args[i + 1];
+      i++;
     } else if (args[i] === '--dry-run') {
       options.dryRun = true;
     } else if (args[i] === '--count-only') {
@@ -411,7 +430,8 @@ Options:
   --since <timestamp>   Unix timestamp (exact seconds) - only fetch events after this time
   --until <timestamp>   Unix timestamp (exact seconds) - only fetch events before this time
   --relay <url>         Nostr relay URL (default: wss://relay.divine.video)
-  --worker <url>        Worker URL (default: https://divine-moderation-service.protestnet.workers.dev)
+  --worker <url>        API URL (default: https://moderation-api.divine.video)
+  --token <token>       Bearer token for authenticated API endpoints
   --dry-run             Check what would be moderated without actually queuing
   --count-only          Just count total videos, skip moderation checks (fast)
   --no-resume           Start from beginning, ignore saved checkpoint
@@ -431,7 +451,7 @@ Examples:
   node scripts/backfill-moderation.mjs --max-total 500 --dry-run
 
   # Process all videos (will auto-resume if interrupted)
-  node scripts/backfill-moderation.mjs
+  SERVICE_API_TOKEN=... node scripts/backfill-moderation.mjs
 
   # Process from specific timestamp (e.g., Dec 1, 2024 = 1733011200)
   node scripts/backfill-moderation.mjs --since 1733011200

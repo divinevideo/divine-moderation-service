@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-27
 **Service:** `divine-moderation-service` (Cloudflare Worker)
-**Base URL:** `https://moderation.admin.divine.video`
+**Base URL:** `https://moderation-api.divine.video`
 
 ---
 
@@ -12,13 +12,12 @@
 
 **Purpose:** Returns full Hive AI classifier data for a video — all 75+ moderation classes with per-frame confidence scores, scene classification (IAB categories), and VTT topic extraction.
 
-**Authentication:** Cloudflare Zero Trust JWT (`cf-access-jwt-assertion` header). In dev, set `ALLOW_DEV_ACCESS=true`.
+**Authentication:** `Authorization: Bearer $SERVICE_API_TOKEN`. Requests forwarded through Cloudflare Access may also use `cf-access-jwt-assertion`. In dev, set `ALLOW_DEV_ACCESS=true`.
 
 ```bash
 # Production
-curl -H "cf-access-client-id: $CF_CLIENT_ID" \
-     -H "cf-access-client-secret: $CF_CLIENT_SECRET" \
-     "https://moderation.admin.divine.video/api/v1/classifier/abc123def456..."
+curl -H "Authorization: Bearer $SERVICE_API_TOKEN" \
+     "https://moderation-api.divine.video/api/v1/classifier/abc123def456..."
 
 # Development
 curl "http://localhost:8787/api/v1/classifier/abc123def456..."
@@ -92,7 +91,8 @@ curl "http://localhost:8787/api/v1/classifier/abc123def456..."
 **Purpose:** Returns classification data pre-formatted for recommendation systems.
 
 ```bash
-curl "https://moderation.admin.divine.video/api/v1/classifier/abc123.../recommendations"
+curl -H "Authorization: Bearer $SERVICE_API_TOKEN" \
+     "https://moderation-api.divine.video/api/v1/classifier/abc123.../recommendations"
 ```
 
 **Response (200):**
@@ -124,7 +124,7 @@ curl "https://moderation.admin.divine.video/api/v1/classifier/abc123.../recommen
 **Purpose:** Returns the moderation action and safety scores. No auth required.
 
 ```bash
-curl "https://moderation.admin.divine.video/check-result/abc123def456..."
+curl "https://moderation-api.divine.video/check-result/abc123def456..."
 ```
 
 **Response (200):**

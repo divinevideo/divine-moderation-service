@@ -1,6 +1,6 @@
 # Cloudflare Access Setup
 
-This protects `admin.divine.video` and `*.admin.divine.video` with Cloudflare Access, allowing only `@divine.video` email addresses.
+This protects `moderation.admin.divine.video` with Cloudflare Access, allowing only `@divine.video` email addresses.
 
 ## Quick Setup
 
@@ -29,13 +29,12 @@ export CLOUDFLARE_API_TOKEN="your-api-token-here"
 
 ## What This Does
 
-1. **Creates an Access Application** for `admin.divine.video` (and all subdomains)
+1. **Creates an Access Application** for `moderation.admin.divine.video`
 2. **Creates an Access Policy** that allows all `@divine.video` email addresses
 3. Configures 24-hour session duration
 
-**Protected domains:**
-- `https://admin.divine.video`
-- `https://*.admin.divine.video` (any subdomain)
+**Protected domain:**
+- `https://moderation.admin.divine.video`
 
 ## After Running the Script
 
@@ -56,11 +55,11 @@ Or add:
 
 ### Set Up DNS
 
-Point `admin.divine.video` to your admin application:
+Point `moderation.admin.divine.video` to your admin application:
 
 ```bash
 # If using Cloudflare Workers:
-# Add a CNAME record: admin.divine.video → divine-moderation-service.protestnet.workers.dev
+# Add a route/CNAME for moderation.admin.divine.video to this worker
 
 # Or if using a custom origin server:
 # Add an A/AAAA record pointing to your server
@@ -68,7 +67,7 @@ Point `admin.divine.video` to your admin application:
 
 ### Test It
 
-1. Visit: https://admin.divine.video
+1. Visit: https://moderation.admin.divine.video/admin
 2. You'll be redirected to Cloudflare Access login
 3. Enter your `@divine.video` email
 4. Verify with the code sent to your email
@@ -76,8 +75,8 @@ Point `admin.divine.video` to your admin application:
 
 ## Other Domains (Not Protected)
 
-Only `admin.divine.video` and its subdomains are protected. Your other services remain publicly accessible:
-- `divine-moderation-service.protestnet.workers.dev` - Public moderation API
+Only `moderation.admin.divine.video` is protected. Your other services remain publicly accessible:
+- `moderation-api.divine.video` - Public and service-facing moderation API
 - `cdn.divine.video` - Public video CDN
 
 ## Optional: Remove Old Auth System

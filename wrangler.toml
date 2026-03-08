@@ -7,10 +7,10 @@ main = "src/index.mjs"
 compatibility_date = "2024-10-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Enable workers.dev subdomain for service-to-service bearer token auth
-workers_dev = true
+# Serve production traffic only on divine.video hostnames.
+workers_dev = false
 
-# Custom domain (requires divine.video zone in the same Cloudflare account)
+# Custom domains (requires divine.video zone in the same Cloudflare account)
 routes = [
   { pattern = "moderation.admin.divine.video/*", zone_name = "divine.video" }
 ]
@@ -91,6 +91,7 @@ RELAY_POLLING_LIMIT = "100"                       # Max events to fetch per poll
 crons = ["*/5 * * * *"]
 
 # Secrets (set with: wrangler secret put <NAME>)
+# SERVICE_API_TOKEN - bearer token for authenticated requests to moderation-api.divine.video
 # POLICY_AUD - Zero Trust application audience tag (from Access > Applications > moderation.admin.divine.video > Overview)
 # CF_ACCESS_CLIENT_ID - Cloudflare Access service token ID for relay.divine.video
 # CF_ACCESS_CLIENT_SECRET - Cloudflare Access service token secret for relay.divine.video

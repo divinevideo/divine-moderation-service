@@ -36,7 +36,7 @@ wrangler secret put ADMIN_PASSWORD_HASH
 wrangler deploy
 ```
 
-Done! Access at: `https://your-worker.workers.dev/admin`
+Done! Access at: `https://moderation.admin.divine.video/admin`
 
 ## Files Created
 

@@ -67,10 +67,10 @@ wrangler deploy
 Once deployed, access the dashboard at:
 
 ```
-https://divine-moderation-service.your-account.workers.dev/admin
+https://moderation.admin.divine.video/admin
 ```
 
-Or your custom domain if configured.
+For local development, use your Wrangler dev URL instead.
 
 ### Login
 

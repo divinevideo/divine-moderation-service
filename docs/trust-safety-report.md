@@ -233,7 +233,7 @@ Pre-formatted classification data for recommendation systems. Includes:
 Paginated list of moderation decisions. Useful for bulk audit/export.
 
 ### `GET /check-result/{sha256}` (public)
-Quick safety check — returns action, scores, and moderation status.
+Quick safety check — returns action, scores, and moderation status from `https://moderation-api.divine.video/check-result/{sha256}`.
 
 ---
 

@@ -40,6 +40,11 @@ const CATEGORY_TO_LABEL = {
   'gambling': { label: 'gambling', namespace: 'content-warning' }
 };
 
+const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
+const API_HOSTNAME = 'moderation-api.divine.video';
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+
 /**
  * Generate NIP-32 style label tags based on scores and human verifications
  * @param {Object} scores - AI-generated scores for each category
@@ -88,40 +93,321 @@ function generateNIP85Tags(scores, categoryVerifications = {}) {
   return tags;
 }
 
+function isLocalHostname(hostname) {
+  return LOCAL_HOSTNAMES.has(hostname) || hostname.endsWith('.localhost');
+}
+
+function isApiSurfacePath(pathname) {
+  return pathname === '/'
+    || pathname === '/health'
+    || pathname === '/test-moderate'
+    || pathname === '/test-kv'
+    || pathname.startsWith('/check-result/')
+    || pathname.startsWith('/api/v1/');
+}
+
+function isAdminSurfacePath(pathname) {
+  return pathname === '/' || pathname.startsWith('/admin');
+}
+
+function jsonError(message, status = 400) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    headers: JSON_HEADERS
+  });
+}
+
+function jsonResponse(status, data, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...JSON_HEADERS, ...headers }
+  });
+}
+
+function corsResponse(response) {
+  const headers = new Headers(response.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function getConfiguredBearerTokens(env) {
+  return [env.SERVICE_API_TOKEN, env.API_BEARER_TOKEN, env.MODERATION_API_KEY]
+    .filter((value, index, all) => typeof value === 'string' && value.length > 0 && all.indexOf(value) === index);
+}
+
+function hostMismatchResponse(requestId, hostname, pathname, expectedHost) {
+  console.log(`[${requestId}] Rejected ${pathname} on ${hostname}; expected ${expectedHost}`);
+  return jsonError(`Not found on ${hostname}. Use https://${expectedHost}${pathname}`, 404);
+}
+
+async function authenticateApiRequest(request, env) {
+  if (env.ALLOW_DEV_ACCESS === 'true') {
+    return { valid: true, email: 'dev@localhost', isServiceToken: false };
+  }
+
+  const authHeader = request.headers.get('Authorization');
+  const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  const configuredTokens = getConfiguredBearerTokens(env);
+  if (bearerToken && configuredTokens.includes(bearerToken)) {
+    return { valid: true, email: 'service@internal', isServiceToken: true };
+  }
+
+  const jwtToken = request.headers.get('cf-access-jwt-assertion');
+  if (jwtToken) {
+    try {
+      return await verifyZeroTrustJWT(jwtToken, env);
+    } catch (error) {
+      return { valid: false, error: error.message };
+    }
+  }
+
+  if (configuredTokens.length === 0) {
+    return { valid: false, error: 'No bearer token configured (SERVICE_API_TOKEN/API_BEARER_TOKEN/MODERATION_API_KEY)' };
+  }
+
+  return { valid: false, error: 'Missing bearer token or Cloudflare Access JWT' };
+}
+
+function apiUnauthorizedResponse(verification) {
+  return jsonError(`Unauthorized - ${verification.error}`, 401);
+}
+
+function authSourceFromVerification(verification) {
+  return verification.email
+    ? `user:${verification.email}`
+    : `service-token:${verification.payload?.sub || 'unknown'}`;
+}
+
+function verifyLegacyBearerAuth(request, env) {
+  const configuredTokens = getConfiguredBearerTokens(env);
+  if (configuredTokens.length === 0) {
+    console.error('[AUTH] No legacy bearer token configured');
+    return jsonResponse(500, { error: 'Server misconfigured — no auth token set' });
+  }
+
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return jsonResponse(401, { error: 'Missing Authorization: Bearer <token>' });
+  }
+
+  const token = authHeader.slice(7);
+  if (!configuredTokens.includes(token)) {
+    return jsonResponse(403, { error: 'Invalid token' });
+  }
+
+  return null;
+}
+
+async function handleLegacyScan(request, env) {
+  const body = await request.json();
+  const { sha256, url: videoUrl, source, pubkey, metadata } = body;
+
+  if (!sha256 || !/^[0-9a-f]{64}$/i.test(sha256)) {
+    return jsonResponse(400, { error: 'sha256 required (64 hex characters)' });
+  }
+
+  const hash = sha256.toLowerCase();
+  const existing = await env.BLOSSOM_DB.prepare(
+    'SELECT sha256, action FROM moderation_results WHERE sha256 = ?'
+  ).bind(hash).first();
+
+  if (existing) {
+    return jsonResponse(200, {
+      sha256: hash,
+      status: 'already_moderated',
+      action: existing.action,
+      queued: false
+    });
+  }
+
+  const resolvedVideoUrl = videoUrl || `https://media.divine.video/${hash}`;
+  await env.MODERATION_QUEUE.send({
+    sha256: hash,
+    r2Key: `blobs/${hash}`,
+    uploadedBy: pubkey || undefined,
+    uploadedAt: Date.now(),
+    metadata: {
+      ...(metadata || {}),
+      source: source || 'api',
+      videoUrl: resolvedVideoUrl
+    }
+  });
+
+  console.log(`[SCAN] Queued ${hash} from ${source || 'api'}`);
+  return jsonResponse(202, {
+    sha256: hash,
+    status: 'queued',
+    queued: true,
+    videoUrl: resolvedVideoUrl
+  });
+}
+
+async function handleLegacyBatchScan(request, env) {
+  const body = await request.json();
+  const { videos, source: defaultSource } = body;
+
+  if (!Array.isArray(videos) || videos.length === 0) {
+    return jsonResponse(400, { error: 'videos array required' });
+  }
+
+  if (videos.length > 100) {
+    return jsonResponse(400, { error: 'Maximum 100 videos per batch' });
+  }
+
+  const results = [];
+  let queued = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const video of videos) {
+    const { sha256, url: videoUrl, source, pubkey, metadata } = video;
+
+    if (!sha256 || !/^[0-9a-f]{64}$/i.test(sha256)) {
+      results.push({ sha256, status: 'error', error: 'Invalid sha256' });
+      errors++;
+      continue;
+    }
+
+    const hash = sha256.toLowerCase();
+    const existing = await env.BLOSSOM_DB.prepare(
+      'SELECT sha256, action FROM moderation_results WHERE sha256 = ?'
+    ).bind(hash).first();
+
+    if (existing) {
+      results.push({ sha256: hash, status: 'already_moderated', action: existing.action });
+      skipped++;
+      continue;
+    }
+
+    const resolvedVideoUrl = videoUrl || `https://media.divine.video/${hash}`;
+    await env.MODERATION_QUEUE.send({
+      sha256: hash,
+      r2Key: `blobs/${hash}`,
+      uploadedBy: pubkey || undefined,
+      uploadedAt: Date.now(),
+      metadata: {
+        ...(metadata || {}),
+        source: source || defaultSource || 'batch-api',
+        videoUrl: resolvedVideoUrl
+      }
+    });
+
+    results.push({ sha256: hash, status: 'queued' });
+    queued++;
+  }
+
+  console.log(`[BATCH] Queued ${queued}, skipped ${skipped}, errors ${errors}`);
+  return jsonResponse(202, {
+    total: videos.length,
+    queued,
+    skipped,
+    errors,
+    results
+  });
+}
+
+async function handleLegacyStatus(sha256, env) {
+  if (!sha256 || !/^[0-9a-f]{64}$/i.test(sha256)) {
+    return jsonResponse(400, { error: 'Invalid sha256' });
+  }
+
+  const hash = sha256.toLowerCase();
+  const result = await env.BLOSSOM_DB.prepare(`
+    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at
+    FROM moderation_results
+    WHERE sha256 = ?
+  `).bind(hash).first();
+
+  if (!result) {
+    return jsonResponse(200, {
+      sha256: hash,
+      moderated: false,
+      action: null,
+      message: 'No moderation result found'
+    });
+  }
+
+  return jsonResponse(200, {
+    sha256: hash,
+    moderated: true,
+    action: result.action,
+    provider: result.provider,
+    scores: result.scores ? JSON.parse(result.scores) : null,
+    categories: result.categories ? JSON.parse(result.categories) : null,
+    moderated_at: result.moderated_at,
+    reviewed_by: result.reviewed_by,
+    reviewed_at: result.reviewed_at,
+    blocked: result.action === 'PERMANENT_BAN',
+    age_restricted: result.action === 'AGE_RESTRICTED',
+    needs_review: result.action === 'REVIEW'
+  });
+}
+
 export default {
   /**
    * HTTP handler for testing and admin dashboard
    */
   async fetch(request, env) {
-    // Ensure offender tracking table exists (idempotent)
-    await initOffenderTable(env.BLOSSOM_DB);
-
     const url = new URL(request.url);
     const startTime = Date.now();
     const requestId = crypto.randomUUID().substring(0, 8);
+    const hostname = url.hostname;
+    const isLocalRequest = isLocalHostname(hostname);
 
     // Log all incoming requests
     console.log(`[${requestId}] ${request.method} ${url.pathname}${url.search ? '?' + url.search.substring(0, 100) : ''}`);
 
-    // Block unauthenticated requests on workers.dev (bypass CF Access)
-    // Requests via custom domain go through CF Access at the edge.
-    // Workers.dev requests must include a valid Bearer token.
-    const hostname = url.hostname;
+    // Do not expose the workers.dev hostname in production.
     if (hostname.endsWith('.workers.dev')) {
-      const authHeader = request.headers.get('Authorization');
-      const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-      const isHealthCheck = url.pathname === '/health' || url.pathname === '/';
-      if (!isHealthCheck && (!token || !env.SERVICE_API_TOKEN || token !== env.SERVICE_API_TOKEN)) {
-        console.log(`[${requestId}] Blocked unauthenticated workers.dev request to ${url.pathname}`);
-        return new Response(JSON.stringify({ error: 'Unauthorized — Bearer token required' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+      console.log(`[${requestId}] Rejected workers.dev request to ${url.pathname}`);
+      return new Response('Not Found', { status: 404 });
+    }
+
+    if (!isLocalRequest && hostname !== API_HOSTNAME && hostname !== ADMIN_HOSTNAME) {
+      console.log(`[${requestId}] Rejected unknown hostname ${hostname}`);
+      return new Response('Not Found', { status: 404 });
+    }
+
+    if (!isLocalRequest && hostname === ADMIN_HOSTNAME) {
+      if (url.pathname === '/') {
+        return Response.redirect(`${url.origin}/admin`, 302);
+      }
+
+      if (!isAdminSurfacePath(url.pathname)) {
+        const expectedHost = isApiSurfacePath(url.pathname) ? API_HOSTNAME : ADMIN_HOSTNAME;
+        return hostMismatchResponse(requestId, hostname, url.pathname, expectedHost);
       }
     }
 
+    if (!isLocalRequest && hostname === API_HOSTNAME && !isApiSurfacePath(url.pathname)) {
+      const expectedHost = url.pathname.startsWith('/admin') ? ADMIN_HOSTNAME : API_HOSTNAME;
+      return hostMismatchResponse(requestId, hostname, url.pathname, expectedHost);
+    }
+
+    // Ensure offender tracking table exists (idempotent)
+    await initOffenderTable(env.BLOSSOM_DB);
+
     // Ensure reports table exists
     await initReportsTable(env.BLOSSOM_DB);
+
+    if (url.pathname === '/health') {
+      return corsResponse(jsonResponse(200, {
+        status: 'ok',
+        service: hostname === API_HOSTNAME || isLocalRequest ? 'divine-moderation-api' : 'divine-moderation-service',
+        timestamp: new Date().toISOString(),
+        hostname
+      }));
+    }
+
+    if (request.method === 'OPTIONS' && url.pathname.startsWith('/api/v1/')) {
+      return corsResponse(new Response(null, { status: 204 }));
+    }
 
     // Admin dashboard routes
     if (url.pathname === '/admin' || url.pathname === '/admin/') {
@@ -1081,6 +1367,11 @@ export default {
 
     // Test endpoint to manually trigger moderation
     if (url.pathname === '/test-moderate' && request.method === 'POST') {
+      const verification = await authenticateApiRequest(request, env);
+      if (!verification.valid) {
+        return apiUnauthorizedResponse(verification);
+      }
+
       const body = await request.json();
       const { sha256, force } = body;
 
@@ -1105,6 +1396,11 @@ export default {
 
     // Test KV write
     if (url.pathname === '/test-kv') {
+      const verification = await authenticateApiRequest(request, env);
+      if (!verification.valid) {
+        return apiUnauthorizedResponse(verification);
+      }
+
       try {
         await env.MODERATION_KV.put('test-key', JSON.stringify({ test: true, timestamp: Date.now() }));
         const readBack = await env.MODERATION_KV.get('test-key');
@@ -1474,23 +1770,49 @@ async function runMigration() {
     }
 
     // API: Submit a user report for a piece of content (NIP-56)
-    // Auth: Verify Zero Trust JWT using jose library
-    if (url.pathname === '/api/v1/report' && request.method === 'POST') {
-      let verification = { valid: false, error: 'Not verified' };
+    // Auth: Bearer token or Cloudflare Access JWT
+    if (url.pathname === '/api/v1/scan' && request.method === 'POST') {
+      const authError = verifyLegacyBearerAuth(request, env);
+      if (authError) return corsResponse(authError);
 
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        const jwtToken = request.headers.get('cf-access-jwt-assertion');
-        verification = await verifyZeroTrustJWT(jwtToken, env);
+      try {
+        return corsResponse(await handleLegacyScan(request, env));
+      } catch (error) {
+        console.error('[SCAN] Error:', error);
+        return corsResponse(jsonResponse(500, { error: error.message }));
       }
+    }
 
+    if (url.pathname === '/api/v1/batch-scan' && request.method === 'POST') {
+      const authError = verifyLegacyBearerAuth(request, env);
+      if (authError) return corsResponse(authError);
+
+      try {
+        return corsResponse(await handleLegacyBatchScan(request, env));
+      } catch (error) {
+        console.error('[BATCH] Error:', error);
+        return corsResponse(jsonResponse(500, { error: error.message }));
+      }
+    }
+
+    if (url.pathname.startsWith('/api/v1/status/') && request.method === 'GET') {
+      const authError = verifyLegacyBearerAuth(request, env);
+      if (authError) return corsResponse(authError);
+
+      try {
+        const sha256 = url.pathname.split('/')[4];
+        return corsResponse(await handleLegacyStatus(sha256, env));
+      } catch (error) {
+        console.error('[STATUS] Error:', error);
+        return corsResponse(jsonResponse(500, { error: error.message }));
+      }
+    }
+
+    if (url.pathname === '/api/v1/report' && request.method === 'POST') {
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        console.log(`[API] JWT verification failed for /api/v1/report: ${verification.error}`);
-        return new Response(JSON.stringify({ error: `Unauthorized - ${verification.error}` }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        console.log(`[API] Authentication failed for /api/v1/report: ${verification.error}`);
+        return apiUnauthorizedResponse(verification);
       }
 
       try {
@@ -1520,35 +1842,16 @@ async function runMigration() {
     }
 
     // API: Update moderation status (for external services)
-    // Auth: Verify Zero Trust JWT using jose library
+    // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname === '/api/v1/moderate' && request.method === 'POST') {
-      let verification = { valid: false, error: 'Not verified' };
-
-      // In development without Zero Trust, allow if explicitly configured
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        console.log('[API] Development mode - bypassing JWT verification');
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        const jwtToken = request.headers.get('cf-access-jwt-assertion');
-
-        // Verify JWT signature, issuer, and audience
-        verification = await verifyZeroTrustJWT(jwtToken, env);
-      }
-
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        console.log(`[API] JWT verification failed: ${verification.error}`);
-        return new Response(JSON.stringify({
-          error: `Unauthorized - ${verification.error}`
-        }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        console.log(`[API] Authentication failed: ${verification.error}`);
+        return apiUnauthorizedResponse(verification);
       }
 
       // Determine auth source for logging
-      const authSource = verification.email
-        ? `user:${verification.email}`
-        : `service-token:${verification.payload?.sub || 'unknown'}`;
+      const authSource = authSourceFromVerification(verification);
 
       try {
         const body = await request.json();
@@ -1666,27 +1969,11 @@ async function runMigration() {
     }
 
     // API: Moderation decisions list (for divine-relay-manager integration)
-    // Auth: Verify Zero Trust JWT
+    // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname === '/api/v1/decisions' && request.method === 'GET') {
-      let verification = { valid: false, error: 'Not verified' };
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        const jwtToken = request.headers.get('cf-access-jwt-assertion');
-        if (jwtToken) {
-          try {
-            verification = await verifyZeroTrustJWT(jwtToken, env);
-          } catch (e) {
-            verification = { valid: false, error: e.message };
-          }
-        }
-      }
-
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        return new Response(JSON.stringify({ error: 'Authentication required' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return apiUnauthorizedResponse(verification);
       }
 
       try {
@@ -1744,7 +2031,7 @@ async function runMigration() {
     }
 
     // API: Single moderation decision lookup (for divine-relay-manager integration)
-    // Auth: Verify Zero Trust JWT
+    // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname.startsWith('/api/v1/decisions/') && request.method === 'GET') {
       const sha256 = url.pathname.split('/')[4];
 
@@ -1755,25 +2042,9 @@ async function runMigration() {
         });
       }
 
-      let verification = { valid: false, error: 'Not verified' };
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        const jwtToken = request.headers.get('cf-access-jwt-assertion');
-        if (jwtToken) {
-          try {
-            verification = await verifyZeroTrustJWT(jwtToken, env);
-          } catch (e) {
-            verification = { valid: false, error: e.message };
-          }
-        }
-      }
-
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        return new Response(JSON.stringify({ error: 'Authentication required' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return apiUnauthorizedResponse(verification);
       }
 
       try {
@@ -1805,7 +2076,7 @@ async function runMigration() {
     }
 
     // API: Quarantine/unquarantine content
-    // Auth: Verify Zero Trust JWT
+    // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname.startsWith('/api/v1/quarantine/') && request.method === 'POST') {
       const sha256 = url.pathname.split('/')[4];
 
@@ -1816,25 +2087,9 @@ async function runMigration() {
         });
       }
 
-      let verification = { valid: false, error: 'Not verified' };
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        const jwtToken = request.headers.get('cf-access-jwt-assertion');
-        if (jwtToken) {
-          try {
-            verification = await verifyZeroTrustJWT(jwtToken, env);
-          } catch (e) {
-            verification = { valid: false, error: e.message };
-          }
-        }
-      }
-
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        return new Response(JSON.stringify({ error: 'Authentication required' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return apiUnauthorizedResponse(verification);
       }
 
       try {
@@ -1842,9 +2097,7 @@ async function runMigration() {
         const { quarantine, reason } = body;
         const newAction = quarantine === false ? 'REVIEW' : 'QUARANTINE';
 
-        const authSource = verification.email
-          ? `user:${verification.email}`
-          : `service-token:${verification.payload?.sub || 'unknown'}`;
+        const authSource = authSourceFromVerification(verification);
 
         // Update D1
         await env.BLOSSOM_DB.prepare(`
@@ -1897,30 +2150,9 @@ async function runMigration() {
     // API: Classify-only endpoint — run VLM classification without full moderation
     // Used by funnelcake janitor for bulk backfill of ~21k existing videos
     if (url.pathname === '/api/v1/classify' && request.method === 'POST') {
-      // Require authentication (Zero Trust JWT, bearer token, or dev access)
-      let verification = { valid: false, error: 'Not verified' };
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        const authHeader = request.headers.get('Authorization');
-        if (authHeader && authHeader.startsWith('Bearer ') && env.SERVICE_API_TOKEN) {
-          const token = authHeader.slice(7);
-          if (token === env.SERVICE_API_TOKEN) {
-            verification = { valid: true, email: 'service@internal', isServiceToken: true };
-          }
-        }
-        if (!verification.valid) {
-          try {
-            verification = await verifyZeroTrustJWT(request, env);
-          } catch (e) {
-            verification = { valid: false, error: e.message };
-          }
-        }
-      }
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        return new Response(JSON.stringify({ error: 'Unauthorized' }), {
-          status: 401, headers: { 'Content-Type': 'application/json' }
-        });
+        return apiUnauthorizedResponse(verification);
       }
 
       try {
@@ -1980,7 +2212,7 @@ async function runMigration() {
     }
 
     // API: Classifier endpoints for recommendation system data
-    // Auth: Verify Zero Trust JWT for access control
+    // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname.startsWith('/api/v1/classifier/')) {
       // Parse the path segments: /api/v1/classifier/{sha256}[/recommendations]
       const pathParts = url.pathname.split('/').filter(Boolean);
@@ -1995,37 +2227,9 @@ async function runMigration() {
         });
       }
 
-      // Require authentication (Zero Trust JWT, bearer token, or dev access)
-      let verification = { valid: false, error: 'Not verified' };
-      if (env.ALLOW_DEV_ACCESS === 'true') {
-        verification = { valid: true, email: 'dev@localhost', isServiceToken: false };
-      } else {
-        // Check bearer token auth first (for service-to-service calls via workers.dev)
-        const authHeader = request.headers.get('Authorization');
-        if (authHeader && authHeader.startsWith('Bearer ') && env.SERVICE_API_TOKEN) {
-          const token = authHeader.slice(7);
-          if (token === env.SERVICE_API_TOKEN) {
-            verification = { valid: true, email: 'service@internal', isServiceToken: true };
-          }
-        }
-        // Fall back to Zero Trust JWT (for requests via CF Access edge)
-        if (!verification.valid) {
-          const jwtToken = request.headers.get('cf-access-jwt-assertion');
-          if (jwtToken) {
-            try {
-              verification = await verifyZeroTrustJWT(jwtToken, env);
-            } catch (e) {
-              verification = { valid: false, error: e.message };
-            }
-          }
-        }
-      }
-
+      const verification = await authenticateApiRequest(request, env);
       if (!verification.valid) {
-        return new Response(JSON.stringify({ error: 'Authentication required' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' }
-        });
+        return apiUnauthorizedResponse(verification);
       }
 
       try {
@@ -2115,7 +2319,7 @@ async function runMigration() {
       }
     }
 
-    return new Response('Divine Moderation Service\n\nEndpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /check-result/{sha256}\nGET  /api/v1/decisions (authenticated - paginated moderation decisions)\nGET  /api/v1/decisions/{sha256} (authenticated - single decision lookup)\nPOST /api/v1/quarantine/{sha256} (authenticated - quarantine/unquarantine)\nGET  /api/v1/classifier/{sha256} (authenticated - all classification layers)\nGET  /api/v1/classifier/{sha256}/recommendations (authenticated - pre-formatted for gorse/funnelcake)\nGET  /admin (password protected)', {
+    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/report\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
       headers: { 'Content-Type': 'text/plain' }
     });
   },
@@ -2442,4 +2646,3 @@ async function notifyBlossom(sha256, action, env) {
     return { success: false, error: error.message };
   }
 }
-

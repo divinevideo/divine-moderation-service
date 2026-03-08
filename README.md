@@ -53,6 +53,7 @@ wrangler kv:namespace create MODERATION_KV
 wrangler queues create video-moderation-queue
 
 # Set secrets
+wrangler secret put SERVICE_API_TOKEN         # Bearer token for moderation-api.divine.video
 wrangler secret put CF_ACCESS_CLIENT_ID        # Cloudflare Access service token ID
 wrangler secret put CF_ACCESS_CLIENT_SECRET    # Cloudflare Access service token secret
 wrangler secret put SIGHTENGINE_API_USER
@@ -65,6 +66,10 @@ wrangler secret put FARO_RELAY_URL
 # Deploy
 wrangler deploy
 ```
+
+Production hostnames:
+- `https://moderation-api.divine.video` for public and service-facing API routes
+- `https://moderation.admin.divine.video` for the admin dashboard behind Cloudflare Access
 
 ### Configuration
 

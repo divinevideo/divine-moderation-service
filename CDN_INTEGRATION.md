@@ -514,7 +514,7 @@ wrangler tail divine-moderation-service
 
 ```bash
 # Check moderation result
-curl https://your-cdn.workers.dev/check-result/abc123...
+curl https://moderation-api.divine.video/check-result/abc123...
 
 # Or use wrangler
 wrangler kv:key get --namespace-id=eee0... "moderation:abc123..."
