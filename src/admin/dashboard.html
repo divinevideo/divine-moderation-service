@@ -3633,20 +3633,25 @@
       });
     }
 
-    // Toggle mute on video click
-    function toggleMute(video) {
-      video.muted = !video.muted;
-      // Update the mute indicator
-      const card = video.closest('.video-card');
-      if (card) {
-        const indicator = card.querySelector('.mute-indicator');
-        if (indicator) {
-          indicator.textContent = video.muted ? '🔇 Click for sound' : '🔊 Sound on';
-        }
+    // Save mute preference when user changes it via native controls
+    function setupMutePreference(video) {
+      if (video.dataset.muteHandler) return;
+      video.dataset.muteHandler = 'true';
+
+      video.addEventListener('volumechange', function() {
+        localStorage.setItem('divine-mod-muted', video.muted);
+      });
+    }
+
+    // Apply saved mute preference (call in response to user gesture)
+    function applySavedMutePreference(video) {
+      const pref = localStorage.getItem('divine-mod-muted');
+      if (pref === 'false') {
+        video.muted = false;
       }
     }
 
-    // Auto-pause other videos when one starts playing
+    // Auto-pause other videos when one starts playing, apply mute preference on interaction
     function setupVideoPauseHandlers() {
       const videos = document.querySelectorAll('video');
 
@@ -3664,6 +3669,15 @@
             }
           });
         });
+
+        // Apply saved mute preference on user click (counts as user gesture,
+        // so browser allows unmuting). Hover-autoplay stays muted.
+        video.addEventListener('click', function() {
+          applySavedMutePreference(video);
+        });
+
+        // Save preference when user mutes/unmutes via native controls
+        setupMutePreference(video);
       });
     }
 
