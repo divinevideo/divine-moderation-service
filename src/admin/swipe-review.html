@@ -909,7 +909,7 @@
       return `
         <div class="transcript-panel-header">
           <span class="transcript-panel-title">Transcript</span>
-          ${transcriptText ? `<button onclick="copyTranscript(this, '${escapeHtml(transcriptData.sha256)}')" style="background: none; border: 1px solid #555; color: #aaa; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">📋 Copy</button>` : ''}
+          ${transcriptText ? `<button data-sha256="${escapeHtml(transcriptData.sha256)}" onclick="copyTranscript(this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">📋 Copy</button>` : ''}
           <a class="transcript-panel-link" href="${escapeHtml(transcriptData.subtitleUrl)}" target="_blank" rel="noopener noreferrer">Open VTT</a>
         </div>
         ${body}
@@ -1459,16 +1459,22 @@
       }).catch(() => { /* clipboard not available */ });
     }
 
-    function copyTranscript(btn, sha256) {
-      const cached = transcriptCache.get(sha256);
-      if (!cached) return;
-      cached.then(data => {
-        if (!data?.transcriptText) return;
-        navigator.clipboard.writeText(data.transcriptText).then(() => {
-          btn.textContent = '✓ Copied';
+    async function copyTranscript(btn) {
+      const sha256 = btn.dataset.sha256;
+      try {
+        const data = await (transcriptCache.get(sha256) || fetchTranscriptData(sha256));
+        if (!data?.transcriptText) {
+          btn.textContent = '✗ None';
           setTimeout(() => { btn.textContent = '📋 Copy'; }, 1500);
-        }).catch(() => { /* clipboard not available */ });
-      });
+          return;
+        }
+        await navigator.clipboard.writeText(data.transcriptText);
+        btn.textContent = '✓ Copied';
+        setTimeout(() => { btn.textContent = '📋 Copy'; }, 1500);
+      } catch {
+        btn.textContent = '✗ Error';
+        setTimeout(() => { btn.textContent = '📋 Copy'; }, 1500);
+      }
     }
 
     function logout() {

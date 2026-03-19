@@ -2088,7 +2088,7 @@
           <div class="transcript-panel-header">
             <span class="transcript-panel-title">Transcript</span>
             <div class="transcript-panel-links">
-              ${transcriptText ? `<button onclick="copyTranscriptText('${sha256}', this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">📋 Copy</button>` : ''}
+              ${transcriptText ? `<button data-sha256="${sha256}" onclick="copyTranscriptText(this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;">📋 Copy</button>` : ''}
               <a href="${transcriptData.subtitleUrl}" target="_blank" rel="noopener noreferrer">Open VTT</a>
             </div>
           </div>
@@ -3552,7 +3552,7 @@
         html += '<div class="classifier-panel">'
           + '<div class="classifier-panel-header" onclick="toggleClassifierPanel(\'transcript-' + sha256 + '\')">'
           + '<span class="classifier-panel-title">Transcript Analysis</span>'
-          + (topics.has_speech ? '<button onclick="event.stopPropagation(); copyTranscriptText(\'' + sha256 + '\', this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: auto; margin-right: 8px;" title="Copy transcript text">📋 Copy</button>' : '')
+          + (topics.has_speech ? '<button data-sha256="' + sha256 + '" onclick="event.stopPropagation(); copyTranscriptText(this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: auto; margin-right: 8px;" title="Copy transcript text">📋 Copy</button>' : '')
           + '<span class="classifier-panel-toggle" id="toggle-transcript-' + sha256 + '">&#9660;</span>'
           + '</div>'
           + '<div class="classifier-panel-body" id="body-transcript-' + sha256 + '">'
@@ -3627,7 +3627,7 @@
             <div class="classifier-panel">
               <div class="classifier-panel-header" onclick="toggleClassifierPanel('transcript-${sha256}')">
                 <span class="classifier-panel-title">Transcript Analysis</span>
-                ${topics.has_speech ? `<button onclick="event.stopPropagation(); copyTranscriptText('${sha256}', this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: auto; margin-right: 8px;" title="Copy transcript text">📋 Copy</button>` : ''}
+                ${topics.has_speech ? `<button data-sha256="${sha256}" onclick="event.stopPropagation(); copyTranscriptText(this)" style="background: none; border: 1px solid #555; color: #aaa; padding: 1px 6px; border-radius: 3px; cursor: pointer; font-size: 10px; margin-left: auto; margin-right: 8px;" title="Copy transcript text">📋 Copy</button>` : ''}
                 <span class="classifier-panel-toggle" id="toggle-transcript-${sha256}">▼</span>
               </div>
               <div class="classifier-panel-body" id="body-transcript-${sha256}">
@@ -3913,7 +3913,8 @@
       }).catch(() => { /* clipboard not available */ });
     }
 
-    async function copyTranscriptText(sha256, btn) {
+    async function copyTranscriptText(btn) {
+      const sha256 = btn.dataset.sha256;
       try {
         const data = await fetchTranscriptData(sha256);
         if (!data?.transcriptText) {
