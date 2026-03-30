@@ -309,6 +309,17 @@ describe('DM Sender - Error Handling', () => {
     expect(result.sent).toBe(false);
   });
 
+  it('should not throw when options is explicitly null', async () => {
+    const env = {};
+    const ctx = { waitUntil: vi.fn() };
+
+    const result = await sendModerationDM('b'.repeat(64), 'c'.repeat(64), 'PERMANENT_BAN', 'test', env, ctx, null);
+    expect(result).toBeDefined();
+    expect(result.sent).toBe(false);
+    // Should fail gracefully (no keys configured) rather than TypeError on null destructuring
+    expect(result.reason).toContain('NOSTR_PRIVATE_KEY');
+  });
+
   it('should not throw when relay connection fails', async () => {
     const mockKV = {
       get: vi.fn().mockResolvedValue(null),

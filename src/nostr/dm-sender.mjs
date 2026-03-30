@@ -536,7 +536,7 @@ function publishToSingleRelay(event, relayUrl, env) {
  * @returns {Promise<{ sent: boolean, reason?: string }>}
  */
 export async function sendModerationDM(recipientPubkey, sha256, action, reason, env, ctx, options = {}) {
-  const { categories = null, title = null, publishedAt = null } = options;
+  const { categories = null, title = null, publishedAt = null } = options || {};
   try {
     // Validate inputs
     if (!recipientPubkey || typeof recipientPubkey !== 'string') {
