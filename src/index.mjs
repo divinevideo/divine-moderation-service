@@ -1515,7 +1515,7 @@ export default {
 
       // Notify reporters who filed reports on this content (non-blocking)
       const { notifyReporters } = await import('./nostr/dm-sender.mjs');
-      notifyReporters(sha256, action, env, '[ADMIN]').catch(() => {});
+      notifyReporters(sha256, action, env, '[ADMIN]');
 
       // Notify ATProto labeler of manual override
       notifyAtprotoLabeler({ sha256, action, scores: updated.scores || {}, reviewed_by: 'admin' }, env).catch(err => {
@@ -3542,7 +3542,7 @@ async function runMigration() {
 
                   // Notify reporters
                   const { notifyReporters: notifyCronReporters } = await import('./nostr/dm-sender.mjs');
-                  notifyCronReporters(sha256, 'PERMANENT_BAN', env, '[CRON]').catch(() => {});
+                  notifyCronReporters(sha256, 'PERMANENT_BAN', env, '[CRON]');
 
                   // Mark escalation complete so cron doesn't retry
                   const rdCached = await env.MODERATION_KV.get(`rd:${sha256}`);
@@ -3651,7 +3651,7 @@ async function handleModerationResult(result, env) {
 
   // Notify reporters who filed reports on this content (non-blocking)
   const { notifyReporters: notifyReportersOfOutcome } = await import('./nostr/dm-sender.mjs');
-  notifyReportersOfOutcome(sha256, action, env, '[MODERATION]').catch(() => {});
+  notifyReportersOfOutcome(sha256, action, env, '[MODERATION]');
 
   // Write normalized moderation labels to ClickHouse
   try {
