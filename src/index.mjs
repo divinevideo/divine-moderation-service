@@ -1463,6 +1463,17 @@ export default {
 
       if (!blossomResult.success && !blossomResult.skipped) {
         console.warn(`[ADMIN] Blossom notification failed: ${blossomResult.error}`);
+        return new Response(JSON.stringify({
+          success: false,
+          sha256,
+          action,
+          previousAction,
+          blossom_notified: false,
+          error: `Moderation recorded but media server did not confirm: ${blossomResult.error}`,
+        }), {
+          status: 502,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
 
       // Publish kind 1984 (NIP-56) report for non-SAFE actions so human moderation
@@ -2787,10 +2798,23 @@ async function runMigration() {
         console.log(`[API] Moderation updated: ${sha256} -> ${action} by ${source || 'external-api'} (auth: ${authSource})`);
 
         // Notify divine-blossom of the moderation decision
-        // This is fire-and-forget - we don't fail the request if blossom notification fails
         const blossomResult = await notifyBlossom(sha256, action.toUpperCase(), env);
+
+        // If Blossom notification failed (and wasn't skipped), return 502.
+        // The D1 record is written but enforcement didn't land.
         if (!blossomResult.success && !blossomResult.skipped) {
           console.warn(`[API] Blossom notification failed but moderation was recorded: ${blossomResult.error}`);
+          return new Response(JSON.stringify({
+            success: false,
+            sha256,
+            action: action.toUpperCase(),
+            updated_at: new Date().toISOString(),
+            blossom_notified: false,
+            error: `Moderation recorded but media server did not confirm: ${blossomResult.error}`,
+          }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' }
+          });
         }
 
         return new Response(JSON.stringify({

@@ -733,6 +733,113 @@ describe('notifyBlossom integration via admin moderate endpoint', () => {
       globalThis.fetch = origFetch;
     }
   });
+
+  it('returns 502 when Blossom webhook fails for /api/v1/moderate', async () => {
+    const kvStore = new Map();
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      SERVICE_API_TOKEN: 'test-service-token',
+      BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      BLOSSOM_DB: createDbMock({ moderationResults: new Map() }),
+      MODERATION_KV: {
+        store: kvStore,
+        async get(key) { return kvStore.get(key) ?? null; },
+        async put(key, value) { kvStore.set(key, value); },
+        async delete(key) { kvStore.delete(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (url === 'https://mock-blossom.test/admin/moderate') {
+        return new Response('Service Unavailable', { status: 503 });
+      }
+      return origFetch(url, init);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation-api.divine.video/api/v1/moderate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer test-service-token',
+          },
+          body: JSON.stringify({
+            sha256: 'abc123',
+            action: 'AGE_RESTRICTED',
+            reason: 'test age restrict',
+            source: 'relay-manager',
+          }),
+        }),
+        env
+      );
+
+      expect(response.status).toBe(502);
+      const data = await response.json();
+      expect(data.success).toBe(false);
+      expect(data.blossom_notified).toBe(false);
+      expect(data.action).toBe('AGE_RESTRICTED');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('returns 200 when Blossom webhook succeeds for /api/v1/moderate', async () => {
+    const kvStore = new Map();
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      SERVICE_API_TOKEN: 'test-service-token',
+      BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      BLOSSOM_DB: createDbMock({ moderationResults: new Map() }),
+      MODERATION_KV: {
+        store: kvStore,
+        async get(key) { return kvStore.get(key) ?? null; },
+        async put(key, value) { kvStore.set(key, value); },
+        async delete(key) { kvStore.delete(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (url === 'https://mock-blossom.test/admin/moderate') {
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      return origFetch(url, init);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation-api.divine.video/api/v1/moderate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer test-service-token',
+          },
+          body: JSON.stringify({
+            sha256: 'abc123',
+            action: 'AGE_RESTRICTED',
+            reason: 'test',
+            source: 'relay-manager',
+          }),
+        }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      const data = await response.json();
+      expect(data.success).toBe(true);
+      expect(data.blossom_notified).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
 });
 
 describe('DM exclusion for QUARANTINE via admin moderate', () => {
