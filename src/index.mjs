@@ -3052,6 +3052,23 @@ async function runMigration() {
         // Notify Blossom (relay notification removed — see comment in admin moderate handler)
         const blossomResult = await notifyBlossom(sha256, newAction, env);
 
+        // If Blossom notification failed (and wasn't skipped), return 502.
+        // The D1/KV records are written but enforcement didn't land.
+        if (!blossomResult.success && !blossomResult.skipped) {
+          console.warn(`[API] Blossom notification failed for quarantine ${sha256}: ${blossomResult.error}`);
+          return new Response(JSON.stringify({
+            success: false,
+            sha256,
+            action: newAction,
+            updated_at: new Date().toISOString(),
+            blossom_notified: false,
+            error: `Quarantine recorded but media server did not confirm: ${blossomResult.error}`,
+          }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
         console.log(`[API] Quarantine updated: ${sha256} -> ${newAction} by ${authSource}`);
 
         return new Response(JSON.stringify({
