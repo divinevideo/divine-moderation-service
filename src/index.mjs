@@ -1454,13 +1454,6 @@ export default {
       // Notify Blossom of the moderation decision.
       const blossomResult = await notifyBlossom(sha256, action, env);
 
-      // For PERMANENT_BAN: also delete the event from the relay (funnelcake).
-      // This is critical for externally-hosted content where Blossom can't enforce the ban.
-      let relayDeleteResult = null;
-      if (action === 'PERMANENT_BAN') {
-        relayDeleteResult = await deleteEventFromRelayBySha256(sha256, env, 'admin-moderate');
-      }
-
       if (!blossomResult.success && !blossomResult.skipped) {
         console.warn(`[ADMIN] Blossom notification failed: ${blossomResult.error}`);
         return new Response(JSON.stringify({
@@ -1474,6 +1467,13 @@ export default {
           status: 502,
           headers: { 'Content-Type': 'application/json' }
         });
+      }
+
+      // For PERMANENT_BAN: also delete the event from the relay (funnelcake),
+      // but only after Blossom confirms enforcement to avoid partial moderation.
+      let relayDeleteResult = null;
+      if (action === 'PERMANENT_BAN') {
+        relayDeleteResult = await deleteEventFromRelayBySha256(sha256, env, 'admin-moderate');
       }
 
       // Publish kind 1984 (NIP-56) report for non-SAFE actions so human moderation
