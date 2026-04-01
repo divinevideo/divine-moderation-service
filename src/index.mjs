@@ -9,6 +9,7 @@ import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
 import { publishToFaro, publishToContentRelay, publishLabelEvent } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
+import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
 import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
@@ -22,8 +23,11 @@ import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforc
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
 import { getKVThresholds, setKVThresholds, DEFAULT_THRESHOLDS } from './moderation/classifier.mjs';
+import { isValidSha256, isValidLookupIdentifier, isValidPubkey, parseMaybeJson, getEventTagValue, parseImetaParams, extractShaFromUrl, extractMediaShaFromEvent } from './validation.mjs';
 import { parseVttText } from './moderation/text-classifier.mjs';
 import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
+import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
+import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 /**
  * NIP-32 label mapping for content categories
  * Maps internal category names to NIP-32/NIP-56 compatible labels
@@ -47,7 +51,7 @@ const CATEGORY_TO_LABEL = {
 const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
 const API_HOSTNAME = 'moderation-api.divine.video';
 const DEFAULT_RELAY_ADMIN_URL = 'https://relay.admin.divine.video';
-const JSON_HEADERS = { 'Content-Type': 'application/json' };
+const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 /**
@@ -141,151 +145,9 @@ function corsResponse(response) {
   });
 }
 
-function getConfiguredBearerTokens(env) {
-  return [env.SERVICE_API_TOKEN, env.API_BEARER_TOKEN, env.MODERATION_API_KEY]
-    .filter((value, index, all) => typeof value === 'string' && value.length > 0 && all.indexOf(value) === index);
-}
-
 function hostMismatchResponse(requestId, hostname, pathname, expectedHost) {
   console.log(`[${requestId}] Rejected ${pathname} on ${hostname}; expected ${expectedHost}`);
   return jsonError(`Not found on ${hostname}. Use https://${expectedHost}${pathname}`, 404);
-}
-
-async function authenticateApiRequest(request, env) {
-  if (env.ALLOW_DEV_ACCESS === 'true') {
-    return { valid: true, email: 'dev@localhost', isServiceToken: false };
-  }
-
-  const authHeader = request.headers.get('Authorization');
-  const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  const configuredTokens = getConfiguredBearerTokens(env);
-  if (bearerToken && configuredTokens.includes(bearerToken)) {
-    return { valid: true, email: 'service@internal', isServiceToken: true };
-  }
-
-  const jwtToken = request.headers.get('cf-access-jwt-assertion');
-  if (jwtToken) {
-    try {
-      return await verifyZeroTrustJWT(jwtToken, env);
-    } catch (error) {
-      return { valid: false, error: error.message };
-    }
-  }
-
-  if (configuredTokens.length === 0) {
-    return { valid: false, error: 'No bearer token configured (SERVICE_API_TOKEN/API_BEARER_TOKEN/MODERATION_API_KEY)' };
-  }
-
-  return { valid: false, error: 'Missing bearer token or Cloudflare Access JWT' };
-}
-
-function apiUnauthorizedResponse(verification) {
-  return jsonError(`Unauthorized - ${verification.error}`, 401);
-}
-
-function authSourceFromVerification(verification) {
-  return verification.email
-    ? `user:${verification.email}`
-    : `service-token:${verification.payload?.sub || 'unknown'}`;
-}
-
-function verifyLegacyBearerAuth(request, env) {
-  const configuredTokens = getConfiguredBearerTokens(env);
-  if (configuredTokens.length === 0) {
-    console.error('[AUTH] No legacy bearer token configured');
-    return jsonResponse(500, { error: 'Server misconfigured — no auth token set' });
-  }
-
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return jsonResponse(401, { error: 'Missing Authorization: Bearer <token>' });
-  }
-
-  const token = authHeader.slice(7);
-  if (!configuredTokens.includes(token)) {
-    return jsonResponse(403, { error: 'Invalid token' });
-  }
-
-  return null;
-}
-
-function isValidSha256(value) {
-  return typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value);
-}
-
-function isValidLookupIdentifier(value) {
-  return typeof value === 'string' && value.length > 0 && value.length <= 255;
-}
-
-function isValidPubkey(value) {
-  return isValidSha256(value);
-}
-
-function parseMaybeJson(value, fallback) {
-  if (value == null) {
-    return fallback;
-  }
-
-  if (typeof value === 'string') {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return fallback;
-    }
-  }
-
-  return value;
-}
-
-function getEventTagValue(tags, key) {
-  return tags?.find((tag) => tag[0] === key)?.[1] || null;
-}
-
-function parseImetaParams(tags) {
-  const imetaTag = tags?.find((tag) => tag[0] === 'imeta');
-  if (!imetaTag) {
-    return {};
-  }
-
-  const params = {};
-  for (let i = 1; i < imetaTag.length; i++) {
-    const entry = imetaTag[i];
-    if (!entry || typeof entry !== 'string') {
-      continue;
-    }
-
-    const separatorIndex = entry.indexOf(' ');
-    if (separatorIndex === -1) {
-      continue;
-    }
-
-    const key = entry.slice(0, separatorIndex);
-    const value = entry.slice(separatorIndex + 1).trim();
-    if (key && value) {
-      params[key] = value;
-    }
-  }
-
-  return params;
-}
-
-function extractShaFromUrl(url) {
-  if (typeof url !== 'string') {
-    return null;
-  }
-
-  const match = url.match(/[0-9a-f]{64}/i);
-  return match ? match[0].toLowerCase() : null;
-}
-
-function extractMediaShaFromEvent(event) {
-  const tags = event?.tags || [];
-  const imeta = parseImetaParams(tags);
-  return extractShaFromUrl(imeta.x)
-    || extractShaFromUrl(getEventTagValue(tags, 'x'))
-    || extractShaFromUrl(imeta.url)
-    || extractShaFromUrl(getEventTagValue(tags, 'url'))
-    || null;
 }
 
 function buildFunnelcakeVideoLookup(eventResponse, identifier) {
@@ -350,7 +212,7 @@ function mergeLookupMetadata(baseVideo, funnelcakeVideo) {
 
   return {
     ...baseVideo,
-    cdnUrl: baseVideo.cdnUrl || funnelcakeVideo.videoUrl || baseVideo.cdnUrl,
+    cdnUrl: funnelcakeVideo.videoUrl || baseVideo.cdnUrl || null,
     thumbnailUrl: baseVideo.thumbnailUrl || funnelcakeVideo.thumbnailUrl || null,
     uploaded_by: baseVideo.uploaded_by || funnelcakeVideo.uploadedBy || null,
     divineUrl: funnelcakeVideo.divineUrl || baseVideo.divineUrl,
@@ -379,9 +241,6 @@ function getRelayAdminHeaders(env) {
   return headers;
 }
 
-function getNostrLookupRelays(env) {
-  return env.NOSTR_RELAY_URL ? [env.NOSTR_RELAY_URL] : ['wss://relay.divine.video'];
-}
 
 function getTranscriptSourceUrl(sha256, env) {
   return `https://${env.CDN_DOMAIN || 'media.divine.video'}/${sha256}.vtt`;
@@ -436,63 +295,88 @@ async function callRelayAdminAction(env, payload) {
   return data;
 }
 
-/**
- * Look up the Nostr event for a SHA256 and delete it from the relay.
- * Used to enforce PERMANENT_BAN on content that may be hosted externally.
- */
-async function deleteEventFromRelayBySha256(sha256, env, source = 'unknown') {
-  try {
-    const event = await fetchNostrEventBySha256(sha256, getNostrLookupRelays(env), env);
-    if (!event?.id) {
-      console.log(`[RELAY-ENFORCE] ${sha256} - No relay event found, skipping delete`);
-      return { success: false, reason: 'no_event_found' };
-    }
-
-    const result = await callRelayAdminAction(env, {
-      action: 'delete_event',
-      eventId: event.id,
-      reason: `PERMANENT_BAN enforcement (${source})`
-    });
-    console.log(`[RELAY-ENFORCE] ${sha256} - Deleted event ${event.id} from relay`);
-    return { success: true, eventId: event.id, result };
-  } catch (error) {
-    console.error(`[RELAY-ENFORCE] ${sha256} - Failed to delete from relay:`, error.message);
-    return { success: false, error: error.message };
-  }
-}
-
-async function deleteRelayEventVersions(eventId, sha256, env, reason) {
-  const fallbackEventId = isValidSha256(eventId) ? eventId : null;
-  const events = await fetchNostrVideoEventsByDTag(sha256, getNostrLookupRelays(env), env);
-  const uniqueEventIds = [...new Set([
-    ...events.map((event) => event?.id).filter(isValidSha256),
-    fallbackEventId
-  ].filter(Boolean))];
+async function deleteRelayEventIds(eventIds, env, reason) {
+  const uniqueEventIds = [...new Set(
+    (eventIds || []).filter((eventId) => typeof eventId === 'string' && isValidSha256(eventId))
+  )];
 
   if (uniqueEventIds.length === 0) {
     return {
       success: false,
-      attemptedCount: 0,
+      reason: 'no_event_found',
+      eventId: null,
+      eventIds: [],
       deletedCount: 0,
-      deletedEventIds: [],
-      reason: 'no_event_found'
+      attemptedCount: 0,
+      failures: []
     };
   }
 
-  for (const id of uniqueEventIds) {
-    await callRelayAdminAction(env, {
-      action: 'delete_event',
-      eventId: id,
-      reason
-    });
+  const deletedEventIds = [];
+  const failures = [];
+
+  for (const eventId of uniqueEventIds) {
+    try {
+      await callRelayAdminAction(env, {
+        action: 'delete_event',
+        eventId,
+        reason
+      });
+      deletedEventIds.push(eventId);
+    } catch (error) {
+      failures.push({
+        eventId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
   }
 
   return {
-    success: true,
+    success: failures.length === 0,
+    eventId: deletedEventIds[0] || uniqueEventIds[0],
+    eventIds: deletedEventIds,
+    deletedCount: deletedEventIds.length,
     attemptedCount: uniqueEventIds.length,
-    deletedCount: uniqueEventIds.length,
-    deletedEventIds: uniqueEventIds
+    failures
   };
+}
+
+/**
+ * Look up all Nostr event versions for a SHA256 d-tag and delete them from the relay.
+ * Used to enforce PERMANENT_BAN on content that may be hosted externally.
+ */
+async function deleteEventFromRelayBySha256(sha256, env, source = 'unknown', reasonOverride = null) {
+  try {
+    const events = await fetchNostrVideoEventsByDTag(sha256, ['wss://relay.divine.video'], env, { limit: 50 });
+    const fallbackEvent = events.length === 0
+      ? await fetchNostrEventBySha256(sha256, ['wss://relay.divine.video'], env)
+      : null;
+    const eventIds = events.length > 0
+      ? events.map((event) => event?.id)
+      : [fallbackEvent?.id];
+
+    if (eventIds.filter(Boolean).length === 0) {
+      console.log(`[RELAY-ENFORCE] ${sha256} - No relay events found for d-tag, skipping delete`);
+      return { success: false, reason: 'no_event_found' };
+    }
+
+    const result = await deleteRelayEventIds(
+      eventIds,
+      env,
+      reasonOverride || `PERMANENT_BAN enforcement (${source})`
+    );
+
+    if (result.success) {
+      console.log(`[RELAY-ENFORCE] ${sha256} - Deleted ${result.deletedCount}/${result.attemptedCount} relay event version(s)`);
+    } else {
+      console.warn(`[RELAY-ENFORCE] ${sha256} - Partial relay delete ${result.deletedCount}/${result.attemptedCount}`, result.failures);
+    }
+
+    return result;
+  } catch (error) {
+    console.error(`[RELAY-ENFORCE] ${sha256} - Failed to delete from relay:`, error.message);
+    return { success: false, error: error.message };
+  }
 }
 
 async function fetchLookupNostrContext(hash, env) {
@@ -602,7 +486,7 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
         previousAction: kvModeration?.previousAction || null,
         detailedCategories: parseMaybeJson(kvModeration?.detailedCategories, null),
         categoryVerifications: parseMaybeJson(kvModeration?.categoryVerifications, {}) || {},
-        cdnUrl
+        cdnUrl: kvModeration?.cdnUrl || cdnUrl
       }, env);
     }
 
@@ -968,24 +852,37 @@ export default {
       console.log(`[${requestId}] Fetching videos: filter=${actionFilter}, limit=${limit}, offset=${offset}`);
 
       // Build SQL query based on filter
-      let whereClause = '';
+      let conditions = [];
       const params = [];
 
       if (actionFilter === 'FLAGGED') {
-        whereClause = "WHERE action IN ('REVIEW', 'AGE_RESTRICTED', 'PERMANENT_BAN') AND reviewed_by IS NULL";
+        conditions.push("action IN ('REVIEW', 'AGE_RESTRICTED', 'PERMANENT_BAN') AND reviewed_by IS NULL");
       } else if (actionFilter === 'QUARANTINE') {
-        whereClause = "WHERE action IN ('AGE_RESTRICTED', 'PERMANENT_BAN') AND reviewed_by IS NULL";
+        conditions.push("action IN ('AGE_RESTRICTED', 'PERMANENT_BAN') AND reviewed_by IS NULL");
       } else if (actionFilter !== 'all') {
-        whereClause = 'WHERE action = ?';
+        conditions.push('action = ?');
         params.push(actionFilter.toUpperCase());
       }
+
+      // Date filter — exclude old test content from review queues
+      const sinceParam = url.searchParams.get('since');
+      if (sinceParam) {
+        conditions.push('moderated_at >= ?');
+        params.push(sinceParam);
+      }
+
+      const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+      // Sort order — 'oldest' fetches from the back of the queue
+      const sortParam = url.searchParams.get('sort');
+      const orderDirection = sortParam === 'oldest' ? 'ASC' : 'DESC';
 
       // Query D1 with pagination
       const query = `
         SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, uploaded_by
         FROM moderation_results
         ${whereClause}
-        ORDER BY moderated_at DESC
+        ORDER BY moderated_at ${orderDirection}
         LIMIT ? OFFSET ?
       `;
       params.push(limit + 1, offset); // Fetch one extra to check if more exist
@@ -1019,7 +916,7 @@ export default {
         hasMore,
         nextOffset: hasMore ? offset + limit : null
       }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: JSON_HEADERS
       });
     }
 
@@ -1034,7 +931,7 @@ export default {
 
       try {
         // All stats from D1 - fast SQL queries instead of KV iteration
-        const [totalResult, moderationStats] = await Promise.all([
+        const [totalResult, moderationStats, pendingStats] = await Promise.all([
           // Total videos (excluding deleted/error)
           env.BLOSSOM_DB.prepare(`
             SELECT COUNT(DISTINCT sha256) as total
@@ -1042,19 +939,28 @@ export default {
             WHERE sha256 IS NOT NULL
               AND status_name NOT IN ('error', 'deleted')
           `).first(),
-          // Moderation breakdown by action
+          // Moderation breakdown by action (all, for "Total Moderated" and "Safe" cards)
           env.BLOSSOM_DB.prepare(`
             SELECT
               action,
               COUNT(*) as count
             FROM moderation_results
             GROUP BY action
+          `).all(),
+          // Pending review breakdown (unreviewed, for "AI Flagged" and queue counts)
+          env.BLOSSOM_DB.prepare(`
+            SELECT
+              action,
+              COUNT(*) as count
+            FROM moderation_results
+            WHERE reviewed_by IS NULL
+            GROUP BY action
           `).all()
         ]);
 
         const totalInD1 = totalResult?.total || 0;
 
-        // Parse moderation stats
+        // Parse total moderation stats
         let totalModerated = 0;
         let safeCount = 0;
         let reviewCount = 0;
@@ -1072,21 +978,45 @@ export default {
           }
         }
 
+        // Parse pending review stats (items not yet reviewed by a human)
+        let pendingReviewCount = 0;
+        let pendingQuarantineCount = 0;
+        let pendingAgeRestrictedCount = 0;
+        let pendingPermanentBanCount = 0;
+
+        for (const row of (pendingStats?.results || [])) {
+          const count = row.count || 0;
+          switch (row.action) {
+            case 'REVIEW': pendingReviewCount = count; break;
+            case 'QUARANTINE': pendingQuarantineCount = count; break;
+            case 'AGE_RESTRICTED': pendingAgeRestrictedCount = count; break;
+            case 'PERMANENT_BAN': pendingPermanentBanCount = count; break;
+          }
+        }
+
+        const pendingFlagged = pendingReviewCount + pendingQuarantineCount + pendingAgeRestrictedCount + pendingPermanentBanCount;
         const untriaged = Math.max(0, totalInD1 - totalModerated);
 
-        console.log(`[${requestId}] Stats: total=${totalInD1}, moderated=${totalModerated}, untriaged=${untriaged}, safe=${safeCount}, review=${reviewCount} in ${Date.now() - startTime}ms`);
+        console.log(`[${requestId}] Stats: total=${totalInD1}, moderated=${totalModerated}, untriaged=${untriaged}, pendingFlagged=${pendingFlagged} in ${Date.now() - startTime}ms`);
         return new Response(JSON.stringify({
           totalInD1,
           totalModerated,
           untriaged,
+          pendingFlagged,
           breakdown: {
             safe: safeCount,
             review: reviewCount,
             ageRestricted: ageRestrictedCount,
             permanentBan: permanentBanCount
+          },
+          pending: {
+            review: pendingReviewCount,
+            quarantine: pendingQuarantineCount,
+            ageRestricted: pendingAgeRestrictedCount,
+            permanentBan: pendingPermanentBanCount
           }
         }), {
-          headers: { 'Content-Type': 'application/json' }
+          headers: JSON_HEADERS
         });
       } catch (error) {
         console.error(`[${requestId}] Failed to get stats:`, error);
@@ -1202,7 +1132,7 @@ export default {
           limit,
           hasMore: offset + limit < (countResult?.total || 0)
         }), {
-          headers: { 'Content-Type': 'application/json' }
+          headers: JSON_HEADERS
         });
       } catch (error) {
         console.error('[ADMIN] Failed to fetch untriaged videos:', error);
@@ -1321,12 +1251,20 @@ export default {
       const moderatorEmail = getAuthenticatedUser(request) || 'admin';
       const reason = body.reason || `Deleted by moderator ${moderatorEmail}`;
       const relayResult = isValidSha256(body.sha256)
-        ? await deleteRelayEventVersions(eventId, body.sha256, env, reason)
-        : await callRelayAdminAction(env, {
-          action: 'delete_event',
+        ? await deleteEventFromRelayBySha256(body.sha256, env, 'admin-delete-event', reason)
+        : await deleteRelayEventIds([eventId], env, reason);
+
+      if (!relayResult.success) {
+        return new Response(JSON.stringify({
+          success: false,
           eventId,
-          reason
+          relayResult,
+          error: relayResult.error || relayResult.reason || 'Failed to delete relay event'
+        }), {
+          status: 502,
+          headers: { 'Content-Type': 'application/json' }
         });
+      }
 
       return new Response(JSON.stringify({
         success: true,
@@ -1465,7 +1403,12 @@ export default {
           reviewed_by = excluded.reviewed_by,
           reviewed_at = excluded.reviewed_at,
           review_notes = excluded.review_notes,
-          uploaded_by = COALESCE(moderation_results.uploaded_by, excluded.uploaded_by)
+          uploaded_by = COALESCE(moderation_results.uploaded_by, excluded.uploaded_by),
+          title = COALESCE(moderation_results.title, excluded.title),
+          author = COALESCE(moderation_results.author, excluded.author),
+          event_id = COALESCE(moderation_results.event_id, excluded.event_id),
+          content_url = COALESCE(moderation_results.content_url, excluded.content_url),
+          published_at = COALESCE(moderation_results.published_at, excluded.published_at)
       `).bind(
         sha256,
         action,
@@ -1514,15 +1457,16 @@ export default {
       // Notify Blossom of the moderation decision.
       const blossomResult = await notifyBlossom(sha256, action, env);
 
-      // For PERMANENT_BAN: also delete the event from the relay (funnelcake).
-      // This is critical for externally-hosted content where Blossom can't enforce the ban.
+      if (!blossomResult.success && !blossomResult.skipped) {
+        console.warn(`[ADMIN] Blossom notification failed: ${blossomResult.error}`);
+        return blossomFailureResponse(sha256, action, blossomResult.error);
+      }
+
+      // For PERMANENT_BAN: also delete the event from the relay (funnelcake),
+      // but only after Blossom confirms enforcement to avoid partial moderation.
       let relayDeleteResult = null;
       if (action === 'PERMANENT_BAN') {
         relayDeleteResult = await deleteEventFromRelayBySha256(sha256, env, 'admin-moderate');
-      }
-
-      if (!blossomResult.success && !blossomResult.skipped) {
-        console.warn(`[ADMIN] Blossom notification failed: ${blossomResult.error}`);
       }
 
       // Publish kind 1984 (NIP-56) report for non-SAFE actions so human moderation
@@ -1564,11 +1508,11 @@ export default {
         try {
           // Look up uploaded_by from D1
           const uploaderRow = await env.BLOSSOM_DB.prepare(
-            'SELECT uploaded_by, categories FROM moderation_results WHERE sha256 = ?'
+            'SELECT uploaded_by, categories, title, published_at FROM moderation_results WHERE sha256 = ?'
           ).bind(sha256).first();
           if (uploaderRow?.uploaded_by) {
             const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
-            await sendModerationDM(uploaderRow.uploaded_by, sha256, action, reason || 'Manual moderator action', env, null, uploaderRow?.categories);
+            await sendModerationDM(uploaderRow.uploaded_by, sha256, action, reason || 'Manual moderator action', env, null, { categories: uploaderRow?.categories, title: uploaderRow?.title, publishedAt: uploaderRow?.published_at });
             dmSent = true;
             console.log(`[ADMIN] DM sent to creator ${uploaderRow.uploaded_by.substring(0, 16)}...`);
           }
@@ -1577,6 +1521,9 @@ export default {
         }
       }
 
+      // Notify reporters who filed reports on this content (non-blocking)
+      const { notifyReporters } = await import('./nostr/dm-sender.mjs');
+      notifyReporters(sha256, action, env, '[ADMIN]');
       // Notify ATProto labeler of manual override
       notifyAtprotoLabeler({ sha256, action, scores: updated.scores || {}, reviewed_by: 'admin' }, env).catch(err => {
         console.error('[ADMIN] ATProto labeler notification failed:', err.message);
@@ -2640,6 +2587,22 @@ async function runMigration() {
       return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
     }
 
+    if (url.pathname === '/admin/api/classic-vines/rollback' && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      try {
+        const body = await request.json();
+        const result = await runClassicVineRollback(body, env, {
+          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env)
+        });
+        return jsonResponse(200, result);
+      } catch (error) {
+        console.error('[CLASSIC-VINES] Rollback error:', error);
+        return jsonResponse(error.status || 500, { error: error.message });
+      }
+    }
+
     // API: Submit a user report for a piece of content (NIP-56)
     // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname === '/api/v1/scan' && request.method === 'POST') {
@@ -2712,6 +2675,80 @@ async function runMigration() {
       }
     }
 
+    // API: Send DM notification only (no Blossom/D1 moderation side effects)
+    // Used by relay-manager to notify users after NIP-86 moderation actions
+    // Auth: Bearer token or Cloudflare Access JWT
+    if (url.pathname === '/api/v1/notify' && request.method === 'POST') {
+      const verification = await authenticateApiRequest(request, env);
+      if (!verification.valid) {
+        console.log(`[API] Authentication failed for /api/v1/notify: ${verification.error}`);
+        return apiUnauthorizedResponse(verification);
+      }
+
+      try {
+        const body = await request.json();
+        const { recipientPubkey, action, reason, sha256, eventId } = body;
+
+        if (!isValidPubkey(recipientPubkey)) {
+          return new Response(JSON.stringify({ error: 'Valid recipientPubkey (64-char hex) required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        if (!action || typeof action !== 'string') {
+          return new Response(JSON.stringify({ error: 'action required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        const validNotifyActions = ['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'];
+        if (!validNotifyActions.includes(action)) {
+          return new Response(JSON.stringify({
+            error: `Invalid action. Must be one of: ${validNotifyActions.join(', ')}`
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        if (!env.NOSTR_PRIVATE_KEY) {
+          console.warn('[API] /api/v1/notify called but NOSTR_PRIVATE_KEY not configured');
+          return new Response(JSON.stringify({ success: true, dm_sent: false, reason: 'DM sending not configured' }), {
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
+        const dmResult = await sendModerationDM(
+          recipientPubkey,
+          sha256 || null,
+          action,
+          reason || null,
+          env,
+          null
+        );
+
+        const authSource = authSourceFromVerification(verification);
+        console.log(`[API] /api/v1/notify: action=${action} recipient=${recipientPubkey.substring(0, 16)}... dm_sent=${dmResult.sent} (auth: ${authSource})${eventId ? ` eventId=${eventId}` : ''}`);
+
+        return new Response(JSON.stringify({
+          success: true,
+          dm_sent: dmResult.sent,
+          reason: dmResult.reason || null
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (error) {
+        console.error('[API] Error in /api/v1/notify:', error);
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
     // API: Update moderation status (for external services)
     // Auth: Bearer token or Cloudflare Access JWT
     if (url.pathname === '/api/v1/moderate' && request.method === 'POST') {
@@ -2769,10 +2806,13 @@ async function runMigration() {
         console.log(`[API] Moderation updated: ${sha256} -> ${action} by ${source || 'external-api'} (auth: ${authSource})`);
 
         // Notify divine-blossom of the moderation decision
-        // This is fire-and-forget - we don't fail the request if blossom notification fails
         const blossomResult = await notifyBlossom(sha256, action.toUpperCase(), env);
+
+        // If Blossom notification failed (and wasn't skipped), return 502.
+        // The D1 record is written but enforcement didn't land.
         if (!blossomResult.success && !blossomResult.skipped) {
           console.warn(`[API] Blossom notification failed but moderation was recorded: ${blossomResult.error}`);
+          return blossomFailureResponse(sha256, action.toUpperCase(), blossomResult.error);
         }
 
         return new Response(JSON.stringify({
@@ -3009,6 +3049,13 @@ async function runMigration() {
 
         // Notify Blossom (relay notification removed — see comment in admin moderate handler)
         const blossomResult = await notifyBlossom(sha256, newAction, env);
+
+        // If Blossom notification failed (and wasn't skipped), return 502.
+        // The D1/KV records are written but enforcement didn't land.
+        if (!blossomResult.success && !blossomResult.skipped) {
+          console.warn(`[API] Blossom notification failed for quarantine ${sha256}: ${blossomResult.error}`);
+          return blossomFailureResponse(sha256, newAction, blossomResult.error);
+        }
 
         console.log(`[API] Quarantine updated: ${sha256} -> ${newAction} by ${authSource}`);
 
@@ -3315,8 +3362,9 @@ async function runMigration() {
         // Store result in D1
         await env.BLOSSOM_DB.prepare(`
           INSERT OR REPLACE INTO moderation_results
-          (sha256, action, provider, scores, categories, raw_response, moderated_at, uploaded_by)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (sha256, action, provider, scores, categories, raw_response, moderated_at, uploaded_by,
+           title, author, event_id, content_url, published_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).bind(
           sha256,
           result.action,
@@ -3325,7 +3373,12 @@ async function runMigration() {
           JSON.stringify(result.categories || []),
           JSON.stringify(result.rawResponse || {}),
           new Date().toISOString(),
-          result.uploadedBy || null
+          result.uploadedBy || null,
+          result.nostrContext?.title || null,
+          result.nostrContext?.author || null,
+          result.nostrEventId || null,
+          result.nostrContext?.url || result.cdnUrl || null,
+          result.nostrContext?.publishedAt || null
         ).run();
         console.log(`[MODERATION] Step 7: D1 write successful`);
 
@@ -3584,12 +3637,19 @@ async function runMigration() {
                   if (uploadedBy && env.NOSTR_PRIVATE_KEY) {
                     try {
                       const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
-                      await sendModerationDM(uploadedBy, sha256, 'PERMANENT_BAN', moderation.reason, env);
+                      const metaRow = await env.BLOSSOM_DB.prepare(
+                        'SELECT title, published_at FROM moderation_results WHERE sha256 = ?'
+                      ).bind(sha256).first();
+                      await sendModerationDM(uploadedBy, sha256, 'PERMANENT_BAN', moderation.reason, env, null, { title: metaRow?.title, publishedAt: metaRow?.published_at });
                       console.log(`[CRON] DM sent to creator for auto-escalated ${sha256}`);
                     } catch (dmErr) {
                       console.error(`[CRON] DM failed for ${sha256}:`, dmErr.message);
                     }
                   }
+
+                  // Notify reporters
+                  const { notifyReporters: notifyCronReporters } = await import('./nostr/dm-sender.mjs');
+                  notifyCronReporters(sha256, 'PERMANENT_BAN', env, '[CRON]');
 
                   // Mark escalation complete so cron doesn't retry
                   const rdCached = await env.MODERATION_KV.get(`rd:${sha256}`);
@@ -3634,29 +3694,21 @@ async function runMigration() {
  */
 async function handleModerationResult(result, env) {
   const { sha256, action, scores, reason, flaggedFrames, severity, cdnUrl, uploadedBy } = result;
+  const downstreamContext = buildDownstreamPublishContext(result);
 
   console.log(`[MODERATION] handleModerationResult called for ${sha256} with action ${action}`);
 
   // Publish Nostr notifications for flagged content
-  if (action !== 'SAFE') {
+  if (downstreamContext.publishReport) {
     try {
-      const reportData = {
-        type: action.toLowerCase().replace('_', '-'),
-        sha256,
-        cdnUrl,
-        category: result.category,
-        scores,
-        reason,
-        severity,
-        frames: flaggedFrames
-      };
+      const reportData = downstreamContext.reportData;
       await publishToFaro(reportData, env);
-      console.log(`[MODERATION] ${sha256} - Nostr ${action} event published to Faro`);
+      console.log(`[MODERATION] ${sha256} - Nostr ${reportData.type} event published to Faro`);
 
       // Also publish to content relay so it can stop serving flagged events
       try {
         await publishToContentRelay(reportData, env);
-        console.log(`[MODERATION] ${sha256} - Nostr ${action} event published to content relay`);
+        console.log(`[MODERATION] ${sha256} - Nostr ${reportData.type} event published to content relay`);
       } catch (relayError) {
         console.error(`[MODERATION] ${sha256} - Content relay publish failed:`, relayError);
       }
@@ -3689,17 +3741,21 @@ async function handleModerationResult(result, env) {
   if (['PERMANENT_BAN', 'AGE_RESTRICTED'].includes(action) && uploadedBy && env.NOSTR_PRIVATE_KEY) {
     try {
       const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
-      await sendModerationDM(uploadedBy, sha256, action, reason, env, null, result.categories);
+      await sendModerationDM(uploadedBy, sha256, action, reason, env, null, { categories: result.categories, title: result.nostrContext?.title, publishedAt: result.nostrContext?.publishedAt });
       console.log(`[MODERATION] ${sha256} - DM notification sent to creator ${uploadedBy.substring(0, 16)}...`);
     } catch (dmErr) {
       console.error(`[MODERATION] ${sha256} - DM notification failed:`, dmErr.message);
     }
   }
 
+  // Notify reporters who filed reports on this content (non-blocking)
+  const { notifyReporters: notifyReportersOfOutcome } = await import('./nostr/dm-sender.mjs');
+  notifyReportersOfOutcome(sha256, action, env, '[MODERATION]');
+
   // Write normalized moderation labels to ClickHouse
   try {
     const { writeModerationLabels } = await import('./moderation/label-writer.mjs');
-    await writeModerationLabels(sha256, result, env, {
+    await writeModerationLabels(sha256, downstreamContext.labelResult, env, {
       sourceId: result.provider || 'divine-hive',
       sourceOwner: 'divine',
       sourceType: 'machine-labeler',
@@ -3710,11 +3766,28 @@ async function handleModerationResult(result, env) {
   }
 
   // Notify ATProto labeler service (fire-and-forget)
-  notifyAtprotoLabeler({ sha256, action, scores, reviewed_by: result.reviewed_by }, env).catch(err => {
+  notifyAtprotoLabeler({ ...downstreamContext.labelResult, sha256, action, reviewed_by: result.reviewed_by }, env).catch(err => {
     console.error('[MODERATION] ATProto labeler notification failed:', err.message);
   });
 
   console.log(`[MODERATION] handleModerationResult finished for ${sha256}`);
+}
+
+/**
+ * Build a 502 response for when Blossom notification fails.
+ * Used by /admin/api/moderate, /api/v1/moderate, and /api/v1/quarantine.
+ */
+function blossomFailureResponse(sha256, action, blossomError) {
+  return new Response(JSON.stringify({
+    success: false,
+    sha256,
+    action,
+    blossom_notified: false,
+    error: `Moderation recorded but media server did not confirm: ${blossomError}`,
+  }), {
+    status: 502,
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 /**
