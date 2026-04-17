@@ -4321,3 +4321,159 @@ describe('age restricted apply returns exact failed shas', () => {
     }
   });
 });
+
+// Chunk 4 Step 1: regression coverage for exact write semantics.
+// Apply must call notifyBlossom with 'AGE_RESTRICTED' and never 'RESTRICT'.
+describe('age restricted reconcile writes AGE_RESTRICTED', () => {
+  const SHA = 'd'.repeat(64);
+
+  it('apply always calls notifyBlossom with AGE_RESTRICTED, never RESTRICT', async () => {
+    const webhookPayloads = [];
+    const e = {
+      ALLOW_DEV_ACCESS: 'false',
+      SERVICE_API_TOKEN: 'test-service-token',
+      BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      CDN_DOMAIN: 'media.divine.video',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} }
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const urlStr = String(url);
+      if (urlStr === e.BLOSSOM_WEBHOOK_URL) {
+        webhookPayloads.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      const match = urlStr.match(/\/admin\/api\/blob\/([0-9a-f]{64})$/i);
+      if (match) {
+        return new Response(JSON.stringify({ sha256: match[1], status: 'restricted' }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${urlStr}`);
+    };
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.notified).toBe(1);
+      expect(webhookPayloads).toHaveLength(1);
+      // Every single payload must be AGE_RESTRICTED — never RESTRICT.
+      for (const payload of webhookPayloads) {
+        expect(payload.action).toBe('AGE_RESTRICTED');
+        expect(payload.action).not.toBe('RESTRICT');
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+// Chunk 5 Step 1: drift reporting — preview must report mismatch categories
+// distinctly, not collapse them into a single population total.
+describe('age restricted preview reports real blossom drift', () => {
+  function sha(n) { return String(n).padStart(64, '0'); }
+
+  function mockDbWith(shas) {
+    return {
+      prepare(sql) {
+        let bindings = [];
+        return {
+          bind(...args) { bindings = args; return this; },
+          async run() { return { success: true }; },
+          async first() { return null; },
+          async all() {
+            if (sql.includes("action = 'AGE_RESTRICTED'") && sql.includes('ORDER BY sha256 ASC')) {
+              const hasCursor = sql.includes('sha256 > ?');
+              const limit = hasCursor ? bindings[1] : bindings[0];
+              const filtered = hasCursor ? shas.filter(s => s > bindings[0]) : shas.slice();
+              return { results: filtered.slice(0, limit).map(s => ({ sha256: s, action: 'AGE_RESTRICTED' })) };
+            }
+            return { results: [] };
+          }
+        };
+      },
+      async batch() { return []; }
+    };
+  }
+
+  it('reports each bucket distinctly rather than a single collapsed total', async () => {
+    const shas = [sha(1), sha(2), sha(3), sha(4)];
+    // Mix: 1 aligned + 1 repairable + 1 skip_deleted + 1 unexpected_state
+    const statusBySha = new Map([
+      [shas[0], 'age_restricted'],
+      [shas[1], 'restricted'],
+      [shas[2], 'deleted'],
+      [shas[3], 'active']
+    ]);
+
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      CDN_DOMAIN: 'media.divine.video',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      BLOSSOM_DB: mockDbWith(shas),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} }
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const match = String(url).match(/\/admin\/api\/blob\/([0-9a-f]{64})$/i);
+      if (match) {
+        const sha = match[1];
+        const status = statusBySha.get(sha);
+        if (!status) return new Response('not found', { status: 404 });
+        return new Response(JSON.stringify({ sha256: sha, status }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ limit: 10 })
+        }),
+        env
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      // Each bucket distinct — not collapsed into a single total.
+      expect(body.counts.aligned).toBe(1);
+      expect(body.counts.repairable_mismatch).toBe(1);
+      expect(body.counts.skip_deleted).toBe(1);
+      expect(body.counts.unexpected_state).toBe(1);
+      expect(body.counts.skip_missing).toBe(0);
+      expect(body.counts.read_failed).toBe(0);
+      // Total across buckets equals total classified rows.
+      const total = Object.values(body.counts).reduce((a, b) => a + b, 0);
+      expect(total).toBe(4);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
