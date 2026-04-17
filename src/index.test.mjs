@@ -3378,3 +3378,447 @@ describe('age restricted reconcile applyAgeRestrictedRepairs stub', () => {
     });
   });
 });
+
+describe('admin age restricted reconcile preview endpoint', () => {
+  // Exercises POST /admin/api/reconcile/age-restricted/preview end-to-end:
+  // D1 paging (keyset on sha256) + per-SHA Blossom admin detail lookup +
+  // classification into aligned / repairable_mismatch / skip_deleted /
+  // skip_missing / unexpected_state / read_failed buckets.
+
+  const CDN_DOMAIN = 'media.divine.video';
+  const WEBHOOK_SECRET = 'test-webhook-secret';
+
+  function sha(index) {
+    return String(index).padStart(64, '0');
+  }
+
+  function createReconcileDbMock(ageRestrictedShas) {
+    // Seed a mixed-action set so we can prove the query filters to AGE_RESTRICTED only.
+    // ageRestrictedShas is an ordered array of hashes we want returned by the paging query.
+    return {
+      prepare(sql) {
+        let bindings = [];
+        return {
+          bind(...args) {
+            bindings = args;
+            return this;
+          },
+          async run() { return { success: true }; },
+          async first() { return null; },
+          async all() {
+            if (
+              sql.includes("FROM moderation_results") &&
+              sql.includes("action = 'AGE_RESTRICTED'") &&
+              sql.includes("ORDER BY sha256 ASC")
+            ) {
+              const hasCursor = sql.includes('sha256 > ?');
+              let cursorSha = null;
+              let limit;
+              if (hasCursor) {
+                [cursorSha, limit] = bindings;
+              } else {
+                [limit] = bindings;
+              }
+
+              const filtered = cursorSha
+                ? ageRestrictedShas.filter((s) => s > cursorSha)
+                : ageRestrictedShas.slice();
+              const sliced = filtered.slice(0, limit);
+              return { results: sliced.map((s) => ({ sha256: s, action: 'AGE_RESTRICTED' })) };
+            }
+            return { results: [] };
+          }
+        };
+      },
+      async batch() { return []; }
+    };
+  }
+
+  function createReconcileEnv({ ageRestrictedShas, blossomStatuses, overrides = {} } = {}) {
+    return {
+      ALLOW_DEV_ACCESS: 'true',
+      CDN_DOMAIN,
+      BLOSSOM_WEBHOOK_SECRET: WEBHOOK_SECRET,
+      BLOSSOM_DB: createReconcileDbMock(ageRestrictedShas),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+      __blossomStatuses: blossomStatuses,
+      ...overrides
+    };
+  }
+
+  function installBlossomFetchInterceptor(env) {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (typeof url === 'string' && url.startsWith(`https://${CDN_DOMAIN}/admin/api/blob/`)) {
+        const sha256 = url.split('/admin/api/blob/')[1];
+        const entry = env.__blossomStatuses[sha256];
+        if (!entry) {
+          return new Response('not found', { status: 404 });
+        }
+        if (entry.throw) {
+          throw new Error(entry.throw);
+        }
+        if (entry.status === 404) {
+          return new Response('not found', { status: 404 });
+        }
+        if (entry.status >= 500) {
+          return new Response('boom', { status: entry.status });
+        }
+        return new Response(JSON.stringify({ sha256, status: entry.status }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return origFetch(url, init);
+    };
+    return () => { globalThis.fetch = origFetch; };
+  }
+
+  it('requires admin auth', async () => {
+    const env = createReconcileEnv({
+      ageRestrictedShas: [],
+      blossomStatuses: {},
+      overrides: { ALLOW_DEV_ACCESS: 'false' }
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      }),
+      env
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it('returns preview with default limit 50 when limit omitted', async () => {
+    const shas = Array.from({ length: 3 }, (_, i) => sha(i + 1));
+    const env = createReconcileEnv({
+      ageRestrictedShas: shas,
+      blossomStatuses: {
+        [shas[0]]: { status: 'restricted' },
+        [shas[1]]: { status: 'age_restricted' },
+        [shas[2]]: { status: 'restricted' }
+      }
+    });
+
+    const restore = installBlossomFetchInterceptor(env);
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({})
+        }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.success).toBe(true);
+      expect(body.limit).toBe(50);
+      expect(body.nextCursor).toBeNull();
+      expect(body.counts).toEqual({
+        aligned: 1,
+        repairable_mismatch: 2,
+        skip_deleted: 0,
+        skip_missing: 0,
+        unexpected_state: 0,
+        read_failed: 0
+      });
+      expect(body.repairableShas).toEqual([shas[0], shas[2]]);
+      expect(body.samples).toEqual({
+        skip_deleted: [],
+        skip_missing: [],
+        unexpected_state: [],
+        read_failed: []
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it('caps limit at 100 when caller requests a higher value', async () => {
+    // Build 105 AGE_RESTRICTED rows; with max limit=100 we should get 100 classified
+    // rows plus a nextCursor equal to the 100th sha.
+    const shas = Array.from({ length: 105 }, (_, i) => sha(i + 1));
+    const blossomStatuses = Object.fromEntries(shas.map((s) => [s, { status: 'restricted' }]));
+    const env = createReconcileEnv({ ageRestrictedShas: shas, blossomStatuses });
+
+    const restore = installBlossomFetchInterceptor(env);
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ limit: 1000 })
+        }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.limit).toBe(100);
+      expect(body.counts.repairable_mismatch).toBe(100);
+      expect(body.repairableShas).toHaveLength(100);
+      expect(body.nextCursor).toBe(shas[99]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('honors cursor and populates non-repairable buckets and samples', async () => {
+    // Set up 6 AGE_RESTRICTED rows so, with cursor=sha(1), the paging skips sha(1)
+    // and classifies sha(2)..sha(6). Each bucket except aligned gets exactly one entry.
+    const shas = Array.from({ length: 6 }, (_, i) => sha(i + 1));
+    const blossomStatuses = {
+      [shas[0]]: { status: 'age_restricted' },  // skipped by cursor
+      [shas[1]]: { status: 'age_restricted' },  // aligned
+      [shas[2]]: { status: 'restricted' },      // repairable_mismatch
+      [shas[3]]: { status: 'deleted' },         // skip_deleted
+      [shas[4]]: { status: 404 },               // skip_missing
+      [shas[5]]: { status: 'active' }           // unexpected_state
+    };
+    const env = createReconcileEnv({ ageRestrictedShas: shas, blossomStatuses });
+
+    const restore = installBlossomFetchInterceptor(env);
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ limit: 10, cursor: shas[0] })
+        }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.limit).toBe(10);
+      expect(body.nextCursor).toBeNull();  // only 5 rows remain, less than limit
+      expect(body.counts).toEqual({
+        aligned: 1,
+        repairable_mismatch: 1,
+        skip_deleted: 1,
+        skip_missing: 1,
+        unexpected_state: 1,
+        read_failed: 0
+      });
+      expect(body.repairableShas).toEqual([shas[2]]);
+      expect(body.samples.skip_deleted).toHaveLength(1);
+      expect(body.samples.skip_deleted[0].sha256).toBe(shas[3]);
+      expect(body.samples.skip_missing[0].sha256).toBe(shas[4]);
+      expect(body.samples.unexpected_state[0].sha256).toBe(shas[5]);
+      expect(body.samples.unexpected_state[0].blossomStatus).toBe('active');
+      expect(body.samples.read_failed).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('classifies read failures as read_failed', async () => {
+    const shas = [sha(1), sha(2)];
+    const blossomStatuses = {
+      [shas[0]]: { status: 500 },
+      [shas[1]]: { throw: 'network down' }
+    };
+    const env = createReconcileEnv({ ageRestrictedShas: shas, blossomStatuses });
+
+    const restore = installBlossomFetchInterceptor(env);
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ limit: 10 })
+        }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.counts.read_failed).toBe(2);
+      expect(body.repairableShas).toEqual([]);
+      expect(body.samples.read_failed).toHaveLength(2);
+      expect(body.samples.read_failed[0].error).toBeTruthy();
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects non-numeric limit', async () => {
+    const env = createReconcileEnv({ ageRestrictedShas: [], blossomStatuses: {} });
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+        },
+        body: JSON.stringify({ limit: 'fifty' })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(400);
+  });
+});
+
+describe('preview logs age restricted mismatch counts', () => {
+  const CDN_DOMAIN = 'media.divine.video';
+  const WEBHOOK_SECRET = 'test-webhook-secret';
+
+  function sha(index) {
+    return String(index).padStart(64, '0');
+  }
+
+  function createReconcileDbMock(ageRestrictedShas) {
+    return {
+      prepare(sql) {
+        let bindings = [];
+        return {
+          bind(...args) {
+            bindings = args;
+            return this;
+          },
+          async run() { return { success: true }; },
+          async first() { return null; },
+          async all() {
+            if (
+              sql.includes("FROM moderation_results") &&
+              sql.includes("action = 'AGE_RESTRICTED'") &&
+              sql.includes("ORDER BY sha256 ASC")
+            ) {
+              const hasCursor = sql.includes('sha256 > ?');
+              let cursorSha = null;
+              let limit;
+              if (hasCursor) {
+                [cursorSha, limit] = bindings;
+              } else {
+                [limit] = bindings;
+              }
+              const filtered = cursorSha
+                ? ageRestrictedShas.filter((s) => s > cursorSha)
+                : ageRestrictedShas.slice();
+              return {
+                results: filtered.slice(0, limit).map((s) => ({ sha256: s, action: 'AGE_RESTRICTED' }))
+              };
+            }
+            return { results: [] };
+          }
+        };
+      },
+      async batch() { return []; }
+    };
+  }
+
+  it('emits one structured log line with limit, cursor, nextCursor, and counts', async () => {
+    const shas = Array.from({ length: 3 }, (_, i) => sha(i + 10));
+    const blossomStatuses = {
+      [shas[0]]: { status: 'restricted' },
+      [shas[1]]: { status: 'age_restricted' },
+      [shas[2]]: { status: 'deleted' }
+    };
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      CDN_DOMAIN,
+      BLOSSOM_WEBHOOK_SECRET: WEBHOOK_SECRET,
+      BLOSSOM_DB: createReconcileDbMock(shas),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} }
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (typeof url === 'string' && url.startsWith(`https://${CDN_DOMAIN}/admin/api/blob/`)) {
+        const sha256 = url.split('/admin/api/blob/')[1];
+        const entry = blossomStatuses[sha256];
+        return new Response(JSON.stringify({ sha256, status: entry.status }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      return origFetch(url);
+    };
+
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...args) => {
+      logs.push(args);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ limit: 50, cursor: null })
+        }),
+        env
+      );
+      expect(response.status).toBe(200);
+    } finally {
+      console.log = origLog;
+      globalThis.fetch = origFetch;
+    }
+
+    // Find the structured reconcile log line — printed as a single JSON string.
+    let parsed = null;
+    for (const args of logs) {
+      for (const arg of args) {
+        if (typeof arg !== 'string') continue;
+        try {
+          const obj = JSON.parse(arg);
+          if (obj && obj.event === 'age_restricted_reconcile.preview') {
+            parsed = obj;
+            break;
+          }
+        } catch (_) {
+          // not json
+        }
+      }
+      if (parsed) break;
+    }
+
+    expect(parsed).not.toBeNull();
+    expect(parsed.limit).toBe(50);
+    expect(parsed.cursor).toBeNull();
+    expect(parsed.nextCursor).toBeNull();
+    expect(parsed.counts).toEqual({
+      aligned: 1,
+      repairable_mismatch: 1,
+      skip_deleted: 1,
+      skip_missing: 0,
+      unexpected_state: 0,
+      read_failed: 0
+    });
+  });
+});
