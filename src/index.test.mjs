@@ -3071,3 +3071,310 @@ describe('POST /api/v1/notify', () => {
     expect(typeof body.dm_sent).toBe('boolean');
   });
 });
+
+// --- Age-Restricted reconcile helper tests (Chunk 1) ---
+
+import {
+  listAgeRestrictedCandidates,
+  fetchBlossomBlobDetail,
+  classifyAgeRestrictedCandidate,
+  buildPreviewResponse,
+  applyAgeRestrictedRepairs
+} from './moderation/age-restricted-reconcile.mjs';
+
+function createCandidateDbMock(rows) {
+  const captured = { sql: null, bindings: null };
+  return {
+    captured,
+    prepare(sql) {
+      let bindings = [];
+      return {
+        bind(...args) {
+          bindings = args;
+          return this;
+        },
+        async all() {
+          captured.sql = sql;
+          captured.bindings = bindings;
+
+          // Filter by action and cursor; sort by sha256 asc; respect limit.
+          // Bindings order: [cursor?, limit]
+          let cursor = null;
+          let limit = bindings[bindings.length - 1];
+          if (bindings.length === 2) cursor = bindings[0];
+
+          const selected = rows
+            .filter((r) => r.action === 'AGE_RESTRICTED')
+            .filter((r) => (cursor === null ? true : r.sha256 > cursor))
+            .sort((a, b) => (a.sha256 < b.sha256 ? -1 : a.sha256 > b.sha256 ? 1 : 0))
+            .slice(0, limit);
+
+          return { results: selected };
+        }
+      };
+    }
+  };
+}
+
+describe('age restricted reconcile candidate paging', () => {
+  const shaA = 'a'.repeat(64);
+  const shaB = 'b'.repeat(64);
+  const shaC = 'c'.repeat(64);
+  const shaD = 'd'.repeat(64);
+  const shaE = 'e'.repeat(64);
+
+  const baseRows = [
+    { sha256: shaC, action: 'AGE_RESTRICTED' },
+    { sha256: shaA, action: 'AGE_RESTRICTED' },
+    { sha256: shaB, action: 'SAFE' },
+    { sha256: shaD, action: 'QUARANTINE' },
+    { sha256: shaE, action: 'PERMANENT_BAN' }
+  ];
+
+  it('selects only AGE_RESTRICTED rows sorted by sha256 ascending', async () => {
+    const db = createCandidateDbMock(baseRows);
+    const { rows, nextCursor } = await listAgeRestrictedCandidates(db, { limit: 10 });
+    expect(rows.map((r) => r.sha256)).toEqual([shaA, shaC]);
+    expect(nextCursor).toBeNull();
+
+    // Verify the SQL restricts on AGE_RESTRICTED
+    expect(db.captured.sql).toMatch(/action\s*=\s*'AGE_RESTRICTED'/);
+    expect(db.captured.sql).toMatch(/ORDER BY\s+sha256\s+ASC/i);
+  });
+
+  it('uses keyset pagination via sha256 > ? when cursor given', async () => {
+    const db = createCandidateDbMock(baseRows);
+    const { rows, nextCursor } = await listAgeRestrictedCandidates(db, {
+      cursorSha: shaA,
+      limit: 10
+    });
+    expect(rows.map((r) => r.sha256)).toEqual([shaC]);
+    expect(nextCursor).toBeNull();
+    // Bindings should include the cursor value
+    expect(db.captured.bindings[0]).toBe(shaA);
+    // SQL should contain sha256 > ?
+    expect(db.captured.sql).toMatch(/sha256\s*>\s*\?/);
+  });
+
+  it('fetches limit+1 rows so nextCursor is exact when more remain', async () => {
+    // 4 AGE_RESTRICTED rows, limit = 2
+    const many = [
+      { sha256: shaA, action: 'AGE_RESTRICTED' },
+      { sha256: shaB, action: 'AGE_RESTRICTED' },
+      { sha256: shaC, action: 'AGE_RESTRICTED' },
+      { sha256: shaD, action: 'AGE_RESTRICTED' }
+    ];
+    const db = createCandidateDbMock(many);
+    const { rows, nextCursor } = await listAgeRestrictedCandidates(db, { limit: 2 });
+    // Only 2 rows returned, but cursor points to the last returned sha
+    expect(rows.map((r) => r.sha256)).toEqual([shaA, shaB]);
+    expect(nextCursor).toBe(shaB);
+
+    // The internal LIMIT should be limit + 1 = 3
+    const lastBinding = db.captured.bindings[db.captured.bindings.length - 1];
+    expect(lastBinding).toBe(3);
+  });
+
+  it('returns null nextCursor when fewer than limit+1 rows are available', async () => {
+    const rowsInput = [
+      { sha256: shaA, action: 'AGE_RESTRICTED' },
+      { sha256: shaB, action: 'AGE_RESTRICTED' }
+    ];
+    const db = createCandidateDbMock(rowsInput);
+    const { rows, nextCursor } = await listAgeRestrictedCandidates(db, { limit: 5 });
+    expect(rows.map((r) => r.sha256)).toEqual([shaA, shaB]);
+    expect(nextCursor).toBeNull();
+  });
+});
+
+describe('age restricted reconcile classification', () => {
+  const sha = 'f'.repeat(64);
+
+  it('classifies Blossom status age_restricted as aligned', () => {
+    const result = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: { status: 200, body: { status: 'age_restricted' } },
+      blossomError: null
+    });
+    expect(result).toEqual({
+      sha256: sha,
+      category: 'aligned',
+      blossomStatus: 'age_restricted',
+      error: null
+    });
+  });
+
+  it('classifies Blossom status restricted as repairable_mismatch', () => {
+    const result = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: { status: 200, body: { status: 'restricted' } },
+      blossomError: null
+    });
+    expect(result.category).toBe('repairable_mismatch');
+    expect(result.blossomStatus).toBe('restricted');
+    expect(result.error).toBeNull();
+  });
+
+  it('classifies Blossom status deleted as skip_deleted', () => {
+    const result = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: { status: 200, body: { status: 'deleted' } },
+      blossomError: null
+    });
+    expect(result.category).toBe('skip_deleted');
+    expect(result.blossomStatus).toBe('deleted');
+  });
+
+  it('classifies Blossom 404 (null detail) as skip_missing', () => {
+    const result = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: null,
+      blossomError: null
+    });
+    expect(result.category).toBe('skip_missing');
+    expect(result.blossomStatus).toBeNull();
+    expect(result.error).toBeNull();
+  });
+
+  it('classifies Blossom status active as unexpected_state', () => {
+    const result = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: { status: 200, body: { status: 'active' } },
+      blossomError: null
+    });
+    expect(result.category).toBe('unexpected_state');
+    expect(result.blossomStatus).toBe('active');
+  });
+
+  it('classifies other unexpected statuses (pending, banned) as unexpected_state', () => {
+    const pending = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: { status: 200, body: { status: 'pending' } },
+      blossomError: null
+    });
+    expect(pending.category).toBe('unexpected_state');
+
+    const banned = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: { status: 200, body: { status: 'banned' } },
+      blossomError: null
+    });
+    expect(banned.category).toBe('unexpected_state');
+  });
+
+  it('classifies fetch error (thrown) as read_failed', () => {
+    const err = new Error('boom');
+    const result = classifyAgeRestrictedCandidate({
+      sha256: sha,
+      blossomDetail: null,
+      blossomError: err
+    });
+    expect(result.category).toBe('read_failed');
+    expect(result.error).toBe('boom');
+  });
+
+  it('fetchBlossomBlobDetail returns { status, body } for 2xx', async () => {
+    const payload = { sha256: sha, status: 'restricted' };
+    const fakeFetch = async (url, init) => {
+      expect(url).toBe(`https://media.divine.video/admin/api/blob/${sha}`);
+      expect(init.headers.Authorization).toBe('Bearer test-secret');
+      expect(init.headers.Accept).toBe('application/json');
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    };
+    const env = { CDN_DOMAIN: 'media.divine.video', BLOSSOM_WEBHOOK_SECRET: 'test-secret' };
+    const detail = await fetchBlossomBlobDetail(sha, env, fakeFetch);
+    expect(detail.status).toBe(200);
+    expect(detail.body).toEqual(payload);
+  });
+
+  it('fetchBlossomBlobDetail returns { status: 404 } for 404 with no body', async () => {
+    const fakeFetch = async () => new Response('', { status: 404 });
+    const env = { BLOSSOM_WEBHOOK_SECRET: 'test-secret' };
+    const detail = await fetchBlossomBlobDetail(sha, env, fakeFetch);
+    expect(detail.status).toBe(404);
+  });
+
+  it('fetchBlossomBlobDetail throws for non-2xx/404', async () => {
+    const fakeFetch = async () => new Response('server err', { status: 500 });
+    const env = { BLOSSOM_WEBHOOK_SECRET: 'test-secret' };
+    await expect(fetchBlossomBlobDetail(sha, env, fakeFetch)).rejects.toThrow();
+  });
+
+  it('fetchBlossomBlobDetail throws on network error', async () => {
+    const fakeFetch = async () => { throw new Error('net down'); };
+    const env = { BLOSSOM_WEBHOOK_SECRET: 'test-secret' };
+    await expect(fetchBlossomBlobDetail(sha, env, fakeFetch)).rejects.toThrow(/net down/);
+  });
+});
+
+describe('age restricted reconcile buildPreviewResponse', () => {
+  it('aggregates counts and samples with repairableShas list', () => {
+    const rows = [
+      { sha256: 'aa' }, { sha256: 'bb' }, { sha256: 'cc' },
+      { sha256: 'dd' }, { sha256: 'ee' }
+    ];
+    const classifications = [
+      { sha256: 'aa', category: 'aligned', blossomStatus: 'age_restricted', error: null },
+      { sha256: 'bb', category: 'repairable_mismatch', blossomStatus: 'restricted', error: null },
+      { sha256: 'cc', category: 'skip_deleted', blossomStatus: 'deleted', error: null },
+      { sha256: 'dd', category: 'skip_missing', blossomStatus: null, error: null },
+      { sha256: 'ee', category: 'unexpected_state', blossomStatus: 'active', error: null }
+    ];
+    const resp = buildPreviewResponse({ rows, classifications, limit: 10, nextCursor: 'ee' });
+    expect(resp.success).toBe(true);
+    expect(resp.limit).toBe(10);
+    expect(resp.nextCursor).toBe('ee');
+    expect(resp.counts).toEqual({
+      aligned: 1,
+      repairable_mismatch: 1,
+      skip_deleted: 1,
+      skip_missing: 1,
+      unexpected_state: 1,
+      read_failed: 0
+    });
+    expect(resp.repairableShas).toEqual(['bb']);
+    expect(resp.samples.skip_deleted).toEqual(['cc']);
+    expect(resp.samples.skip_missing).toEqual(['dd']);
+    expect(resp.samples.unexpected_state).toEqual(['ee']);
+    expect(resp.samples.read_failed).toEqual([]);
+  });
+
+  it('caps samples at 5 per bucket', () => {
+    const rows = [];
+    const classifications = [];
+    for (let i = 0; i < 8; i += 1) {
+      const sha = `sha${i}`;
+      rows.push({ sha256: sha });
+      classifications.push({ sha256: sha, category: 'skip_missing', blossomStatus: null, error: null });
+    }
+    const resp = buildPreviewResponse({ rows, classifications, limit: 50, nextCursor: null });
+    expect(resp.counts.skip_missing).toBe(8);
+    expect(resp.samples.skip_missing).toHaveLength(5);
+  });
+});
+
+describe('age restricted reconcile applyAgeRestrictedRepairs stub', () => {
+  it('returns a skeleton response (Chunk 3 placeholder)', async () => {
+    const result = await applyAgeRestrictedRepairs({
+      shas: ['aa', 'bb'],
+      env: {},
+      fetchBlossomBlobDetail: async () => null,
+      notifyBlossom: async () => ({ success: true })
+    });
+    expect(result.success).toBe(true);
+    expect(result.attempted).toBe(2);
+    expect(result.notified).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(result.failures).toEqual([]);
+    expect(result.skipped).toEqual({
+      aligned: 0,
+      skip_deleted: 0,
+      skip_missing: 0,
+      unexpected_state: 0,
+      read_failed: 0
+    });
+  });
+});
