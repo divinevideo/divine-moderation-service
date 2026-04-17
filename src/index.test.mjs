@@ -3071,3 +3071,503 @@ describe('POST /api/v1/notify', () => {
     expect(typeof body.dm_sent).toBe('boolean');
   });
 });
+
+describe('admin age restricted reconcile apply endpoint', () => {
+  const SHA_A = 'a'.repeat(64);
+  const SHA_B = 'b'.repeat(64);
+  const SHA_C = 'c'.repeat(64);
+
+  function buildApplyEnv({ blossomStatusBySha = new Map(), blossomResponseBySha = new Map(), webhookPayloads = [], webhookResponseStatus = 200 } = {}) {
+    return {
+      ALLOW_DEV_ACCESS: 'false',
+      SERVICE_API_TOKEN: 'test-service-token',
+      BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      BLOSSOM_ADMIN_URL: 'https://mock-blossom.test',
+      BLOSSOM_ADMIN_TOKEN: 'test-admin-token',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+      __blossomStatusBySha: blossomStatusBySha,
+      __blossomResponseBySha: blossomResponseBySha,
+      __webhookPayloads: webhookPayloads,
+      __webhookResponseStatus: webhookResponseStatus
+    };
+  }
+
+  function installApplyFetchMock(env) {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const urlStr = String(url);
+      if (urlStr === env.BLOSSOM_WEBHOOK_URL) {
+        env.__webhookPayloads.push(JSON.parse(init.body));
+        const status = env.__webhookResponseStatus ?? 200;
+        if (status >= 400) {
+          return new Response(JSON.stringify({ error: 'webhook failed' }), { status });
+        }
+        return new Response(JSON.stringify({ success: true }), { status });
+      }
+      // /admin/api/blob/{sha}
+      const match = urlStr.match(/\/admin\/api\/blob\/([0-9a-f]{64})$/i);
+      if (match) {
+        const sha = match[1];
+        if (env.__blossomResponseBySha.has(sha)) {
+          const custom = env.__blossomResponseBySha.get(sha);
+          if (custom === 'throw') {
+            throw new Error('network blew up');
+          }
+          return custom;
+        }
+        if (env.__blossomStatusBySha.has(sha)) {
+          const status = env.__blossomStatusBySha.get(sha);
+          if (status === null) {
+            return new Response('not found', { status: 404 });
+          }
+          return new Response(JSON.stringify({ sha256: sha, status }), { status: 200 });
+        }
+        return new Response('not found', { status: 404 });
+      }
+      throw new Error(`Unexpected fetch: ${urlStr}`);
+    };
+    return () => { globalThis.fetch = origFetch; };
+  }
+
+  it('requires admin auth', async () => {
+    const env = buildApplyEnv();
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shas: [SHA_A] })
+      }),
+      env
+    );
+    expect(response.status).toBe(401);
+  });
+
+  it('rejects empty sha list', async () => {
+    const env = buildApplyEnv();
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+        },
+        body: JSON.stringify({ shas: [] })
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('rejects missing shas field', async () => {
+    const env = buildApplyEnv();
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+        },
+        body: JSON.stringify({})
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('rejects oversized sha list (>100)', async () => {
+    const env = buildApplyEnv();
+    const tooMany = Array.from({ length: 101 }, (_, i) => i.toString(16).padStart(64, '0'));
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+        },
+        body: JSON.stringify({ shas: tooMany })
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('rejects malformed SHAs', async () => {
+    const env = buildApplyEnv();
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+        },
+        body: JSON.stringify({ shas: ['not-a-sha', SHA_A] })
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it('notifies Blossom with AGE_RESTRICTED for currently-restricted shas', async () => {
+    const env = buildApplyEnv({
+      blossomStatusBySha: new Map([[SHA_A, 'restricted']])
+    });
+    const restore = installApplyFetchMock(env);
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_A] })
+        }),
+        env
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        success: true,
+        attempted: 1,
+        notified: 1,
+        failed: 0,
+        failures: []
+      });
+      expect(env.__webhookPayloads).toHaveLength(1);
+      expect(env.__webhookPayloads[0]).toMatchObject({
+        sha256: SHA_A,
+        action: 'AGE_RESTRICTED'
+      });
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('age restricted apply revalidates blossom state', () => {
+  const SHA_REST = 'a'.repeat(64);
+  const SHA_AR = 'b'.repeat(64);
+  const SHA_DEL = 'c'.repeat(64);
+  const SHA_READ_FAIL = 'd'.repeat(64);
+  const SHA_MISSING = 'e'.repeat(64);
+  const SHA_UNEXPECTED = 'f'.repeat(64);
+
+  function env() {
+    const webhookPayloads = [];
+    return {
+      env: {
+        ALLOW_DEV_ACCESS: 'false',
+        SERVICE_API_TOKEN: 'test-service-token',
+        BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
+        BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+        BLOSSOM_ADMIN_URL: 'https://mock-blossom.test',
+        BLOSSOM_ADMIN_TOKEN: 'test-admin-token',
+        BLOSSOM_DB: createDbMock(),
+        MODERATION_KV: {
+          async get() { return null; },
+          async put() {},
+          async delete() {},
+          async list() { return { keys: [], list_complete: true, cursor: null }; }
+        },
+        MODERATION_QUEUE: { async send() {} },
+        __webhookPayloads: webhookPayloads
+      },
+      webhookPayloads
+    };
+  }
+
+  function installMixedFetchMock({ env, statuses }) {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const urlStr = String(url);
+      if (urlStr === env.BLOSSOM_WEBHOOK_URL) {
+        env.__webhookPayloads.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      const match = urlStr.match(/\/admin\/api\/blob\/([0-9a-f]{64})$/i);
+      if (match) {
+        const sha = match[1];
+        if (!statuses.has(sha)) {
+          return new Response('not found', { status: 404 });
+        }
+        const entry = statuses.get(sha);
+        if (entry === 'throw') {
+          throw new Error('simulated read failure');
+        }
+        if (entry === '404') {
+          return new Response('not found', { status: 404 });
+        }
+        return new Response(JSON.stringify({ sha256: sha, status: entry }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${urlStr}`);
+    };
+    return () => { globalThis.fetch = origFetch; };
+  }
+
+  it('skips shas whose blossom state is already age_restricted without calling notifyBlossom', async () => {
+    const { env: e, webhookPayloads } = env();
+    const restore = installMixedFetchMock({
+      env: e,
+      statuses: new Map([[SHA_AR, 'age_restricted']])
+    });
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_AR] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.notified).toBe(0);
+      expect(body.skipped.aligned).toBe(1);
+      expect(webhookPayloads).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('skips shas whose blossom state is deleted without calling notifyBlossom', async () => {
+    const { env: e, webhookPayloads } = env();
+    const restore = installMixedFetchMock({
+      env: e,
+      statuses: new Map([[SHA_DEL, 'deleted']])
+    });
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_DEL] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.notified).toBe(0);
+      expect(body.skipped.skip_deleted).toBe(1);
+      expect(webhookPayloads).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('replays notifyBlossom for shas whose blossom state is still restricted', async () => {
+    const { env: e, webhookPayloads } = env();
+    const restore = installMixedFetchMock({
+      env: e,
+      statuses: new Map([[SHA_REST, 'restricted']])
+    });
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_REST] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.notified).toBe(1);
+      expect(webhookPayloads).toHaveLength(1);
+      expect(webhookPayloads[0].action).toBe('AGE_RESTRICTED');
+      expect(webhookPayloads[0].sha256).toBe(SHA_REST);
+    } finally {
+      restore();
+    }
+  });
+
+  it('counts blossom read failures as failure with stage read and skips notifyBlossom', async () => {
+    const { env: e, webhookPayloads } = env();
+    const restore = installMixedFetchMock({
+      env: e,
+      statuses: new Map([[SHA_READ_FAIL, 'throw']])
+    });
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_READ_FAIL] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.failed).toBe(1);
+      expect(body.skipped.read_failed).toBe(1);
+      expect(body.failures).toHaveLength(1);
+      expect(body.failures[0]).toMatchObject({
+        sha256: SHA_READ_FAIL,
+        stage: 'read'
+      });
+      expect(webhookPayloads).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('counts missing (404) blossom blobs as skip_missing without calling notifyBlossom', async () => {
+    const { env: e, webhookPayloads } = env();
+    const restore = installMixedFetchMock({
+      env: e,
+      statuses: new Map([[SHA_MISSING, '404']])
+    });
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_MISSING] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.notified).toBe(0);
+      expect(body.skipped.skip_missing).toBe(1);
+      expect(webhookPayloads).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('counts unexpected active state as unexpected_state without calling notifyBlossom', async () => {
+    const { env: e, webhookPayloads } = env();
+    const restore = installMixedFetchMock({
+      env: e,
+      statuses: new Map([[SHA_UNEXPECTED, 'active']])
+    });
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_UNEXPECTED] })
+        }),
+        e
+      );
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.notified).toBe(0);
+      expect(body.skipped.unexpected_state).toBe(1);
+      expect(webhookPayloads).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('age restricted apply returns exact failed shas', () => {
+  const SHA_REST = 'a'.repeat(64);
+  const SHA_NOTIFY_FAIL = 'b'.repeat(64);
+  const SHA_READ_FAIL = 'c'.repeat(64);
+
+  it('preserves failed shas with error and stage for retry', async () => {
+    const webhookPayloads = [];
+    const e = {
+      ALLOW_DEV_ACCESS: 'false',
+      SERVICE_API_TOKEN: 'test-service-token',
+      BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      BLOSSOM_ADMIN_URL: 'https://mock-blossom.test',
+      BLOSSOM_ADMIN_TOKEN: 'test-admin-token',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+      __webhookPayloads: webhookPayloads
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const urlStr = String(url);
+      if (urlStr === e.BLOSSOM_WEBHOOK_URL) {
+        const payload = JSON.parse(init.body);
+        webhookPayloads.push(payload);
+        if (payload.sha256 === SHA_NOTIFY_FAIL) {
+          return new Response('boom', { status: 500 });
+        }
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      const match = urlStr.match(/\/admin\/api\/blob\/([0-9a-f]{64})$/i);
+      if (match) {
+        const sha = match[1];
+        if (sha === SHA_READ_FAIL) {
+          throw new Error('read exploded');
+        }
+        return new Response(JSON.stringify({ sha256: sha, status: 'restricted' }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${urlStr}`);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/apply', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ shas: [SHA_REST, SHA_NOTIFY_FAIL, SHA_READ_FAIL] })
+        }),
+        e
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.attempted).toBe(3);
+      expect(body.notified).toBe(1);
+      expect(body.failed).toBe(2);
+      expect(body.success).toBe(false);
+
+      const failureShas = body.failures.map(f => f.sha256).sort();
+      expect(failureShas).toEqual([SHA_NOTIFY_FAIL, SHA_READ_FAIL].sort());
+
+      const notifyFailure = body.failures.find(f => f.sha256 === SHA_NOTIFY_FAIL);
+      expect(notifyFailure.stage).toBe('notify');
+      expect(typeof notifyFailure.error).toBe('string');
+      expect(notifyFailure.error.length).toBeGreaterThan(0);
+
+      const readFailure = body.failures.find(f => f.sha256 === SHA_READ_FAIL);
+      expect(readFailure.stage).toBe('read');
+      expect(typeof readFailure.error).toBe('string');
+      expect(readFailure.error.length).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
