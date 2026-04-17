@@ -32,7 +32,8 @@ import {
   listAgeRestrictedCandidates,
   fetchBlossomBlobDetail,
   classifyAgeRestrictedCandidate,
-  buildPreviewResponse
+  buildPreviewResponse,
+  applyAgeRestrictedRepairs
 } from './moderation/age-restricted-reconcile.mjs';
 /**
  * NIP-32 label mapping for content categories
@@ -3120,6 +3121,55 @@ async function runMigration() {
       } catch (error) {
         console.error('[AGE-RESTRICTED-RECONCILE] Preview error:', error);
         return jsonResponse(error.status || 500, { error: error.message });
+      }
+    }
+
+    // Admin API: Apply age-restricted Blossom reconciliation to an explicit list of SHAs.
+    // Re-reads live Blossom state per SHA and only replays the AGE_RESTRICTED
+    // webhook when Blossom still reports `restricted`. Returns explicit failed
+    // SHAs so the operator can retry the exact list. See
+    // docs/superpowers/plans/2026-04-17-age-restricted-blossom-reconciliation-plan.md
+    if (url.pathname === '/admin/api/reconcile/age-restricted/apply' && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      let body;
+      try {
+        body = await request.json();
+      } catch (err) {
+        return jsonResponse(400, { error: 'Invalid JSON body' });
+      }
+
+      const shas = body?.shas;
+      if (!Array.isArray(shas) || shas.length === 0) {
+        return jsonResponse(400, { error: 'shas must be a non-empty array' });
+      }
+      if (shas.length > 100) {
+        return jsonResponse(400, { error: 'shas exceeds max batch size of 100' });
+      }
+      for (const sha of shas) {
+        if (typeof sha !== 'string' || !isValidSha256(sha)) {
+          return jsonResponse(400, { error: `Invalid SHA-256: ${sha}` });
+        }
+      }
+
+      try {
+        const result = await applyAgeRestrictedRepairs({
+          shas,
+          env,
+          fetchBlossomBlobDetail,
+          notifyBlossom
+        });
+        console.log('[AR-RECONCILE][apply]', JSON.stringify({
+          attempted: result.attempted,
+          notified: result.notified,
+          failed: result.failed,
+          skipped: result.skipped
+        }));
+        return jsonResponse(200, result);
+      } catch (error) {
+        console.error('[AR-RECONCILE][apply] Unhandled error:', error);
+        return jsonResponse(500, { error: error.message });
       }
     }
 

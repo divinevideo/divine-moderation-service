@@ -128,7 +128,7 @@ export function classifyAgeRestrictedCandidate({ sha256, blossomDetail, blossomE
     };
   }
 
-  if (blossomDetail === null || blossomDetail === undefined) {
+  if (blossomDetail === null || blossomDetail === undefined || blossomDetail.status === 404) {
     return { sha256, category: 'skip_missing', blossomStatus: null, error: null };
   }
 
@@ -194,7 +194,12 @@ export function buildPreviewResponse({ rows, classifications, limit, nextCursor 
       repairableShas.push(entry.sha256);
     }
     if (SAMPLE_BUCKETS.includes(entry.category) && samples[entry.category].length < SAMPLE_CAP) {
-      samples[entry.category].push(entry.sha256);
+      // Include blossomStatus + error for operator sanity-checking per plan line 269
+      samples[entry.category].push({
+        sha256: entry.sha256,
+        blossomStatus: entry.blossomStatus,
+        error: entry.error
+      });
     }
   }
 
@@ -214,20 +219,27 @@ export function buildPreviewResponse({ rows, classifications, limit, nextCursor 
 /**
  * Apply age-restricted repairs for an explicit SHA list.
  *
- * Chunk 3 will implement revalidation + `notifyBlossom` replay. Chunk 1 ships
- * a stub so downstream endpoints can wire the contract without blocking on the
- * apply implementation agent.
+ * For each SHA, re-fetches Blossom detail at apply time and only replays
+ * `notifyBlossom(sha, 'AGE_RESTRICTED', env)` when live state is still
+ * `restricted`. Other states are classified into the skip buckets. Read and
+ * notify failures are counted separately with their stage preserved.
  *
  * @param {object} params
  * @param {string[]} params.shas
  * @param {object} params.env
- * @param {Function} params.fetchBlossomBlobDetail - Injected for testability.
- * @param {Function} params.notifyBlossom - Injected for testability.
- * @returns {Promise<object>} Apply response skeleton.
+ * @param {Function} params.fetchBlossomBlobDetail - async (sha, env) -> { status, body } | { status: 404 } | throws
+ * @param {Function} params.notifyBlossom - async (sha, action, env) -> { success, error? }
+ * @returns {Promise<{
+ *   success: boolean,
+ *   attempted: number,
+ *   notified: number,
+ *   failed: number,
+ *   skipped: { aligned: number, skip_deleted: number, skip_missing: number, unexpected_state: number, read_failed: number },
+ *   failures: Array<{ sha256: string, error: string, stage: 'read'|'notify' }>
+ * }>}
  */
-// eslint-disable-next-line no-unused-vars
 export async function applyAgeRestrictedRepairs({ shas, env, fetchBlossomBlobDetail, notifyBlossom }) {
-  return {
+  const result = {
     success: true,
     attempted: Array.isArray(shas) ? shas.length : 0,
     notified: 0,
@@ -241,4 +253,71 @@ export async function applyAgeRestrictedRepairs({ shas, env, fetchBlossomBlobDet
     },
     failures: []
   };
+
+  if (!Array.isArray(shas) || shas.length === 0) {
+    return result;
+  }
+
+  for (const sha256 of shas) {
+    let detail;
+    try {
+      detail = await fetchBlossomBlobDetail(sha256, env);
+    } catch (error) {
+      result.failed += 1;
+      result.skipped.read_failed += 1;
+      result.failures.push({
+        sha256,
+        error: String(error?.message ?? error),
+        stage: 'read'
+      });
+      continue;
+    }
+
+    if (!detail || detail.status === 404) {
+      result.skipped.skip_missing += 1;
+      continue;
+    }
+
+    const moderationStatus = String(detail.body?.status ?? '').toLowerCase();
+    if (moderationStatus === 'age_restricted') {
+      result.skipped.aligned += 1;
+      continue;
+    }
+    if (moderationStatus === 'deleted') {
+      result.skipped.skip_deleted += 1;
+      continue;
+    }
+    if (moderationStatus !== 'restricted') {
+      result.skipped.unexpected_state += 1;
+      continue;
+    }
+
+    // Live state is still 'restricted' — replay the AGE_RESTRICTED webhook
+    let notifyResult;
+    try {
+      notifyResult = await notifyBlossom(sha256, 'AGE_RESTRICTED', env);
+    } catch (error) {
+      result.failed += 1;
+      result.failures.push({
+        sha256,
+        error: String(error?.message ?? error),
+        stage: 'notify'
+      });
+      continue;
+    }
+
+    if (notifyResult && notifyResult.success) {
+      result.notified += 1;
+    } else {
+      result.failed += 1;
+      result.failures.push({
+        sha256,
+        error: String(notifyResult?.error ?? 'notifyBlossom reported failure'),
+        stage: 'notify'
+      });
+    }
+  }
+
+  result.success = result.failed === 0;
+  return result;
 }
