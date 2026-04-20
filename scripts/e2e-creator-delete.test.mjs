@@ -349,3 +349,45 @@ describe('uploadToBlossom', () => {
     await expect(uploadToBlossom(new Uint8Array(1), SHA, sk, cfg, fetchImpl)).rejects.toThrow(/413/);
   });
 });
+
+import { waitForIndexing } from './e2e-creator-delete.mjs';
+
+describe('waitForIndexing', () => {
+  const cfg = parseArgs([]);
+  const EVENT_ID = 'a'.repeat(64);
+
+  it('resolves immediately when fetch returns 200 on first attempt', async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      return { ok: true, status: 200, json: async () => ({ id: EVENT_ID }) };
+    };
+    await waitForIndexing(EVENT_ID, cfg, { fetchImpl, timeoutMs: 5000, pollIntervalMs: 10 });
+    expect(calls).toBe(1);
+  });
+
+  it('polls until 200, tolerates 404 during indexing lag', async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      if (calls < 3) return { ok: false, status: 404, text: async () => 'not found' };
+      return { ok: true, status: 200, json: async () => ({ id: EVENT_ID }) };
+    };
+    await waitForIndexing(EVENT_ID, cfg, { fetchImpl, timeoutMs: 5000, pollIntervalMs: 10 });
+    expect(calls).toBe(3);
+  });
+
+  it('throws after timeout', async () => {
+    const fetchImpl = async () => ({ ok: false, status: 404, text: async () => 'not found' });
+    await expect(
+      waitForIndexing(EVENT_ID, cfg, { fetchImpl, timeoutMs: 50, pollIntervalMs: 10 })
+    ).rejects.toThrow(/timeout|not indexed/i);
+  });
+
+  it('throws immediately on non-404 HTTP error', async () => {
+    const fetchImpl = async () => ({ ok: false, status: 500, text: async () => 'server error' });
+    await expect(
+      waitForIndexing(EVENT_ID, cfg, { fetchImpl, timeoutMs: 5000, pollIntervalMs: 10 })
+    ).rejects.toThrow(/500/);
+  });
+});

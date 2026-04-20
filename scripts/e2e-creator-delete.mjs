@@ -252,3 +252,67 @@ export async function uploadToBlossom(bytes, sha256, sk, cfg, fetchImpl = fetch)
   const body = await res.json();
   return { url: body.url || `${cfg.blossomBase}/${sha256}`, sha256 };
 }
+
+/**
+ * Poll Funnelcake REST GET /api/event/{id} until 200 or timeout.
+ * Catches ClickHouse batch-flush + MergeTree dedup propagation lag.
+ */
+export async function waitForIndexing(eventId, cfg, opts = {}) {
+  const fetchImpl = opts.fetchImpl || fetch;
+  const timeoutMs = opts.timeoutMs ?? 30000;
+  const pollIntervalMs = opts.pollIntervalMs ?? 1000;
+  const deadline = Date.now() + timeoutMs;
+  const url = `${cfg.funnelcakeApi}/api/event/${eventId}`;
+  let polls = 0;
+  while (Date.now() < deadline) {
+    polls++;
+    const res = await fetchImpl(url, { method: 'GET' });
+    if (res.ok) return { polls };
+    if (res.status !== 404) {
+      const text = await res.text();
+      throw new Error(`Funnelcake /api/event/${eventId} HTTP ${res.status}: ${text}`);
+    }
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+  }
+  throw new Error(`timeout after ${timeoutMs}ms: event ${eventId} not indexed by Funnelcake`);
+}
+
+/**
+ * Publish a signed Nostr event to a relay over WebSocket. Resolves with the
+ * event id on OK=true; throws on relay rejection or timeout.
+ *
+ * The WebSocket lives only for the duration of the publish. The ws library
+ * is imported dynamically so the Workers test pool doesn't trip on it at
+ * module-load time.
+ */
+export async function publishEvent(event, relayUrl, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 10000;
+  const WsCtor = opts.WebSocket || (await import('ws')).WebSocket;
+  return await new Promise((resolve, reject) => {
+    const ws = new WsCtor(relayUrl);
+    const timer = setTimeout(() => {
+      try { ws.close(); } catch {}
+      reject(new Error(`publish timeout after ${timeoutMs}ms: ${event.id}`));
+    }, timeoutMs);
+
+    ws.on('open', () => {
+      ws.send(JSON.stringify(['EVENT', event]));
+    });
+    ws.on('message', (data) => {
+      const msg = JSON.parse(data.toString());
+      if (msg[0] === 'OK' && msg[1] === event.id) {
+        clearTimeout(timer);
+        try { ws.close(); } catch {}
+        if (msg[2] === true) {
+          resolve(event.id);
+        } else {
+          reject(new Error(`relay rejected ${event.id}: ${msg[3] || 'unknown'}`));
+        }
+      }
+    });
+    ws.on('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`WebSocket error: ${err.message}`));
+    });
+  });
+}
