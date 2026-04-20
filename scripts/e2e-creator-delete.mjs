@@ -22,6 +22,11 @@ function getFlag(argv, name) {
   return null;
 }
 
+function requireValue(raw, fieldName) {
+  if (raw === true) throw new Error(`--${fieldName} requires a value (use --${fieldName}=<value>)`);
+  return raw;
+}
+
 function validatePositiveInt(value, fieldName) {
   const n = Number(value);
   if (!Number.isInteger(n) || n <= 0) {
@@ -32,23 +37,29 @@ function validatePositiveInt(value, fieldName) {
 
 export function parseArgs(argv) {
   const rawScenario = getFlag(argv, 'scenario');
-  const scenario = rawScenario === null || rawScenario === true ? 'both' : rawScenario;
+  const scenario = rawScenario === null ? 'both' : requireValue(rawScenario, 'scenario');
   if (!['sync', 'cron', 'both'].includes(scenario)) {
     throw new Error(`Invalid scenario: ${scenario} (must be sync|cron|both)`);
   }
 
   const rawCron = getFlag(argv, 'cron-wait-seconds');
   const cronWaitSeconds = rawCron
-    ? validatePositiveInt(rawCron, 'cron-wait-seconds')
+    ? validatePositiveInt(requireValue(rawCron, 'cron-wait-seconds'), 'cron-wait-seconds')
     : DEFAULT_CRON_WAIT_SECONDS;
+
+  const stagingRelay = getFlag(argv, 'staging-relay');
+  const funnelcakeApi = getFlag(argv, 'funnelcake-api');
+  const blossomBase = getFlag(argv, 'blossom-base');
+  const modServiceBase = getFlag(argv, 'mod-service-base');
+  const d1Database = getFlag(argv, 'd1-database');
 
   return {
     scenario,
-    stagingRelay: getFlag(argv, 'staging-relay') || DEFAULT_STAGING_RELAY,
-    funnelcakeApi: getFlag(argv, 'funnelcake-api') || DEFAULT_FUNNELCAKE_API,
-    blossomBase: getFlag(argv, 'blossom-base') || DEFAULT_BLOSSOM_BASE,
-    modServiceBase: getFlag(argv, 'mod-service-base') || DEFAULT_MOD_SERVICE_BASE,
-    d1Database: getFlag(argv, 'd1-database') || DEFAULT_D1_DATABASE,
+    stagingRelay: stagingRelay ? requireValue(stagingRelay, 'staging-relay') : DEFAULT_STAGING_RELAY,
+    funnelcakeApi: funnelcakeApi ? requireValue(funnelcakeApi, 'funnelcake-api') : DEFAULT_FUNNELCAKE_API,
+    blossomBase: blossomBase ? requireValue(blossomBase, 'blossom-base') : DEFAULT_BLOSSOM_BASE,
+    modServiceBase: modServiceBase ? requireValue(modServiceBase, 'mod-service-base') : DEFAULT_MOD_SERVICE_BASE,
+    d1Database: d1Database ? requireValue(d1Database, 'd1-database') : DEFAULT_D1_DATABASE,
     cronWaitSeconds,
     skipCleanup: getFlag(argv, 'skip-cleanup') === true
   };

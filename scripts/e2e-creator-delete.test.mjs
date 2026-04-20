@@ -58,4 +58,24 @@ describe('parseArgs', () => {
     expect(cfg.blossomBase).toBe('http://localhost:7676');
     expect(cfg.modServiceBase).toBe('http://localhost:8787');
   });
+
+  it('rejects --cron-wait-seconds=abc (non-numeric)', () => {
+    expect(() => parseArgs(['--cron-wait-seconds=abc'])).toThrow(/cron-wait/i);
+  });
+
+  it('rejects --cron-wait-seconds=-10 (negative)', () => {
+    expect(() => parseArgs(['--cron-wait-seconds=-10'])).toThrow(/cron-wait/i);
+  });
+
+  it('rejects --cron-wait-seconds=1.5 (non-integer)', () => {
+    expect(() => parseArgs(['--cron-wait-seconds=1.5'])).toThrow(/cron-wait/i);
+  });
+
+  it('rejects flags that expect a value but are passed without = (e.g., --cron-wait-seconds)', () => {
+    expect(() => parseArgs(['--cron-wait-seconds'])).toThrow(/requires a value/i);
+  });
+
+  it('rejects --staging-relay without a value', () => {
+    expect(() => parseArgs(['--staging-relay'])).toThrow(/requires a value/i);
+  });
 });
