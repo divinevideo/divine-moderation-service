@@ -528,3 +528,102 @@ export async function runSyncScenario(cfg, deps = {}) {
 export async function runCronScenario(cfg, deps = {}) {
   return runScenario('cron', cfg, deps, { callSync: false, statusTimeoutMs: cfg.cronWaitSeconds * 1000, statusPollIntervalMs: 3000 });
 }
+
+export function computeExitCode(results) {
+  const anyFailed = results.some(r => r.outcome === 'fail');
+  if (anyFailed) return 1;
+  const anyCleanupFailed = results.some(r => {
+    if (r.cleanup?.skipped) return false;
+    if (r.cleanup?.blossom?.ok === false) return true;
+    if (r.cleanup?.blossom?.errors > 0) return true;
+    if (r.cleanup?.d1?.ok === false) return true;
+    return false;
+  });
+  if (anyCleanupFailed) return 3;
+  return 0;
+}
+
+export function printSummary(results) {
+  console.error('\n=== E2E SUMMARY ===');
+  for (const r of results) {
+    const seconds = (r.totalDurationMs / 1000).toFixed(1);
+    const label = r.outcome.toUpperCase();
+    const detail = r.outcome === 'fail' ? `  (${r.failureReason})` : '';
+    console.error(`Scenario: ${r.scenario.padEnd(6)}${label}  ${seconds}s${detail}`);
+  }
+
+  const artifacts = results.filter(r => !r.cleanup?.skipped);
+  if (artifacts.length > 0) {
+    console.error('\n=== ARTIFACTS (cleaned) ===');
+    for (const r of artifacts) {
+      const blossom = r.cleanup?.blossom?.ok === false
+        ? `vanish=FAILED:${r.cleanup.blossom.error}`
+        : `vanish=fully_deleted:${r.cleanup.blossom?.fullyDeleted ?? '?'}`;
+      const d1 = r.cleanup?.d1?.ok === false ? `d1=FAILED:${r.cleanup.d1.error}` : 'd1=cleaned';
+      console.error(`sha=${r.sha256}  kind5=${r.kind5Id || '-'}  ${blossom}  ${d1}  (${r.scenario})`);
+    }
+  }
+
+  const manual = results.filter(r => {
+    if (r.cleanup?.skipped) return false;
+    return r.cleanup?.blossom?.ok === false || r.cleanup?.d1?.ok === false;
+  });
+  console.error('\n=== MANUAL CLEANUP NEEDED ===');
+  if (manual.length === 0) {
+    console.error('(none)');
+  } else {
+    for (const r of manual) {
+      if (r.cleanup?.blossom?.ok === false) {
+        console.error(`sha=${r.sha256} pubkey=${r.pubkey} (${r.scenario})`);
+        console.error(`  curl -X POST -H "Authorization: Bearer $BLOSSOM_WEBHOOK_SECRET" \\`);
+        console.error(`       ${DEFAULT_BLOSSOM_BASE}/admin/api/vanish \\`);
+        console.error(`       -d '{"pubkey":"${r.pubkey}","reason":"e2e-test manual cleanup"}'`);
+      }
+      if (r.cleanup?.d1?.ok === false) {
+        console.error(`  wrangler d1 execute ${DEFAULT_D1_DATABASE} --remote \\`);
+        console.error(`       --command "DELETE FROM creator_deletions WHERE kind5_id='${r.kind5Id}' AND target_event_id='${r.target}';"`);
+      }
+    }
+  }
+
+  const code = computeExitCode(results);
+  console.error(`\nExit: ${code}`);
+}
+
+function readBlossomSecret(deps) {
+  if (deps.blossomWebhookSecret) return deps.blossomWebhookSecret;
+  const env = deps.env || (typeof process !== 'undefined' ? process.env : {});
+  const s = env.BLOSSOM_WEBHOOK_SECRET;
+  if (!s) throw new Error('BLOSSOM_WEBHOOK_SECRET env var is required');
+  return s;
+}
+
+export async function main(argv, deps = {}) {
+  let cfg;
+  try {
+    cfg = parseArgs(argv);
+  } catch (e) {
+    console.error(`arg error: ${e.message}`);
+    return 2;
+  }
+
+  try {
+    cfg.blossomWebhookSecret = readBlossomSecret(deps);
+  } catch (e) {
+    console.error(e.message);
+    return 2;
+  }
+
+  const results = [];
+  if (cfg.scenario === 'sync' || cfg.scenario === 'both') {
+    const r = await runSyncScenario(cfg, deps);
+    results.push({ ...r, scenario: 'sync' });
+  }
+  if (cfg.scenario === 'cron' || cfg.scenario === 'both') {
+    const r = await runCronScenario(cfg, deps);
+    results.push({ ...r, scenario: 'cron' });
+  }
+
+  printSummary(results);
+  return computeExitCode(results);
+}

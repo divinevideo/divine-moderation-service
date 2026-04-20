@@ -513,6 +513,77 @@ describe('assertD1AndBlossomState', () => {
   });
 });
 
+import { computeExitCode, main } from './e2e-creator-delete.mjs';
+
+describe('computeExitCode', () => {
+  it('0 when all scenarios pass and all cleanups ok', () => {
+    expect(computeExitCode([
+      { outcome: 'pass', cleanup: { blossom: { errors: 0 }, d1: { ok: true } } },
+      { outcome: 'pass', cleanup: { blossom: { errors: 0 }, d1: { ok: true } } }
+    ])).toBe(0);
+  });
+
+  it('1 when any scenario fails, regardless of cleanup', () => {
+    expect(computeExitCode([
+      { outcome: 'fail', cleanup: { blossom: { errors: 0 }, d1: { ok: true } } }
+    ])).toBe(1);
+  });
+
+  it('3 when scenarios pass but a cleanup failed', () => {
+    expect(computeExitCode([
+      { outcome: 'pass', cleanup: { blossom: { errors: 0 }, d1: { ok: false, error: 'x' } } }
+    ])).toBe(3);
+  });
+
+  it('1 (takes precedence) when a scenario fails AND cleanup failed', () => {
+    expect(computeExitCode([
+      { outcome: 'fail', cleanup: { blossom: { ok: false, error: 'x' }, d1: { ok: false, error: 'y' } } }
+    ])).toBe(1);
+  });
+
+  it('0 when scenarios pass and cleanup was skipped', () => {
+    expect(computeExitCode([
+      { outcome: 'pass', cleanup: { skipped: true } }
+    ])).toBe(0);
+  });
+});
+
+describe('main (integration)', () => {
+  const baseDeps = {
+    uploadToBlossom: async () => ({ sha256: 'a'.repeat(64), url: 'u' }),
+    publishEvent: async (event) => event.id,
+    waitForIndexing: async () => ({ polls: 1 }),
+    callSyncEndpoint: async () => ({ accepted: true }),
+    pollStatus: async () => ({ status: 'success', blob_sha256: 'a'.repeat(64) }),
+    assertD1AndBlossomState: async () => ({ d1Status: 'success', byteProbe: { kind: 'bytes_gone', flagStateInferred: 'on' } }),
+    cleanupBlossomVanish: async () => ({ fullyDeleted: 1, unlinked: 0, errors: 0 }),
+    cleanupD1Row: async () => {},
+    blossomWebhookSecret: 'test-secret'
+  };
+
+  it('exits 0 on a passing both-scenarios run', async () => {
+    const code = await main(['--scenario=both'], baseDeps);
+    expect(code).toBe(0);
+  });
+
+  it('exits 1 when pollStatus reports failed:*', async () => {
+    const deps = { ...baseDeps, pollStatus: async () => ({ status: 'failed:permanent:target_not_found' }) };
+    const code = await main(['--scenario=sync'], deps);
+    expect(code).toBe(1);
+  });
+
+  it('exits 2 on missing BLOSSOM_WEBHOOK_SECRET', async () => {
+    const deps = { ...baseDeps, blossomWebhookSecret: null, env: {} };
+    const code = await main(['--scenario=sync'], deps);
+    expect(code).toBe(2);
+  });
+
+  it('exits 2 on invalid --scenario', async () => {
+    const code = await main(['--scenario=invalid'], baseDeps);
+    expect(code).toBe(2);
+  });
+});
+
 import { runSyncScenario, runCronScenario } from './e2e-creator-delete.mjs';
 
 describe('runSyncScenario', () => {
