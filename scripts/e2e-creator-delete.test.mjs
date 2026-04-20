@@ -114,3 +114,57 @@ describe('generateSyntheticBlob', () => {
     expect(a.sha256).not.toBe(b.sha256);
   });
 });
+
+import { buildKind34236Event } from './e2e-creator-delete.mjs';
+import { verifyEvent } from 'nostr-tools/pure';
+
+describe('buildKind34236Event', () => {
+  const cfg = parseArgs([]);
+  const SHA = 'a'.repeat(64);
+
+  it('returns a signed kind 34236 event with all required tags', () => {
+    const { sk } = generateTestKey();
+    const event = buildKind34236Event(sk, SHA, cfg);
+    expect(event.kind).toBe(34236);
+    expect(verifyEvent(event)).toBe(true);
+
+    const tagNames = event.tags.map(t => t[0]);
+    expect(tagNames).toContain('d');
+    expect(tagNames).toContain('title');
+    expect(tagNames).toContain('imeta');
+    expect(tagNames).toContain('thumb');
+  });
+
+  it('imeta tag contains space-delimited url/x/m items (Funnelcake contract)', () => {
+    const { sk } = generateTestKey();
+    const event = buildKind34236Event(sk, SHA, cfg);
+    const imeta = event.tags.find(t => t[0] === 'imeta');
+    expect(imeta).toBeDefined();
+
+    // validate_imeta_format: each non-first item must contain a space
+    for (const item of imeta.slice(1)) {
+      expect(item).toMatch(/\s/);
+    }
+
+    // Required keys for our test blob
+    const itemsByKey = Object.fromEntries(
+      imeta.slice(1).map(item => {
+        const idx = item.indexOf(' ');
+        return [item.slice(0, idx), item.slice(idx + 1)];
+      })
+    );
+    expect(itemsByKey.url).toMatch(/^https?:\/\//);
+    expect(itemsByKey.x).toBe(SHA);
+    expect(itemsByKey.m).toBe('video/mp4');
+  });
+
+  it('d tag is unique across calls (prevents addressable-event collision)', () => {
+    const { sk: sk1 } = generateTestKey();
+    const { sk: sk2 } = generateTestKey();
+    const e1 = buildKind34236Event(sk1, SHA, cfg);
+    const e2 = buildKind34236Event(sk2, SHA, cfg);
+    const d1 = e1.tags.find(t => t[0] === 'd')[1];
+    const d2 = e2.tags.find(t => t[0] === 'd')[1];
+    expect(d1).not.toBe(d2);
+  });
+});

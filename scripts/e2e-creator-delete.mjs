@@ -65,7 +65,7 @@ export function parseArgs(argv) {
   };
 }
 
-import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { generateSecretKey, getPublicKey, finalizeEvent } from 'nostr-tools/pure';
 import { sha256 as sha256Hash } from '@noble/hashes/sha256';
 import { bytesToHex, randomBytes } from '@noble/hashes/utils';
 
@@ -99,4 +99,33 @@ export function generateSyntheticBlob() {
   bytes.set(payload, 32);
   const sha256 = bytesToHex(sha256Hash(bytes));
   return { bytes, sha256 };
+}
+
+/**
+ * Build and sign a kind 34236 event that passes Funnelcake's validation at
+ * divine-funnelcake/crates/relay/src/relay.rs:1023-1087.
+ *
+ * Required: d (unique), title, imeta with url+x+m (each space-delimited item
+ * per validate_imeta_format), and a thumb-equivalent. Thumb URL does not need
+ * to resolve.
+ */
+export function buildKind34236Event(sk, sha256, cfg) {
+  const blobUrl = `${cfg.blossomBase}/${sha256}`;
+  const thumbUrl = `${cfg.blossomBase}/${sha256}.jpg`;
+  // Unique d tag per run: timestamp + random suffix ensures no collision across
+  // concurrent or rapid-fire test runs with the same key (not our normal case
+  // but cheap to defend against).
+  const dTag = `e2e-test-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  return finalizeEvent({
+    kind: 34236,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [
+      ['d', dTag],
+      ['title', 'creator-delete e2e test video'],
+      ['imeta', `url ${blobUrl}`, `x ${sha256}`, `m video/mp4`],
+      ['thumb', thumbUrl]
+    ],
+    content: 'Synthetic 1KB test blob published by scripts/e2e-creator-delete.mjs'
+  }, sk);
 }
