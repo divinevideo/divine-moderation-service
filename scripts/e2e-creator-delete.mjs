@@ -627,3 +627,15 @@ export async function main(argv, deps = {}) {
   printSummary(results);
   return computeExitCode(results);
 }
+
+// CLI entrypoint — runs only when invoked directly (not when imported by tests).
+const isMain = typeof process !== 'undefined' && process.argv && import.meta.url === `file://${process.argv[1]}`;
+if (isMain) {
+  main(process.argv.slice(2)).then(
+    (code) => process.exit(code),
+    (err) => {
+      process.stderr.write(`unexpected error: ${err.stack || err.message}\n`);
+      process.exit(99);
+    }
+  );
+}
