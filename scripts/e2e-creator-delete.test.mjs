@@ -79,3 +79,38 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--staging-relay'])).toThrow(/requires a value/i);
   });
 });
+
+import { generateTestKey, generateSyntheticBlob } from './e2e-creator-delete.mjs';
+import { getPublicKey } from 'nostr-tools/pure';
+import { sha256 as sha256Hash } from '@noble/hashes/sha256';
+import { bytesToHex } from '@noble/hashes/utils';
+
+describe('generateTestKey', () => {
+  it('returns a fresh nsec + hex pubkey each call', () => {
+    const a = generateTestKey();
+    const b = generateTestKey();
+    expect(a.sk).not.toEqual(b.sk);
+    expect(a.pubkey).toMatch(/^[0-9a-f]{64}$/);
+    expect(a.pubkey).toBe(getPublicKey(a.sk));
+  });
+});
+
+describe('generateSyntheticBlob', () => {
+  it('returns exactly 1024 bytes', () => {
+    const { bytes } = generateSyntheticBlob();
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(bytes.length).toBe(1024);
+  });
+
+  it('returns a sha256 that matches the bytes', () => {
+    const { bytes, sha256 } = generateSyntheticBlob();
+    const computed = bytesToHex(sha256Hash(bytes));
+    expect(sha256).toBe(computed);
+  });
+
+  it('produces a different sha256 on each call', () => {
+    const a = generateSyntheticBlob();
+    const b = generateSyntheticBlob();
+    expect(a.sha256).not.toBe(b.sha256);
+  });
+});

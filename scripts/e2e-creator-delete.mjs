@@ -64,3 +64,39 @@ export function parseArgs(argv) {
     skipCleanup: getFlag(argv, 'skip-cleanup') === true
   };
 }
+
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { sha256 as sha256Hash } from '@noble/hashes/sha256';
+import { bytesToHex, randomBytes } from '@noble/hashes/utils';
+
+export function generateTestKey() {
+  const sk = generateSecretKey();
+  return { sk, pubkey: getPublicKey(sk) };
+}
+
+// Minimal ISO-BMFF ftyp box so the payload at least looks like MP4 to a casual
+// inspector. 1024 bytes total: 32-byte header + 992 bytes of random payload so
+// each run has a unique sha256.
+export function generateSyntheticBlob() {
+  const header = new Uint8Array([
+    // box size (32 bytes)
+    0x00, 0x00, 0x00, 0x20,
+    // 'ftyp'
+    0x66, 0x74, 0x79, 0x70,
+    // major brand 'isom'
+    0x69, 0x73, 0x6f, 0x6d,
+    // minor version (0x00000200)
+    0x00, 0x00, 0x02, 0x00,
+    // compatible brands: 'isom', 'iso2', 'avc1', 'mp41'
+    0x69, 0x73, 0x6f, 0x6d,
+    0x69, 0x73, 0x6f, 0x32,
+    0x61, 0x76, 0x63, 0x31,
+    0x6d, 0x70, 0x34, 0x31
+  ]);
+  const payload = randomBytes(992);
+  const bytes = new Uint8Array(1024);
+  bytes.set(header, 0);
+  bytes.set(payload, 32);
+  const sha256 = bytesToHex(sha256Hash(bytes));
+  return { bytes, sha256 };
+}
