@@ -173,3 +173,40 @@ export async function cleanupD1Row(kind5_id, target_event_id, cfg, runner = defa
     throw new Error(`wrangler d1 execute failed (exit ${r.status}): ${r.stderr.trim() || r.stdout.trim()}`);
   }
 }
+
+/**
+ * Fully purge the single blob owned by the test pubkey.
+ *
+ * Uses POST /admin/api/vanish (verified at divine-blossom/src/main.rs:209 →
+ * handle_admin_vanish, src/main.rs:3975 → execute_vanish). For a fresh
+ * ephemeral pubkey that owns exactly one blob, this is surgical: full GCS +
+ * KV + VCL purge of the test blob and nothing else.
+ *
+ * Expects a successful vanish to return { vanished: true, fully_deleted, unlinked, errors }.
+ * fully_deleted:0 is acceptable (pipeline may have already purged the blob).
+ * errors > 0 indicates Blossom couldn't fully process; surface as failure.
+ */
+export async function cleanupBlossomVanish(testPubkey, cfg, fetchImpl = fetch) {
+  const res = await fetchImpl(`${cfg.blossomBase}/admin/api/vanish`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${cfg.blossomWebhookSecret}`
+    },
+    body: JSON.stringify({ pubkey: testPubkey, reason: 'e2e-test cleanup' })
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Blossom vanish failed: HTTP ${res.status}: ${text}`);
+  }
+  const body = await res.json();
+  const out = {
+    fullyDeleted: body.fully_deleted ?? 0,
+    unlinked: body.unlinked ?? 0,
+    errors: body.errors ?? 0
+  };
+  if (out.errors > 0) {
+    throw new Error(`Blossom vanish reported errors:${out.errors} fully_deleted:${out.fullyDeleted} unlinked:${out.unlinked}`);
+  }
+  return out;
+}

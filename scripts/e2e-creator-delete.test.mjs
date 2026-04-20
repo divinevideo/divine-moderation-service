@@ -243,3 +243,60 @@ describe('cleanupD1Row', () => {
     expect(runner.calls.length).toBe(0);
   });
 });
+
+import { cleanupBlossomVanish } from './e2e-creator-delete.mjs';
+
+function makeFakeFetch(impl) {
+  const calls = [];
+  const fn = async (url, init) => {
+    calls.push({ url, init });
+    return impl({ url, init });
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+describe('cleanupBlossomVanish', () => {
+  const cfg = { ...parseArgs([]), blossomWebhookSecret: 'test-secret' };
+  const PUBKEY = 'f'.repeat(64);
+
+  it('POSTs to /admin/api/vanish with bearer auth and pubkey+reason body', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ vanished: true, pubkey: PUBKEY, reason: 'e2e-test cleanup', fully_deleted: 1, unlinked: 0, errors: 0 })
+    }));
+    const out = await cleanupBlossomVanish(PUBKEY, cfg, fetchImpl);
+    expect(fetchImpl.calls.length).toBe(1);
+    const call = fetchImpl.calls[0];
+    expect(call.url).toBe(`${cfg.blossomBase}/admin/api/vanish`);
+    expect(call.init.method).toBe('POST');
+    expect(call.init.headers.Authorization).toBe('Bearer test-secret');
+    expect(call.init.headers['Content-Type']).toBe('application/json');
+    const body = JSON.parse(call.init.body);
+    expect(body.pubkey).toBe(PUBKEY);
+    expect(body.reason).toBe('e2e-test cleanup');
+    expect(out).toEqual({ fullyDeleted: 1, unlinked: 0, errors: 0 });
+  });
+
+  it('throws on HTTP 4xx/5xx', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 500, text: async () => 'bad gateway' }));
+    await expect(cleanupBlossomVanish(PUBKEY, cfg, fetchImpl)).rejects.toThrow(/500/);
+  });
+
+  it('throws when vanish body reports errors > 0', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ vanished: true, pubkey: PUBKEY, fully_deleted: 0, unlinked: 0, errors: 1 })
+    }));
+    await expect(cleanupBlossomVanish(PUBKEY, cfg, fetchImpl)).rejects.toThrow(/errors/);
+  });
+
+  it('tolerates fully_deleted:0 unlinked:0 (blob already gone from a previous cleanup)', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ vanished: true, pubkey: PUBKEY, fully_deleted: 0, unlinked: 0, errors: 0 })
+    }));
+    const out = await cleanupBlossomVanish(PUBKEY, cfg, fetchImpl);
+    expect(out).toEqual({ fullyDeleted: 0, unlinked: 0, errors: 0 });
+  });
+});
