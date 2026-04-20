@@ -187,6 +187,9 @@ export async function cleanupD1Row(kind5_id, target_event_id, cfg, runner = defa
  * errors > 0 indicates Blossom couldn't fully process; surface as failure.
  */
 export async function cleanupBlossomVanish(testPubkey, cfg, fetchImpl = fetch) {
+  if (!cfg.blossomWebhookSecret) {
+    throw new Error('cleanupBlossomVanish: cfg.blossomWebhookSecret is required');
+  }
   const res = await fetchImpl(`${cfg.blossomBase}/admin/api/vanish`, {
     method: 'POST',
     headers: {

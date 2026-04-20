@@ -299,4 +299,11 @@ describe('cleanupBlossomVanish', () => {
     const out = await cleanupBlossomVanish(PUBKEY, cfg, fetchImpl);
     expect(out).toEqual({ fullyDeleted: 0, unlinked: 0, errors: 0 });
   });
+
+  it('throws when cfg.blossomWebhookSecret is missing', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({ ok: true, status: 200, json: async () => ({ fully_deleted: 1, unlinked: 0, errors: 0 }) }));
+    const cfgNoSecret = { ...parseArgs([]) };
+    await expect(cleanupBlossomVanish(PUBKEY, cfgNoSecret, fetchImpl)).rejects.toThrow(/blossomWebhookSecret/);
+    expect(fetchImpl.calls.length).toBe(0);
+  });
 });
