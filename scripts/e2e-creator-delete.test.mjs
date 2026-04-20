@@ -307,3 +307,45 @@ describe('cleanupBlossomVanish', () => {
     expect(fetchImpl.calls.length).toBe(0);
   });
 });
+
+import { uploadToBlossom, buildBud01UploadAuth } from './e2e-creator-delete.mjs';
+
+describe('buildBud01UploadAuth', () => {
+  const SHA = 'a'.repeat(64);
+  it('returns a Nostr-scheme header with kind 24242 event containing t=upload and x=sha', () => {
+    const { sk } = generateTestKey();
+    const header = buildBud01UploadAuth(sk, SHA);
+    expect(header.startsWith('Nostr ')).toBe(true);
+    const eventJson = Buffer.from(header.slice('Nostr '.length), 'base64').toString('utf8');
+    const event = JSON.parse(eventJson);
+    expect(event.kind).toBe(24242);
+    expect(event.tags).toEqual(expect.arrayContaining([['t', 'upload'], ['x', SHA]]));
+  });
+});
+
+describe('uploadToBlossom', () => {
+  const cfg = parseArgs([]);
+  const SHA = 'a'.repeat(64);
+
+  it('PUTs the bytes to /upload with BUD-01 auth and returns the parsed response', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ url: `${cfg.blossomBase}/${SHA}`, sha256: SHA, size: 1024 })
+    }));
+    const { sk } = generateTestKey();
+    const bytes = new Uint8Array(1024);
+    const out = await uploadToBlossom(bytes, SHA, sk, cfg, fetchImpl);
+    expect(fetchImpl.calls.length).toBe(1);
+    expect(fetchImpl.calls[0].url).toBe(`${cfg.blossomBase}/upload`);
+    expect(fetchImpl.calls[0].init.method).toBe('PUT');
+    expect(fetchImpl.calls[0].init.headers.Authorization.startsWith('Nostr ')).toBe(true);
+    expect(fetchImpl.calls[0].init.body).toBe(bytes);
+    expect(out).toEqual({ url: `${cfg.blossomBase}/${SHA}`, sha256: SHA });
+  });
+
+  it('throws on non-2xx', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 413, text: async () => 'too large' }));
+    const { sk } = generateTestKey();
+    await expect(uploadToBlossom(new Uint8Array(1), SHA, sk, cfg, fetchImpl)).rejects.toThrow(/413/);
+  });
+});

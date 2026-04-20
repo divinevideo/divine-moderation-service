@@ -213,3 +213,42 @@ export async function cleanupBlossomVanish(testPubkey, cfg, fetchImpl = fetch) {
   }
   return out;
 }
+
+/**
+ * BUD-01 upload authorization. Signed kind 24242 event with:
+ *   - t tag: "upload"
+ *   - x tag: sha256 of the payload
+ *   - expiration tag: unix timestamp (5 minutes from now)
+ */
+export function buildBud01UploadAuth(sk, sha256) {
+  const expiration = Math.floor(Date.now() / 1000) + 300;
+  const event = finalizeEvent({
+    kind: 24242,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [
+      ['t', 'upload'],
+      ['x', sha256],
+      ['expiration', String(expiration)]
+    ],
+    content: 'creator-delete e2e test upload'
+  }, sk);
+  return `Nostr ${Buffer.from(JSON.stringify(event)).toString('base64')}`;
+}
+
+export async function uploadToBlossom(bytes, sha256, sk, cfg, fetchImpl = fetch) {
+  const res = await fetchImpl(`${cfg.blossomBase}/upload`, {
+    method: 'PUT',
+    headers: {
+      Authorization: buildBud01UploadAuth(sk, sha256),
+      'Content-Type': 'video/mp4',
+      'Content-Length': String(bytes.length)
+    },
+    body: bytes
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Blossom upload failed: HTTP ${res.status}: ${text}`);
+  }
+  const body = await res.json();
+  return { url: body.url || `${cfg.blossomBase}/${sha256}`, sha256 };
+}
