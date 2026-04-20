@@ -142,3 +142,34 @@ export function classifyByteProbeResponse(status) {
   if (status === 200) return { kind: 'bytes_present', flagStateInferred: 'off' };
   return { kind: 'unknown', status };
 }
+
+/**
+ * Default runner used when the script runs as a CLI. Tests inject a fake.
+ * Uses spawnSync (args is an array, not a string — no shell interpretation).
+ * The node:child_process import is deferred via dynamic import() so the
+ * Cloudflare Workers vitest pool does not try to resolve it at module-load
+ * time (nodejs_compat does not expose child_process there).
+ */
+export async function defaultRunner({ command, args }) {
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  return { stdout: r.stdout || '', stderr: r.stderr || '', status: r.status ?? 0 };
+}
+
+function validateHex64(value, fieldName) {
+  if (typeof value !== 'string' || !SHA256_HEX.test(value)) {
+    throw new Error(`Invalid ${fieldName}: ${value} (must be 64-char lowercase hex)`);
+  }
+  return value;
+}
+
+export async function cleanupD1Row(kind5_id, target_event_id, cfg, runner = defaultRunner) {
+  validateHex64(kind5_id, 'kind5_id');
+  validateHex64(target_event_id, 'target_event_id');
+  const sql = `DELETE FROM creator_deletions WHERE kind5_id = '${kind5_id}' AND target_event_id = '${target_event_id}';`;
+  const args = ['d1', 'execute', cfg.d1Database, '--remote', '--json', '--command', sql];
+  const r = await runner({ command: 'wrangler', args });
+  if (r.status !== 0) {
+    throw new Error(`wrangler d1 execute failed (exit ${r.status}): ${r.stderr.trim() || r.stdout.trim()}`);
+  }
+}

@@ -199,3 +199,47 @@ describe('classifyByteProbeResponse', () => {
     expect(classifyByteProbeResponse(0).kind).toBe('unknown');
   });
 });
+
+import { cleanupD1Row } from './e2e-creator-delete.mjs';
+
+function makeFakeRunner(responseFor) {
+  const calls = [];
+  const fn = async ({ command, args }) => {
+    calls.push({ command, args });
+    const sql = args[args.indexOf('--command') + 1];
+    return responseFor(sql);
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+const WRANGLER_OK = JSON.stringify([{ results: [], success: true, meta: {} }]);
+
+describe('cleanupD1Row', () => {
+  const cfg = parseArgs([]);
+  const KIND5 = 'a'.repeat(64);
+  const TARGET = 'b'.repeat(64);
+
+  it('runs wrangler d1 execute with a DELETE matching the composite primary key', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: WRANGLER_OK, stderr: '', status: 0 }));
+    await cleanupD1Row(KIND5, TARGET, cfg, runner);
+    expect(runner.calls.length).toBe(1);
+    expect(runner.calls[0].args.slice(0, 5)).toEqual(['d1', 'execute', cfg.d1Database, '--remote', '--json']);
+    const sql = runner.calls[0].args[runner.calls[0].args.indexOf('--command') + 1];
+    expect(sql).toContain('DELETE FROM creator_deletions');
+    expect(sql).toContain(`kind5_id = '${KIND5}'`);
+    expect(sql).toContain(`target_event_id = '${TARGET}'`);
+  });
+
+  it('throws when wrangler exits non-zero', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: '', stderr: 'd1 unreachable', status: 1 }));
+    await expect(cleanupD1Row(KIND5, TARGET, cfg, runner)).rejects.toThrow(/d1 unreachable/i);
+  });
+
+  it('rejects kind5 or target that is not 64-char hex (prevents SQL interpolation risk)', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: WRANGLER_OK, stderr: '', status: 0 }));
+    await expect(cleanupD1Row('not-hex', TARGET, cfg, runner)).rejects.toThrow(/kind5_id/i);
+    await expect(cleanupD1Row(KIND5, 'not-hex', cfg, runner)).rejects.toThrow(/target_event_id/i);
+    expect(runner.calls.length).toBe(0);
+  });
+});
