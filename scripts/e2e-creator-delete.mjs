@@ -316,3 +316,55 @@ export async function publishEvent(event, relayUrl, opts = {}) {
     });
   });
 }
+
+import { signNip98Header } from './sign-nip98.mjs';
+
+export async function callSyncEndpoint(sk, kind5Event, cfg, fetchImpl = fetch) {
+  const url = `${cfg.modServiceBase}/api/creator-delete/sync`;
+  const res = await fetchImpl(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: signNip98Header(sk, url, 'POST')
+    },
+    body: JSON.stringify(kind5Event)
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`sync endpoint HTTP ${res.status}: ${text}`);
+  }
+  return await res.json();
+}
+
+/**
+ * Poll the status endpoint until the row reaches a terminal status
+ * (success OR failed:*). Returns the final body so the caller can distinguish.
+ *
+ * Re-signs NIP-98 per poll so the signature stays fresh and the `u` tag always
+ * matches the request URL exactly (see PR #104 URL-normalization fix).
+ */
+export async function pollStatus(sk, kind5Id, cfg, opts = {}) {
+  const fetchImpl = opts.fetchImpl || fetch;
+  const timeoutMs = opts.timeoutMs ?? 60000;
+  const pollIntervalMs = opts.pollIntervalMs ?? 2000;
+  const url = `${cfg.modServiceBase}/api/creator-delete/status/${kind5Id}`;
+  const deadline = Date.now() + timeoutMs;
+  let polls = 0;
+  while (Date.now() < deadline) {
+    polls++;
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      headers: { Authorization: signNip98Header(sk, url, 'GET') }
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`status endpoint HTTP ${res.status}: ${text}`);
+    }
+    const body = await res.json();
+    if (body.status === 'success' || (typeof body.status === 'string' && body.status.startsWith('failed:'))) {
+      return { ...body, polls };
+    }
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+  }
+  throw new Error(`timeout after ${timeoutMs}ms: kind5 ${kind5Id} did not reach terminal status. Common cause: CREATOR_DELETE_PIPELINE_ENABLED may be unset on the prod worker.`);
+}

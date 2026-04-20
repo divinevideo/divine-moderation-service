@@ -391,3 +391,70 @@ describe('waitForIndexing', () => {
     ).rejects.toThrow(/500/);
   });
 });
+
+import { callSyncEndpoint, pollStatus } from './e2e-creator-delete.mjs';
+
+describe('callSyncEndpoint', () => {
+  const cfg = parseArgs([]);
+
+  it('POSTs to /api/creator-delete/sync with NIP-98 Authorization + kind 5 body', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({ ok: true, status: 202, json: async () => ({ accepted: true }) }));
+    const { sk } = generateTestKey();
+    const kind5 = { id: 'a'.repeat(64), kind: 5, pubkey: 'f'.repeat(64), tags: [], content: '', created_at: 0, sig: '00' };
+    await callSyncEndpoint(sk, kind5, cfg, fetchImpl);
+    expect(fetchImpl.calls.length).toBe(1);
+    const call = fetchImpl.calls[0];
+    expect(call.url).toBe(`${cfg.modServiceBase}/api/creator-delete/sync`);
+    expect(call.init.method).toBe('POST');
+    expect(call.init.headers.Authorization.startsWith('Nostr ')).toBe(true);
+    expect(JSON.parse(call.init.body)).toEqual(kind5);
+  });
+
+  it('throws on 4xx/5xx', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 400, text: async () => 'bad request' }));
+    const { sk } = generateTestKey();
+    const kind5 = { id: 'a'.repeat(64), kind: 5, pubkey: 'f'.repeat(64), tags: [], content: '', created_at: 0, sig: '00' };
+    await expect(callSyncEndpoint(sk, kind5, cfg, fetchImpl)).rejects.toThrow(/400/);
+  });
+});
+
+describe('pollStatus', () => {
+  const cfg = parseArgs([]);
+  const KIND5 = 'a'.repeat(64);
+
+  it('resolves with the terminal success body', async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      if (calls < 3) return { ok: true, status: 200, json: async () => ({ status: 'accepted' }) };
+      return { ok: true, status: 200, json: async () => ({ status: 'success', blob_sha256: 'a'.repeat(64) }) };
+    };
+    const { sk } = generateTestKey();
+    const out = await pollStatus(sk, KIND5, cfg, { fetchImpl, timeoutMs: 5000, pollIntervalMs: 10 });
+    expect(out.status).toBe('success');
+    expect(calls).toBe(3);
+  });
+
+  it('resolves when status reaches a failed:* terminal (returns the body for caller to assert on)', async () => {
+    const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ status: 'failed:permanent:target_not_found' }) });
+    const { sk } = generateTestKey();
+    const out = await pollStatus(sk, KIND5, cfg, { fetchImpl, timeoutMs: 5000, pollIntervalMs: 10 });
+    expect(out.status).toBe('failed:permanent:target_not_found');
+  });
+
+  it('throws on timeout if no terminal status is reached', async () => {
+    const fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ status: 'accepted' }) });
+    const { sk } = generateTestKey();
+    await expect(
+      pollStatus(sk, KIND5, cfg, { fetchImpl, timeoutMs: 40, pollIntervalMs: 10 })
+    ).rejects.toThrow(/timeout/i);
+  });
+
+  it('throws on non-2xx', async () => {
+    const fetchImpl = async () => ({ ok: false, status: 401, text: async () => 'unauthorized' });
+    const { sk } = generateTestKey();
+    await expect(
+      pollStatus(sk, KIND5, cfg, { fetchImpl, timeoutMs: 5000, pollIntervalMs: 10 })
+    ).rejects.toThrow(/401/);
+  });
+});
