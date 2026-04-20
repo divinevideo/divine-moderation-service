@@ -368,3 +368,50 @@ export async function pollStatus(sk, kind5Id, cfg, opts = {}) {
   }
   throw new Error(`timeout after ${timeoutMs}ms: kind5 ${kind5Id} did not reach terminal status. Common cause: CREATOR_DELETE_PIPELINE_ENABLED may be unset on the prod worker.`);
 }
+
+/**
+ * Verify that the pipeline completed successfully:
+ * - D1 row exists with status='success'
+ * - blob_sha256 matches the expected value
+ * - Blossom byte probe indicates the final state (bytes_gone or bytes_present)
+ *
+ * Returns { d1Status, byteProbe } for caller to record in JSONL output.
+ * byteProbe.kind is 'bytes_gone' (flag was on) or 'bytes_present' (flag was off).
+ * Both are acceptable final states; the test records which one actually occurred.
+ */
+export async function assertD1AndBlossomState(kind5Id, expectedSha, cfg, deps = {}) {
+  validateHex64(kind5Id, 'kind5_id');
+  validateHex64(expectedSha, 'expectedSha');
+
+  const runner = deps.runner || defaultRunner;
+  const fetchImpl = deps.fetchImpl || fetch;
+
+  // (a) D1 row check
+  const sql = `SELECT kind5_id, target_event_id, blob_sha256, status FROM creator_deletions WHERE kind5_id = '${kind5Id}';`;
+  const args = ['d1', 'execute', cfg.d1Database, '--remote', '--json', '--command', sql];
+  const r = await runner({ command: 'wrangler', args });
+  if (r.status !== 0) {
+    throw new Error(`wrangler d1 execute failed (exit ${r.status}): ${r.stderr.trim() || r.stdout.trim()}`);
+  }
+  const parsed = JSON.parse(r.stdout);
+  const rows = (parsed?.[0]?.results) || [];
+  if (rows.length === 0) {
+    throw new Error(`D1 row not found for kind5_id=${kind5Id}`);
+  }
+  const row = rows[0];
+  if (row.status !== 'success') {
+    throw new Error(`expected D1 status='success', got status=${row.status}`);
+  }
+  if (row.blob_sha256 !== expectedSha) {
+    throw new Error(`blob_sha256 mismatch: D1 has ${row.blob_sha256}, expected ${expectedSha}`);
+  }
+
+  // (b) Blossom byte probe
+  const probe = await fetchImpl(`${cfg.blossomBase}/${expectedSha}`, { method: 'GET' });
+  const byteProbe = classifyByteProbeResponse(probe.status);
+  if (byteProbe.kind === 'unknown') {
+    throw new Error(`Blossom byte probe returned unknown status: ${probe.status}`);
+  }
+
+  return { d1Status: row.status, byteProbe };
+}

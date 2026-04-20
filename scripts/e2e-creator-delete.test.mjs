@@ -458,3 +458,57 @@ describe('pollStatus', () => {
     ).rejects.toThrow(/401/);
   });
 });
+
+import { assertD1AndBlossomState } from './e2e-creator-delete.mjs';
+
+describe('assertD1AndBlossomState', () => {
+  const cfg = parseArgs([]);
+  const KIND5 = 'a'.repeat(64);
+  const TARGET = 'b'.repeat(64);
+  const SHA = 'c'.repeat(64);
+
+  const makeD1Row = (overrides) => JSON.stringify([{
+    results: [{ kind5_id: KIND5, target_event_id: TARGET, blob_sha256: SHA, status: 'success', ...overrides }],
+    success: true, meta: {}
+  }]);
+
+  it('passes when D1 row status=success and Blossom returns 404 (bytes gone)', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: makeD1Row(), stderr: '', status: 0 }));
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 404, text: async () => 'not found' }));
+    const out = await assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl });
+    expect(out.d1Status).toBe('success');
+    expect(out.byteProbe).toMatchObject({ kind: 'bytes_gone', flagStateInferred: 'on' });
+  });
+
+  it('passes when D1 row status=success and Blossom returns 200 (bytes present, flag off)', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: makeD1Row(), stderr: '', status: 0 }));
+    const fetchImpl = makeFakeFetch(async () => ({ ok: true, status: 200, text: async () => 'bytes' }));
+    const out = await assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl });
+    expect(out.byteProbe).toMatchObject({ kind: 'bytes_present', flagStateInferred: 'off' });
+  });
+
+  it('fails when D1 row is missing', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: JSON.stringify([{ results: [], success: true, meta: {} }]), stderr: '', status: 0 }));
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 404, text: async () => '' }));
+    await expect(assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl })).rejects.toThrow(/D1 row not found/i);
+  });
+
+  it('fails when D1 row status is not success', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: makeD1Row({ status: 'failed:transient:timeout' }), stderr: '', status: 0 }));
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 404, text: async () => '' }));
+    await expect(assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl })).rejects.toThrow(/status=failed:transient:timeout/i);
+  });
+
+  it('fails when byte probe returns unknown status', async () => {
+    const runner = makeFakeRunner(() => ({ stdout: makeD1Row(), stderr: '', status: 0 }));
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 500, text: async () => 'server error' }));
+    await expect(assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl })).rejects.toThrow(/byte probe returned unknown/i);
+  });
+
+  it('fails when sha256 on the D1 row does not match the expected sha', async () => {
+    const wrongSha = 'e'.repeat(64);
+    const runner = makeFakeRunner(() => ({ stdout: makeD1Row({ blob_sha256: wrongSha }), stderr: '', status: 0 }));
+    const fetchImpl = makeFakeFetch(async () => ({ ok: false, status: 404, text: async () => '' }));
+    await expect(assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl })).rejects.toThrow(/blob_sha256 mismatch/i);
+  });
+});
