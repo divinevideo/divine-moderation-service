@@ -512,3 +512,114 @@ describe('assertD1AndBlossomState', () => {
     await expect(assertD1AndBlossomState(KIND5, SHA, cfg, { runner, fetchImpl })).rejects.toThrow(/blob_sha256 mismatch/i);
   });
 });
+
+import { runSyncScenario, runCronScenario } from './e2e-creator-delete.mjs';
+
+describe('runSyncScenario', () => {
+  const cfg = { ...parseArgs([]), blossomWebhookSecret: 'test-secret' };
+
+  function makeDeps({ uploadResult, publishEventIds, statusBody, d1Row, byteProbeStatus, vanishResult }) {
+    const published = [];
+    return {
+      uploadToBlossom: async () => uploadResult,
+      publishEvent: async (event) => {
+        published.push(event);
+        return publishEventIds.shift() || event.id;
+      },
+      waitForIndexing: async () => ({ polls: 1 }),
+      callSyncEndpoint: async () => ({ accepted: true }),
+      pollStatus: async () => statusBody,
+      runner: makeFakeRunner((sql) => {
+        if (sql.startsWith('SELECT')) {
+          return { stdout: JSON.stringify([{ results: [d1Row], success: true, meta: {} }]), stderr: '', status: 0 };
+        }
+        if (sql.startsWith('DELETE')) {
+          return { stdout: JSON.stringify([{ results: [], success: true, meta: {} }]), stderr: '', status: 0 };
+        }
+        throw new Error('unexpected sql: ' + sql.slice(0, 80));
+      }),
+      fetchImpl: makeFakeFetch(async ({ url }) => {
+        if (url.endsWith('/admin/api/vanish')) {
+          return { ok: true, status: 200, json: async () => vanishResult };
+        }
+        // byte probe
+        return { ok: byteProbeStatus === 200, status: byteProbeStatus, text: async () => '' };
+      }),
+      published
+    };
+  }
+
+  it('passes end-to-end with flag-on path (byte probe 404)', async () => {
+    const SHA = 'a'.repeat(64);
+    const deps = makeDeps({
+      uploadResult: { sha256: SHA, url: `${cfg.blossomBase}/${SHA}` },
+      publishEventIds: [],
+      statusBody: { status: 'success', blob_sha256: SHA, polls: 4 },
+      d1Row: { kind5_id: '', target_event_id: '', blob_sha256: SHA, status: 'success' },
+      byteProbeStatus: 404,
+      vanishResult: { vanished: true, fully_deleted: 1, unlinked: 0, errors: 0 }
+    });
+    const result = await runSyncScenario(cfg, deps);
+    expect(result.outcome).toBe('pass');
+    expect(result.cleanup.blossom.fullyDeleted).toBe(1);
+    expect(result.cleanup.d1.ok).toBe(true);
+  });
+
+  it('fails when pollStatus returns a failed:* terminal, but cleanup still runs', async () => {
+    const SHA = 'a'.repeat(64);
+    const deps = makeDeps({
+      uploadResult: { sha256: SHA, url: `${cfg.blossomBase}/${SHA}` },
+      publishEventIds: [],
+      statusBody: { status: 'failed:permanent:target_not_found' },
+      d1Row: { kind5_id: '', target_event_id: '', blob_sha256: SHA, status: 'failed:permanent:target_not_found' },
+      byteProbeStatus: 200,
+      vanishResult: { vanished: true, fully_deleted: 1, unlinked: 0, errors: 0 }
+    });
+    const result = await runSyncScenario(cfg, deps);
+    expect(result.outcome).toBe('fail');
+    expect(result.cleanup.blossom.fullyDeleted).toBe(1);
+  });
+
+  it('skips cleanup when cfg.skipCleanup is true', async () => {
+    const SHA = 'a'.repeat(64);
+    const cfgNoCleanup = { ...cfg, skipCleanup: true };
+    const deps = makeDeps({
+      uploadResult: { sha256: SHA, url: `${cfg.blossomBase}/${SHA}` },
+      publishEventIds: [],
+      statusBody: { status: 'success', blob_sha256: SHA },
+      d1Row: { kind5_id: '', target_event_id: '', blob_sha256: SHA, status: 'success' },
+      byteProbeStatus: 404,
+      vanishResult: { vanished: true, fully_deleted: 1, unlinked: 0, errors: 0 }
+    });
+    const result = await runSyncScenario(cfgNoCleanup, deps);
+    expect(result.outcome).toBe('pass');
+    expect(result.cleanup).toEqual({ skipped: true });
+  });
+});
+
+describe('runCronScenario', () => {
+  const cfg = { ...parseArgs([]), blossomWebhookSecret: 'test-secret' };
+
+  it('does NOT call the sync endpoint; relies on pollStatus for cron-triggered D1 update', async () => {
+    const SHA = 'a'.repeat(64);
+    let syncCalls = 0;
+    const deps = {
+      uploadToBlossom: async () => ({ sha256: SHA, url: `${cfg.blossomBase}/${SHA}` }),
+      publishEvent: async (event) => event.id,
+      waitForIndexing: async () => ({ polls: 1 }),
+      callSyncEndpoint: async () => { syncCalls++; return { accepted: true }; },
+      pollStatus: async () => ({ status: 'success', blob_sha256: SHA }),
+      runner: makeFakeRunner((sql) => {
+        if (sql.startsWith('SELECT')) return { stdout: JSON.stringify([{ results: [{ kind5_id: '', target_event_id: '', blob_sha256: SHA, status: 'success' }], success: true, meta: {} }]), stderr: '', status: 0 };
+        return { stdout: JSON.stringify([{ results: [], success: true, meta: {} }]), stderr: '', status: 0 };
+      }),
+      fetchImpl: makeFakeFetch(async ({ url }) => {
+        if (url.endsWith('/admin/api/vanish')) return { ok: true, status: 200, json: async () => ({ vanished: true, fully_deleted: 1, unlinked: 0, errors: 0 }) };
+        return { ok: false, status: 404, text: async () => '' };
+      })
+    };
+    const result = await runCronScenario(cfg, deps);
+    expect(syncCalls).toBe(0);
+    expect(result.outcome).toBe('pass');
+  });
+});

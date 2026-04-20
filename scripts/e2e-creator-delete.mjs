@@ -415,3 +415,116 @@ export async function assertD1AndBlossomState(kind5Id, expectedSha, cfg, deps = 
 
   return { d1Status: row.status, byteProbe };
 }
+
+function nowIso() { return new Date().toISOString(); }
+
+function emit(obj) { console.log(JSON.stringify(obj)); }
+
+async function runScenario(name, cfg, deps, opts) {
+  const { sk, pubkey } = (deps.generateTestKey || generateTestKey)();
+  const blob = (deps.generateSyntheticBlob || generateSyntheticBlob)();
+  const started = Date.now();
+  let kind5Id = null;
+  let target = null;
+  let assertResult = null;
+  let outcome = 'pass';
+  let failureReason = null;
+  // Hoisted so it is accessible in cleanup and return after the try block.
+  // Upload.sha256 (server-confirmed) is the canonical sha; falls back to blob.sha256
+  // if upload hasn't run yet (shouldn't happen in normal flow).
+  let blobSha256 = blob.sha256;
+
+  try {
+    // 1. Upload
+    const upload = await (deps.uploadToBlossom || uploadToBlossom)(blob.bytes, blob.sha256, sk, cfg, deps.fetchImpl);
+    // Use upload.sha256 (server-confirmed) as the canonical sha for all downstream assertions.
+    // This ensures injected uploadToBlossom can control which sha flows through the scenario.
+    blobSha256 = upload.sha256;
+    emit({ ts: nowIso(), scenario: name, step: 'upload', ok: true, sha256: blobSha256, bytes: blob.bytes.length });
+
+    // 2. Publish kind 34236
+    const event = buildKind34236Event(sk, blobSha256, cfg);
+    target = await (deps.publishEvent || publishEvent)(event, cfg.stagingRelay);
+    emit({ ts: nowIso(), scenario: name, step: 'publish_kind34236', ok: true, event_id: target });
+
+    // 3. Wait for Funnelcake to index it
+    const indexing = await (deps.waitForIndexing || waitForIndexing)(target, cfg, { fetchImpl: deps.fetchImpl });
+    emit({ ts: nowIso(), scenario: name, step: 'wait_indexing', ok: true, polls: indexing.polls });
+
+    // 4. Publish kind 5
+    const kind5Event = finalizeEvent({
+      kind: 5,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [['e', target], ['k', '34236'], ['client', 'diVine']],
+      content: 'e2e test delete'
+    }, sk);
+    kind5Id = await (deps.publishEvent || publishEvent)(kind5Event, cfg.stagingRelay);
+    emit({ ts: nowIso(), scenario: name, step: 'publish_kind5', ok: true, kind5_id: kind5Id });
+
+    // 5. Sync (sync scenario only)
+    if (opts.callSync) {
+      await (deps.callSyncEndpoint || callSyncEndpoint)(sk, kind5Event, cfg, deps.fetchImpl);
+      emit({ ts: nowIso(), scenario: name, step: 'call_sync', ok: true });
+    }
+
+    // 6. Poll status
+    const pollOpts = {
+      fetchImpl: deps.fetchImpl,
+      timeoutMs: opts.statusTimeoutMs,
+      pollIntervalMs: opts.statusPollIntervalMs
+    };
+    const status = await (deps.pollStatus || pollStatus)(sk, kind5Id, cfg, pollOpts);
+    emit({ ts: nowIso(), scenario: name, step: 'poll_status', ok: status.status === 'success', terminal_status: status.status, polls: status.polls });
+    if (status.status !== 'success') {
+      throw new Error(`pipeline failed: ${status.status}`);
+    }
+
+    // 7. Assert D1 + Blossom state
+    assertResult = await (deps.assertD1AndBlossomState || assertD1AndBlossomState)(kind5Id, blobSha256, cfg, { runner: deps.runner, fetchImpl: deps.fetchImpl });
+    emit({ ts: nowIso(), scenario: name, step: 'assert_d1_and_blossom', ok: true, d1_status: assertResult.d1Status, byte_probe: assertResult.byteProbe.kind });
+  } catch (err) {
+    outcome = 'fail';
+    failureReason = err.message;
+    emit({ ts: nowIso(), scenario: name, step: 'failure', ok: false, error: err.message });
+  }
+
+  // 8. Cleanup (always, unless --skip-cleanup)
+  let cleanup = null;
+  if (cfg.skipCleanup) {
+    cleanup = { skipped: true };
+    emit({ ts: nowIso(), scenario: name, step: 'cleanup', ok: true, skipped: true });
+  } else {
+    cleanup = { blossom: null, d1: null };
+    try {
+      cleanup.blossom = await (deps.cleanupBlossomVanish || cleanupBlossomVanish)(pubkey, cfg, deps.fetchImpl);
+      emit({ ts: nowIso(), scenario: name, step: 'cleanup_blossom', ok: true, ...cleanup.blossom });
+    } catch (err) {
+      cleanup.blossom = { ok: false, error: err.message };
+      emit({ ts: nowIso(), scenario: name, step: 'cleanup_blossom', ok: false, error: err.message });
+    }
+    if (kind5Id && target) {
+      try {
+        await (deps.cleanupD1Row || cleanupD1Row)(kind5Id, target, cfg, deps.runner);
+        cleanup.d1 = { ok: true };
+        emit({ ts: nowIso(), scenario: name, step: 'cleanup_d1', ok: true });
+      } catch (err) {
+        cleanup.d1 = { ok: false, error: err.message };
+        emit({ ts: nowIso(), scenario: name, step: 'cleanup_d1', ok: false, error: err.message });
+      }
+    } else {
+      cleanup.d1 = { ok: true, skipped: 'no kind5/target' };
+    }
+  }
+
+  const totalDurationMs = Date.now() - started;
+  emit({ ts: nowIso(), scenario: name, outcome, total_duration_ms: totalDurationMs });
+  return { outcome, failureReason, cleanup, pubkey, sha256: blobSha256, kind5Id, target, totalDurationMs };
+}
+
+export async function runSyncScenario(cfg, deps = {}) {
+  return runScenario('sync', cfg, deps, { callSync: true, statusTimeoutMs: 60000, statusPollIntervalMs: 2000 });
+}
+
+export async function runCronScenario(cfg, deps = {}) {
+  return runScenario('cron', cfg, deps, { callSync: false, statusTimeoutMs: cfg.cronWaitSeconds * 1000, statusPollIntervalMs: 3000 });
+}
