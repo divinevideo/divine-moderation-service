@@ -129,3 +129,16 @@ export function buildKind34236Event(sk, sha256, cfg) {
     content: 'Synthetic 1KB test blob published by scripts/e2e-creator-delete.mjs'
   }, sk);
 }
+
+/**
+ * Classify a GET https://media.divine.video/<sha256> response after the
+ * pipeline has completed. 404/410 → bytes physically deleted (ENABLE_PHYSICAL_DELETE
+ * was on). 200 → bytes still present (flag was off, soft-delete state). Both
+ * are acceptable pass conditions for the script; the kind is recorded in the
+ * JSONL output. Anything else is treated as an unexpected state.
+ */
+export function classifyByteProbeResponse(status) {
+  if (status === 404 || status === 410) return { kind: 'bytes_gone', flagStateInferred: 'on' };
+  if (status === 200) return { kind: 'bytes_present', flagStateInferred: 'off' };
+  return { kind: 'unknown', status };
+}

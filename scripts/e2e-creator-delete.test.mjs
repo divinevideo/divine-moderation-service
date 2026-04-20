@@ -168,3 +168,34 @@ describe('buildKind34236Event', () => {
     expect(d1).not.toBe(d2);
   });
 });
+
+import { classifyByteProbeResponse } from './e2e-creator-delete.mjs';
+
+describe('classifyByteProbeResponse', () => {
+  it('404 → bytes_gone (flag was on)', () => {
+    expect(classifyByteProbeResponse(404)).toEqual({
+      kind: 'bytes_gone',
+      flagStateInferred: 'on'
+    });
+  });
+
+  it('200 → bytes_present (flag was off)', () => {
+    expect(classifyByteProbeResponse(200)).toEqual({
+      kind: 'bytes_present',
+      flagStateInferred: 'off'
+    });
+  });
+
+  it('410 also counts as bytes_gone (some CDNs serve 410 for deleted)', () => {
+    expect(classifyByteProbeResponse(410)).toEqual({
+      kind: 'bytes_gone',
+      flagStateInferred: 'on'
+    });
+  });
+
+  it('other statuses → unknown (assertion failure)', () => {
+    expect(classifyByteProbeResponse(500).kind).toBe('unknown');
+    expect(classifyByteProbeResponse(403).kind).toBe('unknown');
+    expect(classifyByteProbeResponse(0).kind).toBe('unknown');
+  });
+});
