@@ -348,6 +348,132 @@ describe('uploadToBlossom', () => {
     const { sk } = generateTestKey();
     await expect(uploadToBlossom(new Uint8Array(1), SHA, sk, cfg, fetchImpl)).rejects.toThrow(/413/);
   });
+
+  it('returns the server-confirmed sha256 from the response body, not the caller value', async () => {
+    // Regression for Liz's #110 review. Downstream `runScenario()` treats
+    // `upload.sha256` as the canonical server-confirmed hash, so the
+    // previous implementation would have silently propagated the
+    // caller's claim if the two ever diverged.
+    const SERVER_SHA = 'b'.repeat(64);
+    const CALLER_SHA = 'c'.repeat(64);
+    const fetchImpl = makeFakeFetch(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ url: `${cfg.blossomBase}/${SERVER_SHA}`, sha256: SERVER_SHA, size: 42 })
+    }));
+    const { sk } = generateTestKey();
+    const out = await uploadToBlossom(new Uint8Array(42), CALLER_SHA, sk, cfg, fetchImpl);
+    expect(out.sha256).toBe(SERVER_SHA);
+    expect(out.sha256).not.toBe(CALLER_SHA);
+  });
+
+  it('throws when the response body is missing sha256 (contract break)', async () => {
+    const fetchImpl = makeFakeFetch(async () => ({
+      ok: true, status: 200,
+      json: async () => ({ url: 'http://whatever', size: 1 })
+    }));
+    const { sk } = generateTestKey();
+    await expect(
+      uploadToBlossom(new Uint8Array(1), SHA, sk, cfg, fetchImpl)
+    ).rejects.toThrow(/missing sha256/i);
+  });
+});
+
+import { publishEvent } from './e2e-creator-delete.mjs';
+
+/**
+ * Minimal fake WebSocket that lets each test drive the relay-side
+ * behavior (immediate OK true/false, error, or early close) and
+ * records the messages that the client sent. Mimics the shape the
+ * `ws` library exposes: `on()`, `send()`, `close()`.
+ */
+function makeFakeWebSocketCtor(driver) {
+  const instances = [];
+  function Ctor(url) {
+    const handlers = {};
+    const ws = {
+      url,
+      sent: [],
+      closed: false,
+      on(event, cb) { handlers[event] = cb; },
+      send(data) { this.sent.push(data); },
+      close() { this.closed = true; },
+      // Helpers the driver uses to push events at the client:
+      _fire(event, ...args) { if (handlers[event]) handlers[event](...args); },
+    };
+    instances.push(ws);
+    // Defer driver callback until after the caller wires up `on(...)`.
+    setImmediate(() => driver(ws));
+    return ws;
+  }
+  Ctor.instances = instances;
+  return Ctor;
+}
+
+describe('publishEvent', () => {
+  const event = { id: 'e'.repeat(64), pubkey: 'p'.repeat(64), kind: 1, created_at: 0, tags: [], content: '', sig: 's'.repeat(128) };
+  const relayUrl = 'wss://relay.example/test';
+
+  it('resolves with the event id on OK true and closes the socket', async () => {
+    const WebSocket = makeFakeWebSocketCtor((ws) => {
+      ws._fire('open');
+      ws._fire('message', Buffer.from(JSON.stringify(['OK', event.id, true, ''])));
+    });
+    const id = await publishEvent(event, relayUrl, { WebSocket });
+    expect(id).toBe(event.id);
+    expect(WebSocket.instances[0].sent[0]).toContain(event.id);
+    expect(WebSocket.instances[0].closed).toBe(true);
+  });
+
+  it('rejects with the relay reason on OK false and still closes the socket', async () => {
+    const WebSocket = makeFakeWebSocketCtor((ws) => {
+      ws._fire('open');
+      ws._fire('message', Buffer.from(JSON.stringify(['OK', event.id, false, 'blocked: rate limit'])));
+    });
+    await expect(publishEvent(event, relayUrl, { WebSocket })).rejects.toThrow(/blocked: rate limit/);
+    expect(WebSocket.instances[0].closed).toBe(true);
+  });
+
+  it('rejects on early WebSocket close with a concrete publish-failure message', async () => {
+    // Regression for Liz's #110 review. Without a close handler, an
+    // early disconnect from the relay degraded into a generic timeout
+    // ~10s later instead of a concrete failure. The done-once wrapper
+    // now turns a pre-OK close into an immediate rejection.
+    const WebSocket = makeFakeWebSocketCtor((ws) => {
+      ws._fire('open');
+      ws._fire('close', 1006, 'abnormal');
+    });
+    await expect(publishEvent(event, relayUrl, { WebSocket, timeoutMs: 5000 }))
+      .rejects.toThrow(/closed before OK/i);
+  });
+
+  it('rejects on socket error and closes exactly once even if close fires later', async () => {
+    const WebSocket = makeFakeWebSocketCtor((ws) => {
+      ws._fire('open');
+      ws._fire('error', new Error('econnreset'));
+      // Simulate the ws lib firing close after error — must not double-settle.
+      ws._fire('close', 1006, '');
+    });
+    await expect(publishEvent(event, relayUrl, { WebSocket })).rejects.toThrow(/econnreset/);
+  });
+
+  it('rejects on timeout if no OK, error, or close arrives', async () => {
+    const WebSocket = makeFakeWebSocketCtor((ws) => {
+      // Open but never send OK, never close.
+      ws._fire('open');
+    });
+    await expect(publishEvent(event, relayUrl, { WebSocket, timeoutMs: 15 }))
+      .rejects.toThrow(/publish timeout/);
+  });
+
+  it('ignores OK frames for unrelated event ids', async () => {
+    const WebSocket = makeFakeWebSocketCtor((ws) => {
+      ws._fire('open');
+      ws._fire('message', Buffer.from(JSON.stringify(['OK', 'different-event-id', true, ''])));
+      ws._fire('message', Buffer.from(JSON.stringify(['OK', event.id, true, ''])));
+    });
+    const id = await publishEvent(event, relayUrl, { WebSocket });
+    expect(id).toBe(event.id);
+  });
 });
 
 import { waitForIndexing } from './e2e-creator-delete.mjs';
@@ -578,9 +704,78 @@ describe('main (integration)', () => {
     expect(code).toBe(2);
   });
 
+  it('does NOT require BLOSSOM_WEBHOOK_SECRET when --skip-cleanup is set', async () => {
+    // Regression for Liz's #110 review. The inspection mode should run
+    // without requiring a prod admin secret it will never use, since
+    // /admin/api/vanish only runs during cleanup.
+    const deps = {
+      ...baseDeps,
+      blossomWebhookSecret: null,
+      env: {},
+      // Cleanup deps should not be called when skipCleanup is true; if
+      // they are, fail the test loudly.
+      cleanupBlossomVanish: async () => { throw new Error('cleanup should not run with --skip-cleanup'); },
+      cleanupD1Row: async () => { throw new Error('cleanup should not run with --skip-cleanup'); },
+    };
+    const code = await main(['--scenario=sync', '--skip-cleanup'], deps);
+    expect(code).toBe(0);
+  });
+
   it('exits 2 on invalid --scenario', async () => {
     const code = await main(['--scenario=invalid'], baseDeps);
     expect(code).toBe(2);
+  });
+});
+
+import { printSummary } from './e2e-creator-delete.mjs';
+
+describe('printSummary manual-cleanup commands', () => {
+  // Regression for Liz's #110 review. The manual-cleanup block must
+  // render against the effective cfg (blossomBase, d1Database), not
+  // the prod defaults, so operators running the script against an
+  // override target see commands that actually point at their target.
+  const failedResult = {
+    scenario: 'sync',
+    outcome: 'pass',
+    totalDurationMs: 5000,
+    sha256: 'a'.repeat(64),
+    pubkey: 'b'.repeat(64),
+    kind5Id: 'c'.repeat(64),
+    target: 'd'.repeat(64),
+    cleanup: {
+      blossom: { ok: false, error: 'vanish 503' },
+      d1: { ok: false, error: 'd1 unreachable' },
+    },
+  };
+
+  it('renders Blossom vanish curl against cfg.blossomBase', () => {
+    const lines = [];
+    const origError = console.error;
+    console.error = (msg) => lines.push(String(msg));
+    try {
+      printSummary([failedResult], { blossomBase: 'https://staging.blossom.example', d1Database: 'staging-db' });
+    } finally {
+      console.error = origError;
+    }
+    const joined = lines.join('\n');
+    expect(joined).toContain('https://staging.blossom.example/admin/api/vanish');
+    expect(joined).not.toContain('https://media.divine.video/admin/api/vanish');
+    expect(joined).toContain('wrangler d1 execute staging-db');
+    expect(joined).not.toContain('wrangler d1 execute blossom-webhook-events');
+  });
+
+  it('falls back to prod defaults when cfg is absent (older callers)', () => {
+    const lines = [];
+    const origError = console.error;
+    console.error = (msg) => lines.push(String(msg));
+    try {
+      printSummary([failedResult]);
+    } finally {
+      console.error = origError;
+    }
+    const joined = lines.join('\n');
+    expect(joined).toContain('https://media.divine.video/admin/api/vanish');
+    expect(joined).toContain('wrangler d1 execute blossom-webhook-events');
   });
 });
 

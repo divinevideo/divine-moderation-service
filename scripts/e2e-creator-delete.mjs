@@ -250,7 +250,16 @@ export async function uploadToBlossom(bytes, sha256, sk, cfg, fetchImpl = fetch)
     throw new Error(`Blossom upload failed: HTTP ${res.status}: ${text}`);
   }
   const body = await res.json();
-  return { url: body.url || `${cfg.blossomBase}/${sha256}`, sha256 };
+  // Return the server-confirmed sha, not the caller-provided value.
+  // Any mismatch between them means either our local hash is wrong or
+  // Blossom rehashed the bytes under a different content type; either
+  // case should surface loudly rather than silently propagate the
+  // caller's claim through the rest of the pipeline. A missing
+  // body.sha256 is also a contract break worth raising here.
+  if (!body.sha256 || typeof body.sha256 !== 'string') {
+    throw new Error(`Blossom upload response missing sha256 field: ${JSON.stringify(body)}`);
+  }
+  return { url: body.url || `${cfg.blossomBase}/${body.sha256}`, sha256: body.sha256 };
 }
 
 /**
@@ -290,29 +299,45 @@ export async function publishEvent(event, relayUrl, opts = {}) {
   const WsCtor = opts.WebSocket || (await import('ws')).WebSocket;
   return await new Promise((resolve, reject) => {
     const ws = new WsCtor(relayUrl);
-    const timer = setTimeout(() => {
+    let settled = false;
+
+    // Centralize socket teardown and promise settlement so every exit
+    // path (OK=true, OK=false, error, close, timeout) releases the
+    // socket exactly once and no later handlers mutate the outcome.
+    const done = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       try { ws.close(); } catch {}
-      reject(new Error(`publish timeout after ${timeoutMs}ms: ${event.id}`));
+      fn();
+    };
+
+    const timer = setTimeout(() => {
+      done(() => reject(new Error(`publish timeout after ${timeoutMs}ms: ${event.id}`)));
     }, timeoutMs);
 
     ws.on('open', () => {
       ws.send(JSON.stringify(['EVENT', event]));
     });
     ws.on('message', (data) => {
-      const msg = JSON.parse(data.toString());
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
       if (msg[0] === 'OK' && msg[1] === event.id) {
-        clearTimeout(timer);
-        try { ws.close(); } catch {}
         if (msg[2] === true) {
-          resolve(event.id);
+          done(() => resolve(event.id));
         } else {
-          reject(new Error(`relay rejected ${event.id}: ${msg[3] || 'unknown'}`));
+          done(() => reject(new Error(`relay rejected ${event.id}: ${msg[3] || 'unknown'}`)));
         }
       }
     });
     ws.on('error', (err) => {
-      clearTimeout(timer);
-      reject(new Error(`WebSocket error: ${err.message}`));
+      done(() => reject(new Error(`WebSocket error: ${err.message}`)));
+    });
+    // Early-close handler: if the relay disconnects before sending OK,
+    // surface a concrete publish failure instead of waiting for the
+    // generic timeout. If we already resolved/rejected, this is a no-op.
+    ws.on('close', (code, reason) => {
+      done(() => reject(new Error(`WebSocket closed before OK for ${event.id} (code=${code}${reason ? `, reason=${reason}` : ''})`)));
     });
   });
 }
@@ -543,7 +568,12 @@ export function computeExitCode(results) {
   return 0;
 }
 
-export function printSummary(results) {
+export function printSummary(results, cfg = {}) {
+  // Fall back to defaults only when cfg is absent (e.g. older callers).
+  // The live main() flow always passes cfg so the manual-cleanup
+  // commands render against the target the script actually ran against.
+  const blossomBase = cfg.blossomBase || DEFAULT_BLOSSOM_BASE;
+  const d1Database = cfg.d1Database || DEFAULT_D1_DATABASE;
   console.error('\n=== E2E SUMMARY ===');
   for (const r of results) {
     const seconds = (r.totalDurationMs / 1000).toFixed(1);
@@ -576,11 +606,11 @@ export function printSummary(results) {
       if (r.cleanup?.blossom?.ok === false) {
         console.error(`sha=${r.sha256} pubkey=${r.pubkey} (${r.scenario})`);
         console.error(`  curl -X POST -H "Authorization: Bearer $BLOSSOM_WEBHOOK_SECRET" \\`);
-        console.error(`       ${DEFAULT_BLOSSOM_BASE}/admin/api/vanish \\`);
+        console.error(`       ${blossomBase}/admin/api/vanish \\`);
         console.error(`       -d '{"pubkey":"${r.pubkey}","reason":"e2e-test manual cleanup"}'`);
       }
       if (r.cleanup?.d1?.ok === false) {
-        console.error(`  wrangler d1 execute ${DEFAULT_D1_DATABASE} --remote \\`);
+        console.error(`  wrangler d1 execute ${d1Database} --remote \\`);
         console.error(`       --command "DELETE FROM creator_deletions WHERE kind5_id='${r.kind5Id}' AND target_event_id='${r.target}';"`);
       }
     }
@@ -607,11 +637,17 @@ export async function main(argv, deps = {}) {
     return 2;
   }
 
-  try {
-    cfg.blossomWebhookSecret = readBlossomSecret(deps);
-  } catch (e) {
-    console.error(e.message);
-    return 2;
+  // BLOSSOM_WEBHOOK_SECRET only gates /admin/api/vanish cleanup. The
+  // documented --skip-cleanup inspection mode intentionally leaves
+  // artifacts in place, so requiring the secret there made the
+  // no-cleanup path depend on a prod admin credential it never used.
+  if (!cfg.skipCleanup) {
+    try {
+      cfg.blossomWebhookSecret = readBlossomSecret(deps);
+    } catch (e) {
+      console.error(e.message);
+      return 2;
+    }
   }
 
   const results = [];
@@ -624,7 +660,7 @@ export async function main(argv, deps = {}) {
     results.push({ ...r, scenario: 'cron' });
   }
 
-  printSummary(results);
+  printSummary(results, cfg);
   return computeExitCode(results);
 }
 
