@@ -17,7 +17,7 @@ import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
 import messagesHTML from './admin/messages.html';
-import { initReportsTable, addReport } from './reports.mjs';
+import { initReportsTable } from './reports.mjs';
 import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforcement, applyUploaderEnforcementToResult } from './uploader-enforcement.mjs';
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
@@ -3259,39 +3259,6 @@ async function runMigration() {
       }
     }
 
-    if (url.pathname === '/api/v1/report' && request.method === 'POST') {
-      const verification = await authenticateApiRequest(request, env);
-      if (!verification.valid) {
-        console.log(`[API] Authentication failed for /api/v1/report: ${verification.error}`);
-        return apiUnauthorizedResponse(verification);
-      }
-
-      try {
-        const { sha256, reporter_pubkey, report_type, reason } = await request.json();
-
-        if (!sha256 || !reporter_pubkey || !report_type) {
-          return new Response(JSON.stringify({ error: 'sha256, reporter_pubkey, and report_type are required' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-
-        const result = await addReport(env.BLOSSOM_DB, { sha256, reporter_pubkey, report_type, reason });
-
-        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... escalate=${result.escalate}`);
-
-        return new Response(JSON.stringify({ success: true, ...result }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      } catch (error) {
-        console.error('[API] Error adding report:', error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-    }
-
     // API: Send DM notification only (no Blossom/D1 moderation side effects)
     // Used by relay-manager to notify users after NIP-86 moderation actions
     // Auth: Bearer token or Cloudflare Access JWT
@@ -3902,7 +3869,7 @@ async function runMigration() {
       }
     }
 
-    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\nGET  /api/v1/moderation/vocabulary\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/report\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
+    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\nGET  /api/v1/moderation/vocabulary\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
       headers: { 'Content-Type': 'text/plain' }
     });
   },
