@@ -138,7 +138,6 @@ Using `ctx.waitUntil()` ensures DM sending doesn't block the queue consumer or a
 
 **Also wire into:**
 - `/admin/api/moderate/:sha256` — for manual moderator overrides (lookup `uploaded_by` from D1)
-- `/api/v1/report` — when a report leads to escalation, DM the reporter
 
 ---
 
