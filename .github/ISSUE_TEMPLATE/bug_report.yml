@@ -1,0 +1,41 @@
+name: Bug Report
+description: Report a bug or regression
+title: "fix: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use generic descriptors for external partners, customers, brands, campaign names, and other sensitive identities unless a maintainer has approved naming them publicly.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly describe the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: List the queue flow, API call, admin action, or event sequence needed to reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Result
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Include relevant environment details, logs, or payloads. Redact secrets and sensitive external names.

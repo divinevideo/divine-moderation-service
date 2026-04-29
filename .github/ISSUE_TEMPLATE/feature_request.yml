@@ -1,0 +1,36 @@
+name: Feature Request
+description: Propose a new feature or improvement
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use generic descriptors for external partners, customers, brands, campaign names, and other sensitive identities unless a maintainer has approved naming them publicly.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the feature or improvement.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: Explain why this work is needed.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Approach
+      description: Describe the intended behavior or implementation direction.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Include queue behavior, API examples, or rollout notes as needed. Redact secrets and sensitive external names.
