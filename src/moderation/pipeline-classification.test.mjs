@@ -5,7 +5,7 @@
 // ABOUTME: Verifies that classification runs in parallel with moderation and results flow through
 
 import { describe, it, expect, vi } from 'vitest';
-import { moderateVideo } from './pipeline.mjs';
+import { classifyVideoOnly, moderateVideo } from './pipeline.mjs';
 
 /** Build a mock VLM chat completion response. */
 function mockVLMChatCompletion(content = {}) {
@@ -99,6 +99,37 @@ describe('Pipeline Classification Integration', () => {
 
   const sha256 = 'a'.repeat(64);
 
+  describe('classifyVideoOnly', () => {
+    it('should skip Hive VLM and return local transcript topics only', async () => {
+      const hiveCalls = [];
+      const mockFetch = vi.fn(async (url) => {
+        const urlString = String(url);
+        if (urlString.includes('api.thehive.ai')) {
+          hiveCalls.push(urlString);
+          throw new Error(`Unexpected Hive call: ${urlString}`);
+        }
+        if (urlString.endsWith('.vtt')) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => 'WEBVTT\n\n00:00.000 --> 00:01.000\nA guitar tutorial with melody and chords.'
+          };
+        }
+        throw new Error(`Unexpected fetch call: ${urlString}`);
+      });
+
+      const result = await classifyVideoOnly(sha256, {
+        CDN_DOMAIN: 'cdn.divine.video',
+        HIVE_VLM_API_KEY: 'vlm-key'
+      }, { fetchFn: mockFetch });
+
+      expect(result.sceneClassification).toBeNull();
+      expect(result.topicProfile).not.toBeNull();
+      expect(result.topicProfile.primary_topic).toBe('music');
+      expect(hiveCalls).toEqual([]);
+    });
+  });
+
   describe('sceneClassification field', () => {
     it('should return null sceneClassification when HIVE_VLM_API_KEY not set', async () => {
       const mockFetch = buildMockFetch({ vttStatus: 404 });
@@ -113,7 +144,7 @@ describe('Pipeline Classification Integration', () => {
       expect(result.action).toBeDefined();
     });
 
-    it('should include sceneClassification when HIVE_VLM_API_KEY is set and classification succeeds', async () => {
+    it('should skip Hive sceneClassification in upload moderation even when HIVE_VLM_API_KEY is set', async () => {
       const classificationResponse = mockVLMChatCompletion({
         topics: ['sports'],
         setting: 'beach outdoor',
@@ -127,8 +158,7 @@ describe('Pipeline Classification Integration', () => {
 
       const env = {
         ...baseEnv,
-        HIVE_VLM_API_KEY: 'test-vlm-key',
-        HIVE_VLM_ENABLED: 'true'
+        HIVE_VLM_API_KEY: 'test-vlm-key'
       };
 
       const result = await moderateVideo(
@@ -137,13 +167,12 @@ describe('Pipeline Classification Integration', () => {
         mockFetch
       );
 
-      // Scene classification should be present with labels
-      expect(result.sceneClassification).not.toBeNull();
-      expect(result.sceneClassification.provider).toBe('hiveai-vlm');
-      expect(result.sceneClassification.labels).toBeDefined();
-      expect(Array.isArray(result.sceneClassification.labels)).toBe(true);
-      expect(result.sceneClassification.skipped).toBe(false);
-      expect(result.sceneClassification.description).toBeDefined();
+      expect(result.action).toBe('REVIEW');
+      expect(result.provider).toBe('manual-review');
+      expect(result.sceneClassification).toBeNull();
+
+      const hiveCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes('api.thehive.ai'));
+      expect(hiveCalls).toHaveLength(0);
     });
 
     it('should not break moderation when scene classification fails', async () => {
@@ -170,8 +199,7 @@ describe('Pipeline Classification Integration', () => {
 
       const env = {
         ...baseEnv,
-        HIVE_VLM_API_KEY: 'test-vlm-key',
-        HIVE_VLM_ENABLED: 'true'
+        HIVE_VLM_API_KEY: 'test-vlm-key'
       };
 
       // Should NOT throw even though classification fails
@@ -267,7 +295,7 @@ how to learn the basics so you can understand this concept`;
   });
 
   describe('videoseal field', () => {
-    it('should attach the interpreted Video Seal signal without changing moderation flow', async () => {
+    it('should attach the interpreted Video Seal signal without changing manual review flow', async () => {
       const payload = `01${'c'.repeat(62)}`;
       const mockFetch = buildMockFetch({ vttStatus: 404 });
 
@@ -282,7 +310,8 @@ how to learn the basics so you can understand this concept`;
         mockFetch
       );
 
-      expect(result.action).toBe('SAFE');
+      expect(result.action).toBe('REVIEW');
+      expect(result.provider).toBe('manual-review');
       expect(result.videoseal).toEqual({
         signal: 'videoseal',
         detected: true,
@@ -294,8 +323,8 @@ how to learn the basics so you can understand this concept`;
     });
   });
 
-  describe('parallel execution', () => {
-    it('should run both moderation and classification, returning all results', async () => {
+  describe('manual review enrichment', () => {
+    it('should return local topic and text results while skipping Hive scene classification', async () => {
       const vttText = `WEBVTT
 
 00:00:00.000 --> 00:00:05.000
@@ -314,8 +343,7 @@ This is a funny joke about comedy and stand-up`;
 
       const env = {
         ...baseEnv,
-        HIVE_VLM_API_KEY: 'test-vlm-key',
-        HIVE_VLM_ENABLED: 'true'
+        HIVE_VLM_API_KEY: 'test-vlm-key'
       };
 
       const result = await moderateVideo(
@@ -324,18 +352,21 @@ This is a funny joke about comedy and stand-up`;
         mockFetch
       );
 
-      // All three layers should be present
-      expect(result.action).toBeDefined();
-      expect(result.scores).toBeDefined();
-      expect(result.sceneClassification).not.toBeNull();
+      expect(result.action).toBe('REVIEW');
+      expect(result.provider).toBe('manual-review');
+      expect(result.scores).toEqual({});
+      expect(result.sceneClassification).toBeNull();
       expect(result.topicProfile).not.toBeNull();
       expect(result.topicProfile.primary_topic).toBe('comedy');
       expect(result.text_scores).not.toBeNull();
+
+      const hiveCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes('api.thehive.ai'));
+      expect(hiveCalls).toHaveLength(0);
     });
   });
 
-  describe('existing moderation is unaffected', () => {
-    it('should still classify SAFE content correctly', async () => {
+  describe('manual review moderation result', () => {
+    it('should route upload moderation to REVIEW', async () => {
       const mockFetch = buildMockFetch({ vttStatus: 404 });
 
       const result = await moderateVideo(
@@ -344,12 +375,13 @@ This is a funny joke about comedy and stand-up`;
         mockFetch
       );
 
-      expect(result.action).toBe('SAFE');
-      expect(result.severity).toBe('low');
+      expect(result.action).toBe('REVIEW');
+      expect(result.provider).toBe('manual-review');
+      expect(result.severity).toBe('medium');
       expect(result.sha256).toBe(sha256);
     });
 
-    it('should still include rawClassifierData from moderation provider', async () => {
+    it('should leave rawClassifierData null because no provider classifier runs', async () => {
       const mockFetch = buildMockFetch({ vttStatus: 404 });
 
       const result = await moderateVideo(
@@ -358,9 +390,7 @@ This is a funny joke about comedy and stand-up`;
         mockFetch
       );
 
-      // rawClassifierData comes from the moderation provider, not classification
-      // With Sightengine as fallback, it won't have raw classifier data
-      expect(result).toHaveProperty('rawClassifierData');
+      expect(result.rawClassifierData).toBeNull();
     });
   });
 });

@@ -2,22 +2,32 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: Classification pipeline for video topic/category detection
-// ABOUTME: Coordinates VLM classification provider to produce recommendation labels
+// ABOUTME: Keeps Hive VLM classification disabled unless an explicit future integration is restored
 
-import { HiveVLMClassificationProvider } from './providers/hiveai/adapter.mjs';
+/**
+ * Run the VLM classification pipeline on a video.
+ *
+ * Hive VLM classification is intentionally disabled. The service now keeps
+ * uploads playable in team review and uses local transcript topic extraction
+ * in `src/moderation/pipeline.mjs` for low-cost review context.
+ *
+ * @param {string} videoUrl - Public URL to the video
+ * @param {Object} env - Environment variables
+ * @param {Object} options - Pipeline options
+ * @param {string} [options.sha256] - Video hash (for logging / correlation)
+ * @param {Function} [options.fetchFn] - Custom fetch (for testing)
+ * @param {number} [options.maxLabels=50] - Maximum labels to return
+ * @returns {Promise<Object>} Classification result
+ */
+export async function classifyVideo(videoUrl, env, options = {}) {
+  const sha256 = options.sha256 || 'unknown';
 
-// Singleton provider instance
-const vlmProvider = new HiveVLMClassificationProvider();
-
-function isHiveVLMEnabled(env = {}) {
-  return String(env.HIVE_VLM_ENABLED || '').toLowerCase() === 'true';
-}
-
-function skippedClassificationResult(reason) {
+  console.warn(`[Classification] Hive VLM classification disabled for ${sha256}; skipping external classification`);
   return {
     provider: null,
+    sha256,
     skipped: true,
-    reason,
+    reason: 'Hive VLM classification disabled; team review uses local transcript topics only',
     labels: [],
     topics: [],
     setting: '',
@@ -29,66 +39,6 @@ function skippedClassificationResult(reason) {
     topSettings: [],
     topObjects: []
   };
-}
-
-/**
- * Run the VLM classification pipeline on a video.
- *
- * Calls the Hive AI VLM (Vision Language Model) API and returns
- * structured topics, setting, objects, activities, mood, and a
- * human-readable description -- plus pre-formatted recommendation
- * labels for downstream systems (funnelcake, gorse).
- *
- * @param {string} videoUrl - Public URL to the video
- * @param {Object} env - Environment variables (needs HIVE_VLM_API_KEY)
- * @param {Object} options - Pipeline options
- * @param {string} [options.sha256] - Video hash (for logging / correlation)
- * @param {Function} [options.fetchFn] - Custom fetch (for testing)
- * @param {number} [options.maxLabels=50] - Maximum labels to return
- * @returns {Promise<Object>} Classification result
- */
-export async function classifyVideo(videoUrl, env, options = {}) {
-  const sha256 = options.sha256 || 'unknown';
-
-  if (!isHiveVLMEnabled(env)) {
-    console.warn('[Classification] Hive VLM classification disabled - skipping classification');
-    return skippedClassificationResult('Hive VLM classification disabled');
-  }
-
-  // Validate configuration
-  if (!vlmProvider.isConfigured(env)) {
-    console.warn('[Classification] HIVE_VLM_API_KEY not configured - skipping classification');
-    return skippedClassificationResult('HIVE_VLM_API_KEY not configured');
-  }
-
-  console.log(`[Classification] Starting VLM classification pipeline for ${sha256}`);
-
-  try {
-    const result = await vlmProvider.classify(
-      videoUrl,
-      { sha256 },
-      env,
-      {
-        fetchFn: options.fetchFn,
-        maxLabels: options.maxLabels
-      }
-    );
-
-    console.log(
-      `[Classification] Pipeline complete for ${sha256}: ` +
-      `${result.labels.length} labels, ${result.topics.length} topics`
-    );
-
-    return {
-      ...result,
-      sha256,
-      skipped: false
-    };
-
-  } catch (error) {
-    console.error(`[Classification] Pipeline failed for ${sha256}:`, error.message);
-    throw error;
-  }
 }
 
 /**

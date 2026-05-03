@@ -91,7 +91,70 @@ afterEach(() => {
 });
 
 describe('Moderation Pipeline', () => {
-  it('should run full pipeline and return SAFE classification', async () => {
+  it('defaults new videos to playable manual review without calling Hive', async () => {
+    const hiveCalls = [];
+    const mockFetch = vi.fn(async (url) => {
+      const urlString = String(url);
+      if (urlString.includes('api.thehive.ai')) {
+        hiveCalls.push(urlString);
+        throw new Error(`Unexpected Hive call: ${urlString}`);
+      }
+      if (urlString.endsWith('.vtt')) {
+        return { ok: false, status: 404, text: async () => '' };
+      }
+      throw new Error(`Unexpected fetch call: ${urlString}`);
+    });
+
+    const env = {
+      CDN_DOMAIN: 'cdn.divine.video',
+      HIVE_MODERATION_API_KEY: 'mod-key',
+      HIVE_API_KEY: 'ai-key',
+      HIVE_VLM_API_KEY: 'vlm-key'
+    };
+
+    const result = await moderateVideo({
+      sha256: 'a'.repeat(64),
+      uploadedAt: Date.now()
+    }, env, mockFetch);
+
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
+    expect(result.reason).toContain('Team review required');
+    expect(result.rawClassifierData).toBeNull();
+    expect(result.sceneClassification).toBeNull();
+    expect(result.scores).toEqual({});
+    expect(hiveCalls).toEqual([]);
+  });
+
+  it('keeps local transcript topic extraction in manual review mode', async () => {
+    const mockFetch = vi.fn(async (url) => {
+      const urlString = String(url);
+      if (urlString.includes('api.thehive.ai')) {
+        throw new Error(`Unexpected Hive call: ${urlString}`);
+      }
+      if (urlString.endsWith('.vtt')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => 'WEBVTT\n\n00:00.000 --> 00:01.000\nSkateboarding downtown with music.'
+        };
+      }
+      throw new Error(`Unexpected fetch call: ${urlString}`);
+    });
+
+    const result = await moderateVideo({
+      sha256: 'b'.repeat(64),
+      uploadedAt: Date.now()
+    }, { CDN_DOMAIN: 'cdn.divine.video', HIVE_VLM_API_KEY: 'vlm-key' }, mockFetch);
+
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
+    expect(result.topicProfile).not.toBeNull();
+    expect(result.topicProfile.has_speech).toBe(true);
+    expect(result.sceneClassification).toBeNull();
+  });
+
+  it('returns playable manual review for new uploads even when Sightengine is configured', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -118,9 +181,12 @@ describe('Moderation Pipeline', () => {
       uploadedAt: Date.now()
     }, env, mockFetch);
 
-    expect(result.action).toBe('SAFE');
-    expect(result.severity).toBe('low');
-    expect(result.scores).toBeDefined();
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
+    expect(result.severity).toBe('medium');
+    expect(result.scores).toEqual({});
+    expect(result.sceneClassification).toBeNull();
+    expect(result.rawClassifierData).toBeNull();
   });
 
   it('skips transcript analysis while Blossom reports VTT generation is pending', async () => {
@@ -163,14 +229,13 @@ describe('Moderation Pipeline', () => {
       uploadedAt: Date.now()
     }, env, mockFetch);
 
-    expect(result.action).toBe('SAFE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.text_scores).toBeNull();
     expect(result.topicProfile).toBeNull();
-    expect(result.transcriptPending).toBe(true);
-    expect(result.transcriptRetryAfterSeconds).toBe(12);
   });
 
-  it('keeps benign Hive nudity SAFE while retaining downstream nudity signals', async () => {
+  it('does not call Hive for benign nudity signals that used to be provider-scored', async () => {
     const mockFetch = vi.fn(async (url) => {
       if (typeof url === 'string' && url.endsWith('.vtt')) {
         return {
@@ -216,17 +281,13 @@ describe('Moderation Pipeline', () => {
       uploadedAt: Date.now()
     }, env, mockFetch);
 
-    expect(result.provider).toBe('hiveai');
-    expect(result.action).toBe('SAFE');
-    expect(result.scores.nudity).toBe(0.91);
-    expect(result.scores.sexual).toBe(0);
-    expect(result.scores.porn).toBe(0);
-    expect(result.downstreamSignals?.hasSignals).toBe(true);
-    expect(result.downstreamSignals?.scores?.nudity).toBe(0.91);
-    expect(result.downstreamSignals?.primaryConcern).toBe('nudity');
+    expect(result.provider).toBe('manual-review');
+    expect(result.action).toBe('REVIEW');
+    expect(result.scores).toEqual({});
+    expect(result.downstreamSignals?.hasSignals).toBe(false);
   });
 
-  it('should detect Hive sexual content and return AGE_RESTRICTED', async () => {
+  it('does not call Hive for sexual-content signals that now require team review', async () => {
     const mockFetch = vi.fn(async (url) => {
       if (typeof url === 'string' && url.endsWith('.vtt')) {
         return {
@@ -271,11 +332,10 @@ describe('Moderation Pipeline', () => {
       uploadedAt: Date.now()
     }, env, mockFetch);
 
-    expect(result.provider).toBe('hiveai');
-    expect(result.action).toBe('AGE_RESTRICTED');
-    expect(result.category).toBe('sexual');
-    expect(result.scores.sexual).toBe(0.9);
-    expect(result.scores.porn).toBe(0);
+    expect(result.provider).toBe('manual-review');
+    expect(result.action).toBe('REVIEW');
+    expect(result.category).toBe('manual_review');
+    expect(result.scores).toEqual({});
   });
 
   it('should detect borderline violence and return REVIEW', async () => {
@@ -307,10 +367,11 @@ describe('Moderation Pipeline', () => {
 
     expect(result.action).toBe('REVIEW');
     expect(result.severity).toBe('medium');
-    expect(result.primaryConcern).toBe('violence');
+    expect(result.provider).toBe('manual-review');
+    expect(result.downstreamSignals?.primaryConcern).toBeNull();
   });
 
-  it('should detect high violence and return AGE_RESTRICTED', async () => {
+  it('routes high-violence provider scenarios to playable team review', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -337,10 +398,10 @@ describe('Moderation Pipeline', () => {
       uploadedAt: Date.now()
     }, env, mockFetch);
 
-    expect(result.action).toBe('AGE_RESTRICTED');
-    expect(result.severity).toBe('high');
-    expect(result.primaryConcern).toBe('violence');
-    expect(result.category).toBe('violence');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
+    expect(result.severity).toBe('medium');
+    expect(result.category).toBe('manual_review');
   });
 
   it('should construct correct CDN URL from sha256', async () => {
@@ -361,16 +422,13 @@ describe('Moderation Pipeline', () => {
     };
 
     const sha256 = 'd'.repeat(64);
-    await moderateVideo({
+    const result = await moderateVideo({
       sha256,
       r2Key: 'videos/test.mp4',
       uploadedAt: Date.now()
     }, env, mockFetch);
 
-    // Check that Sightengine was called with correct URL (URL encoded)
-    const callUrl = mockFetch.mock.calls[0][0];
-    const decodedUrl = decodeURIComponent(callUrl);
-    expect(decodedUrl).toContain(`https://cdn.divine.video/${sha256}`);
+    expect(result.cdnUrl).toBe(`https://cdn.divine.video/${sha256}`);
   });
 
   it('should include metadata in result', async () => {
@@ -404,7 +462,7 @@ describe('Moderation Pipeline', () => {
     expect(result.uploadedAt).toBe(uploadedAt);
   });
 
-  it('should handle Sightengine API errors', async () => {
+  it('does not fail upload moderation when external provider-style fetches fail', async () => {
     const mockFetch = vi.fn().mockResolvedValue({
       ok: false,
       status: 500,
@@ -417,13 +475,14 @@ describe('Moderation Pipeline', () => {
       CDN_DOMAIN: 'cdn.divine.video'
     };
 
-    await expect(
-      moderateVideo({
-        sha256: 'g'.repeat(64),
-        r2Key: 'videos/test.mp4',
-        uploadedAt: Date.now()
-      }, env, mockFetch)
-    ).rejects.toThrow('Sightengine API error');
+    const result = await moderateVideo({
+      sha256: 'g'.repeat(64),
+      r2Key: 'videos/test.mp4',
+      uploadedAt: Date.now()
+    }, env, mockFetch);
+
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
   });
 
   it('should require CDN_DOMAIN configuration', async () => {
@@ -441,7 +500,7 @@ describe('Moderation Pipeline', () => {
     ).rejects.toThrow('CDN_DOMAIN not configured');
   });
 
-  it('keeps imported original vines SAFE while retaining raw AI scores', async () => {
+  it('keeps imported original Vine context while routing to team review', async () => {
     const sha256 = 'c'.repeat(64);
     globalThis.WebSocket = createNostrLookupWebSocket({
       id: 'evt-original-vine',
@@ -490,15 +549,15 @@ describe('Moderation Pipeline', () => {
       metadata: { videoUrl: 'https://archive.example.com/original-vine.mp4' }
     }, env, mockFetch);
 
-    expect(result.action).toBe('SAFE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.policyContext?.originalVine).toBe(true);
-    expect(result.policyContext?.enforcementOverridden).toBe(true);
-    expect(result.scores.ai_generated).toBe(0.96);
-    expect(result.downstreamSignals?.scores?.ai_generated ?? 0).toBe(0);
+    expect(result.policyContext?.enforcementOverridden).toBe(false);
+    expect(result.scores).toEqual({});
     expect(result.downstreamSignals?.hasSignals).toBe(false);
   });
 
-  it('skips Hive AI detection when legacy queue metadata already identifies an original Vine', async () => {
+  it('does not call Hive when legacy queue metadata identifies an original Vine', async () => {
     const sha256 = 'k'.repeat(64);
     globalThis.WebSocket = createEmptyNostrLookupWebSocket();
 
@@ -553,11 +612,13 @@ describe('Moderation Pipeline', () => {
       }
     }, env, mockFetch);
 
-    expect(hiveAuthCalls).toEqual(['token mod-key']);
+    expect(hiveAuthCalls).toEqual([]);
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.policyContext?.originalVine).toBe(true);
   });
 
-  it('keeps downstream moderation signals for original vines when non-AI scores are high', async () => {
+  it('keeps original Vine policy context without provider downstream signals', async () => {
     const sha256 = 'd'.repeat(64);
     globalThis.WebSocket = createNostrLookupWebSocket({
       id: 'evt-original-vine-signals',
@@ -605,17 +666,16 @@ describe('Moderation Pipeline', () => {
       metadata: { videoUrl: 'https://archive.example.com/original-vine-nudity.mp4' }
     }, env, mockFetch);
 
-    expect(result.action).toBe('SAFE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.policyContext?.originalVine).toBe(true);
-    expect(result.scores.nudity).toBe(0.86);
-    expect(result.downstreamSignals?.hasSignals).toBe(true);
-    expect(result.downstreamSignals?.scores?.nudity).toBe(0.86);
-    expect(result.downstreamSignals?.scores?.ai_generated ?? 0).toBe(0);
-    expect(result.downstreamSignals?.primaryConcern).toBe('nudity');
+    expect(result.scores).toEqual({});
+    expect(result.downstreamSignals?.hasSignals).toBe(false);
+    expect(result.downstreamSignals?.primaryConcern).toBeNull();
   });
 });
 
-describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
+describe('Moderation Pipeline — C2PA / ProofMode review context', () => {
   function buildMockFetch({ inquisitor, hive = null, vtt404 = true }) {
     return vi.fn(async (url) => {
       const urlStr = String(url);
@@ -650,7 +710,7 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
     INQUISITOR_BASE_URL: 'https://inquisitor.divine.video',
   };
 
-  it('short-circuits to QUARANTINE on valid_ai_signed and never calls Hive', async () => {
+  it('routes valid_ai_signed content to playable team review and never calls Hive', async () => {
     const mockFetch = buildMockFetch({
       inquisitor: {
         has_c2pa: true,
@@ -670,28 +730,20 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, baseEnv, mockFetch);
 
-    expect(result.action).toBe('QUARANTINE');
-    expect(result.category).toBe('ai_generated');
-    expect(result.provider).toBe('inquisitor-c2pa');
-    expect(result.reason).toContain('c2pa-ai-signed');
-    expect(result.reason).toContain('Adobe Firefly');
+    expect(result.action).toBe('REVIEW');
+    expect(result.category).toBe('manual_review');
+    expect(result.provider).toBe('manual-review');
+    expect(result.reason).toContain('Team review required');
     expect(result.requiresSecondaryVerification).toBe(false);
     expect(result.c2pa?.state).toBe('valid_ai_signed');
-    expect(result.policyContext?.overrideReason).toBe('c2pa-ai-signed-short-circuit');
-    expect(result.aiDetectionPolicy).toMatchObject({
-      aiDetectionAllowed: false,
-      aiDetectionForced: false,
-      aiDetectionRan: false,
-      aiDetectionSkipped: true,
-      policyReason: 'valid_ai_signed_skip',
-      c2paState: 'valid_ai_signed',
-    });
+    expect(result.c2pa?.claimGenerator).toContain('Adobe Firefly');
+    expect(result.policyContext?.overrideReason).toBeNull();
 
     const hiveCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes('api.thehive.ai'));
     expect(hiveCalls).toHaveLength(0);
   });
 
-  it('skips Hive AI detection by default on valid_proofmode while keeping content moderation', async () => {
+  it('keeps valid_proofmode context and skips Hive entirely', async () => {
     const hiveAuthCalls = [];
     const mockFetch = vi.fn(async (url, options = {}) => {
       const urlStr = String(url);
@@ -747,21 +799,14 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, baseEnv, mockFetch);
 
-    expect(result.action).toBe('SAFE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.c2pa?.state).toBe('valid_proofmode');
-    expect(result.scores.ai_generated).toBe(0);
-    expect(result.aiDetectionPolicy).toMatchObject({
-      aiDetectionAllowed: false,
-      aiDetectionForced: false,
-      aiDetectionRan: false,
-      aiDetectionSkipped: true,
-      policyReason: 'valid_proofmode_skip',
-      c2paState: 'valid_proofmode',
-    });
-    expect(hiveAuthCalls).toEqual(['token mod-key']);
+    expect(result.scores).toEqual({});
+    expect(hiveAuthCalls).toEqual([]);
   });
 
-  it('forces AI detection for reported valid_proofmode content and downgrades AI QUARANTINE to REVIEW', async () => {
+  it('keeps reported valid_proofmode content in team review without forcing Hive AI detection', async () => {
     const mockFetch = buildMockFetch({
       inquisitor: {
         has_c2pa: true,
@@ -799,24 +844,17 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
     }, baseEnv, mockFetch);
 
     expect(result.action).toBe('REVIEW');
-    expect(result.policyContext?.originalAction).toBe('QUARANTINE');
-    expect(result.policyContext?.overrideReason).toBe('proofmode-capture-authenticated');
-    expect(result.reason).toContain('proofmode-capture-authenticated');
+    expect(result.provider).toBe('manual-review');
+    expect(result.policyContext?.originalAction).toBe('REVIEW');
+    expect(result.policyContext?.overrideReason).toBeNull();
+    expect(result.reason).toContain('Team review required');
     expect(result.c2pa?.state).toBe('valid_proofmode');
-    expect(result.aiDetectionPolicy).toMatchObject({
-      aiDetectionAllowed: true,
-      aiDetectionForced: true,
-      aiDetectionRan: true,
-      aiDetectionSkipped: false,
-      policyReason: 'report_forced_ai_detection',
-      c2paState: 'valid_proofmode',
-    });
 
     const hiveCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes('api.thehive.ai'));
-    expect(hiveCalls.length).toBeGreaterThan(0);
+    expect(hiveCalls).toHaveLength(0);
   });
 
-  it('leaves action unchanged on valid_proofmode when Hive does not flag AI', async () => {
+  it('routes valid_proofmode content to review even when Hive fixtures would not flag AI', async () => {
     const mockFetch = buildMockFetch({
       inquisitor: {
         has_c2pa: true,
@@ -851,12 +889,13 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, baseEnv, mockFetch);
 
-    expect(result.action).toBe('SAFE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.c2pa?.state).toBe('valid_proofmode');
-    expect(result.policyContext?.overrideReason).toBeFalsy();
+    expect(result.policyContext?.overrideReason).toBeNull();
   });
 
-  it('does not downgrade valid_c2pa + AI flag — remains QUARANTINE', async () => {
+  it('routes valid_c2pa content to review without using Hive AI flags', async () => {
     const mockFetch = buildMockFetch({
       inquisitor: {
         has_c2pa: true,
@@ -890,11 +929,12 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, baseEnv, mockFetch);
 
-    expect(result.action).toBe('QUARANTINE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.c2pa?.state).toBe('valid_c2pa');
   });
 
-  it('falls through to Hive flow when inquisitor returns unchecked (timeout)', async () => {
+  it('routes to review when inquisitor returns unchecked from timeout', async () => {
     const mockFetch = vi.fn(async (url) => {
       const urlStr = String(url);
       if (urlStr.includes('inquisitor.divine.video/verify')) {
@@ -928,11 +968,12 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, baseEnv, mockFetch);
 
-    expect(result.action).toBe('QUARANTINE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.c2pa?.state).toBe('unchecked');
   });
 
-  it('falls through to Hive flow when absent C2PA + AI flag → QUARANTINE', async () => {
+  it('routes absent C2PA content to review without using Hive AI flags', async () => {
     const mockFetch = buildMockFetch({
       inquisitor: {
         has_c2pa: false,
@@ -963,11 +1004,12 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, baseEnv, mockFetch);
 
-    expect(result.action).toBe('QUARANTINE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.c2pa?.state).toBe('absent');
   });
 
-  it('skips inquisitor and falls through when INQUISITOR_BASE_URL not set', async () => {
+  it('skips inquisitor and routes to review when INQUISITOR_BASE_URL is not set', async () => {
     const envWithoutInquisitor = { ...baseEnv };
     delete envWithoutInquisitor.INQUISITOR_BASE_URL;
 
@@ -995,7 +1037,8 @@ describe('Moderation Pipeline — C2PA / ProofMode enforcement', () => {
       uploadedAt: Date.now(),
     }, envWithoutInquisitor, mockFetch);
 
-    expect(result.action).toBe('SAFE');
+    expect(result.action).toBe('REVIEW');
+    expect(result.provider).toBe('manual-review');
     expect(result.c2pa?.state).toBe('unchecked');
 
     const inquisitorCalls = mockFetch.mock.calls.filter(([url]) => String(url).includes('inquisitor.divine.video'));

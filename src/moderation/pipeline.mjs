@@ -4,18 +4,13 @@
 // ABOUTME: Complete moderation pipeline orchestration
 // ABOUTME: Coordinates video analysis and classification using pluggable providers
 
-import { moderateWithFallback } from './providers/index.mjs';
-import { classifyModerationResult, getKVThresholds, kvThresholdsToEnv } from './classifier.mjs';
 import { classifyText, parseVttText } from './text-classifier.mjs';
 import { interpretVideoSealPayload } from './videoseal.mjs';
 import { fetchNostrEventBySha256, parseVideoEventMetadata, isOriginalVine, hasStrongOriginalVineEvidence } from '../nostr/relay-client.mjs';
-import { classifyVideo } from '../classification/pipeline.mjs';
 import { extractTopics } from '../classification/topic-extractor.mjs';
 import { verifyC2pa } from './inquisitor-client.mjs';
-import { getAIDetectionPolicyDecision, proofModeSkipsAIDetection, shouldForceAIDetection } from './ai-detection-policy.mjs';
+import { shouldForceAIDetection } from './ai-detection-policy.mjs';
 
-const ORIGINAL_VINE_SUPPRESSED_CATEGORIES = new Set(['ai_generated', 'deepfake']);
-const DOWNSTREAM_SIGNAL_THRESHOLD = 0.5;
 const ARCHIVE_ORIGINAL_VINE_SOURCES = new Set(['archive-export', 'incident-backfill', 'sha-list']);
 const C2PA_CACHE_PREFIX = 'c2pa:';
 const C2PA_CACHE_TTL = 30 * 86400;
@@ -45,17 +40,42 @@ async function getCachedC2paOrVerify({ sha256, videoUrl, env, fetchFn }) {
   return result;
 }
 
-function buildSignedAiShortCircuitResult({ sha256, uploadedBy, uploadedAt, metadata, videoUrl, nostrContext, nostrEventId, c2pa, videoseal }) {
-  const claimGenerator = c2pa.claimGenerator || 'unknown';
-  const reason = `c2pa-ai-signed:${claimGenerator} — quarantined pending moderator review`;
+function buildManualReviewAIDetectionPolicy({ c2pa, metadata }) {
   return {
-    action: 'QUARANTINE',
-    severity: 'high',
-    category: 'ai_generated',
-    reason,
+    aiDetectionAllowed: false,
+    aiDetectionForced: shouldForceAIDetection(metadata),
+    aiDetectionRan: false,
+    aiDetectionSkipped: true,
+    policyReason: 'manual_review_external_ai_disabled',
+    c2paState: c2pa?.state || 'unchecked',
+  };
+}
+
+function buildManualReviewResult({
+  sha256,
+  uploadedBy,
+  uploadedAt,
+  metadata,
+  videoUrl,
+  nostrContext,
+  nostrEventId,
+  c2pa,
+  videoseal,
+  textScores,
+  topicProfile,
+  originalVine,
+  originalVineLegacyFallback,
+  transcriptPending,
+  transcriptRetryAfterSeconds,
+}) {
+  return {
+    action: 'REVIEW',
+    severity: 'medium',
+    category: 'manual_review',
+    reason: 'Team review required before final moderation decision',
     requiresSecondaryVerification: false,
-    scores: { ai_generated: 1.0, deepfake: 0 },
-    provider: 'inquisitor-c2pa',
+    scores: {},
+    provider: 'manual-review',
     processingTime: 0,
     detailedCategories: null,
     sha256,
@@ -66,35 +86,30 @@ function buildSignedAiShortCircuitResult({ sha256, uploadedBy, uploadedAt, metad
     nostrEventId,
     nostrContext,
     policyContext: {
-      originalVine: false,
-      originalVineLegacyFallback: false,
-      enforcementOverridden: true,
-      overrideReason: 'c2pa-ai-signed-short-circuit',
-      originalAction: 'QUARANTINE',
+      originalVine,
+      originalVineLegacyFallback,
+      enforcementOverridden: false,
+      overrideReason: null,
+      originalAction: 'REVIEW',
     },
-    aiDetectionPolicy: {
-      aiDetectionAllowed: false,
-      aiDetectionForced: false,
-      aiDetectionRan: false,
-      aiDetectionSkipped: true,
-      policyReason: 'valid_ai_signed_skip',
-      c2paState: 'valid_ai_signed',
-    },
+    aiDetectionPolicy: buildManualReviewAIDetectionPolicy({ c2pa, metadata }),
     downstreamSignals: {
-      hasSignals: true,
-      scores: { ai_generated: 1.0 },
-      primaryConcern: 'ai_generated',
-      category: 'ai_generated',
-      severity: 'high',
-      reason: `C2PA signature declares AI origin (claim_generator=${claimGenerator})`,
+      hasSignals: false,
+      scores: {},
+      primaryConcern: null,
+      category: null,
+      severity: 'low',
+      reason: null,
     },
-    text_scores: null,
+    text_scores: textScores,
     providerRaw: null,
     rawClassifierData: null,
     sceneClassification: null,
-    topicProfile: null,
+    topicProfile,
     c2pa,
     videoseal,
+    transcriptPending,
+    transcriptRetryAfterSeconds,
   };
 }
 
@@ -168,50 +183,9 @@ function buildQueueMetadataNostrContext(metadata) {
   return Object.values(context).some((value) => value !== null) ? context : null;
 }
 
-function applyOriginalVineEnforcementOverride(classification) {
-  return {
-    ...classification,
-    action: 'SAFE',
-    severity: 'low',
-    category: null,
-    reason: 'Original Vine archive content remains serveable; moderation signals retained for trust and safety context',
-    requiresSecondaryVerification: false
-  };
-}
-
-function deriveDownstreamSignals(classification, { originalVine = false } = {}) {
-  const sourceScores = classification?.scores || {};
-  const filteredScores = {};
-
-  for (const [category, score] of Object.entries(sourceScores)) {
-    const shouldSuppress = originalVine && ORIGINAL_VINE_SUPPRESSED_CATEGORIES.has(category);
-    filteredScores[category] = shouldSuppress ? 0 : score;
-  }
-
-  const signalEntries = Object.entries(filteredScores)
-    .filter(([, score]) => score >= DOWNSTREAM_SIGNAL_THRESHOLD)
-    .sort((a, b) => b[1] - a[1]);
-
-  const primaryConcern = signalEntries[0]?.[0] || null;
-  const primaryScore = signalEntries[0]?.[1] || 0;
-
-  return {
-    hasSignals: signalEntries.length > 0,
-    scores: filteredScores,
-    primaryConcern,
-    category: primaryConcern,
-    severity: primaryScore >= 0.8 ? 'high' : (primaryScore > 0 ? 'medium' : 'low'),
-    reason: primaryConcern
-      ? `Moderation signal retained for ${primaryConcern}`
-      : null
-  };
-}
-
 /**
  * Run classify-only pipeline on a video that already has moderation results.
- * Skips expensive HiveAI moderation + Sightengine calls. Only runs:
- *   - VLM scene classification (Hive VLM)
- *   - VTT topic extraction
+ * Skips Hive VLM and only runs local VTT topic extraction.
  *
  * @param {string} sha256 - Video hash
  * @param {Object} env - Environment variables
@@ -247,62 +221,34 @@ export async function classifyVideoOnly(sha256, env, options = {}) {
     console.log(`[CLASSIFY-ONLY] Using provided video URL for ${sha256}: ${videoUrl}`);
   }
 
-  // Run VLM scene classification and VTT topic extraction in parallel
-  const [sceneResult, topicResult] = await Promise.allSettled([
-    // Scene classification via Hive VLM
-    (async () => {
-      try {
-        const result = await classifyVideo(videoUrl, env, { sha256, fetchFn });
-        if (result && !result.skipped) {
-          console.log(`[CLASSIFY-ONLY] Scene classification complete for ${sha256}: ${result.labels?.length || 0} labels`);
-          return result;
-        }
-        console.log(`[CLASSIFY-ONLY] Scene classification skipped for ${sha256}: ${result?.reason || 'unknown'}`);
-        return null;
-      } catch (error) {
-        console.error(`[CLASSIFY-ONLY] Scene classification failed for ${sha256}: ${error.message}`);
-        return null;
-      }
-    })(),
-    // VTT topic extraction
-    (async () => {
-      try {
-        const vttUrl = `https://media.divine.video/${sha256}.vtt`;
-        const vttResponse = await fetchFn(vttUrl);
-        if (vttResponse.status === 202) {
-          const retryAfterSeconds = getRetryAfterSeconds(vttResponse);
-          console.log(`[CLASSIFY-ONLY] VTT transcript for ${sha256} is still pending${retryAfterSeconds !== null ? ` (retry after ${retryAfterSeconds}s)` : ''}`);
-          return null;
-        }
-        if (vttResponse.status === 404) {
-          console.log(`[CLASSIFY-ONLY] No VTT transcript for ${sha256} (404)`);
-          return null;
-        }
-        if (!vttResponse.ok) {
-          console.warn(`[CLASSIFY-ONLY] VTT fetch returned ${vttResponse.status} for ${sha256}`);
-          return null;
-        }
-        const vttContent = await vttResponse.text();
-        const { parseVttText } = await import('./text-classifier.mjs');
-        const plainText = parseVttText(vttContent);
-        if (plainText.trim().length > 0) {
-          const profile = extractTopics(plainText);
-          console.log(`[CLASSIFY-ONLY] Topic extraction for ${sha256}: primary_topic=${profile.primary_topic}, ${profile.topics.length} topics`);
-          return profile;
-        }
+  console.log(`[CLASSIFY-ONLY] Skipping Hive VLM scene classification for ${sha256}; using local transcript topics only`);
+
+  let topicProfile = null;
+  try {
+    const vttUrl = `https://media.divine.video/${sha256}.vtt`;
+    const vttResponse = await fetchFn(vttUrl);
+    if (vttResponse.status === 202) {
+      const retryAfterSeconds = getRetryAfterSeconds(vttResponse);
+      console.log(`[CLASSIFY-ONLY] VTT transcript for ${sha256} is still pending${retryAfterSeconds !== null ? ` (retry after ${retryAfterSeconds}s)` : ''}`);
+    } else if (vttResponse.status === 404) {
+      console.log(`[CLASSIFY-ONLY] No VTT transcript for ${sha256} (404)`);
+    } else if (!vttResponse.ok) {
+      console.warn(`[CLASSIFY-ONLY] VTT fetch returned ${vttResponse.status} for ${sha256}`);
+    } else {
+      const vttContent = await vttResponse.text();
+      const plainText = parseVttText(vttContent);
+      if (plainText.trim().length > 0) {
+        topicProfile = extractTopics(plainText);
+        console.log(`[CLASSIFY-ONLY] Topic extraction for ${sha256}: primary_topic=${topicProfile.primary_topic}, ${topicProfile.topics.length} topics`);
+      } else {
         console.log(`[CLASSIFY-ONLY] VTT transcript for ${sha256} contains no extractable text`);
-        return null;
-      } catch (error) {
-        console.error(`[CLASSIFY-ONLY] VTT/topic extraction failed for ${sha256}: ${error.message}`);
-        return null;
       }
-    })()
-  ]);
+    }
+  } catch (error) {
+    console.error(`[CLASSIFY-ONLY] VTT/topic extraction failed for ${sha256}: ${error.message}`);
+  }
 
-  const sceneClassification = sceneResult.status === 'fulfilled' ? sceneResult.value : null;
-  const topicProfile = topicResult.status === 'fulfilled' ? topicResult.value : null;
-
-  return { sha256, sceneClassification, topicProfile };
+  return { sha256, sceneClassification: null, topicProfile };
 }
 
 /**
@@ -325,7 +271,6 @@ export async function moderateVideo(videoData, env, fetchFn = fetch) {
     videoSealPayload = null,
     videoSealBitAccuracy = null
   } = videoData;
-  const forceAIDetection = shouldForceAIDetection(metadata);
 
   // Validate configuration
   if (!env.CDN_DOMAIN) {
@@ -374,99 +319,16 @@ export async function moderateVideo(videoData, env, fetchFn = fetch) {
   const originalVineSkipsAIDetection = isOriginalVine(nostrContext);
   const shouldForceServeable = hasStrongOriginalVineEvidence(nostrContext);
   if (originalVineSkipsAIDetection) {
-    console.log(`[MODERATION] Original Vine detected - skipping AI detection for ${sha256}`);
+    console.log(`[MODERATION] Original Vine detected for ${sha256}; preserving context for team review`);
   }
 
-  // Step 2.5: Call divine-inquisitor first so valid_ai_signed content can short-circuit Hive
+  // Step 2.5: Call divine-inquisitor for human review context only. Do not
+  // short-circuit to external moderation; every upload now goes to team review.
   const c2pa = await getCachedC2paOrVerify({ sha256, videoUrl, env, fetchFn });
   console.log(`[MODERATION] ${sha256} - C2PA state: ${c2pa.state}${c2pa.claimGenerator ? ` (claim=${c2pa.claimGenerator})` : ''}`);
   const videoseal = interpretVideoSealPayload(videoSealPayload, videoSealBitAccuracy);
 
-  const aiDetectionPolicyBase = {
-    ...getAIDetectionPolicyDecision({ c2pa, metadata, originalVine: originalVineSkipsAIDetection }),
-    c2paState: c2pa.state,
-  };
-
-  if (c2pa.state === 'valid_ai_signed') {
-    console.log(`[MODERATION] ${sha256} - signed-AI short-circuit, skipping Hive and Reality Defender`);
-    return buildSignedAiShortCircuitResult({
-      sha256, uploadedBy, uploadedAt, metadata,
-      videoUrl, nostrContext, nostrEventId, c2pa, videoseal,
-    });
-  }
-
-  const proofModeSkip = proofModeSkipsAIDetection(c2pa, metadata);
-  const skipAIDetection = originalVineSkipsAIDetection || proofModeSkip;
-
-  if (proofModeSkip) {
-    console.log(`[MODERATION] ${sha256} - valid ProofMode capture, skipping Hive AI detection`);
-  } else if (c2pa.state === 'valid_proofmode' && forceAIDetection) {
-    console.log(`[MODERATION] ${sha256} - valid ProofMode capture but forced AI detection requested`);
-  }
-
-  // Step 3: Run moderation and scene classification in parallel
-  let moderationResult;
-  let combinedScores = {};
-  let combinedFlaggedFrames = [];
-  let providers = [];
-  let processingTime = 0;
-  let rawClassifierData = null;
-  let sceneClassification = null;
-
-  // Build the moderation promise (HiveAI primary, Sightengine fallback)
-  const moderationPromise = (async () => {
-    try {
-      console.log('[MODERATION] Running moderation with fallback chain');
-      return await moderateWithFallback(
-        videoUrl,
-        { sha256 },
-        env,
-        { fetchFn, skipAIDetection }
-      );
-    } catch (error) {
-      console.error('[MODERATION] Moderation failed:', error);
-      throw error;
-    }
-  })();
-
-  // Build the scene classification promise (runs in parallel with moderation)
-  const sceneClassificationPromise = (async () => {
-    try {
-      const result = await classifyVideo(videoUrl, env, { sha256, fetchFn });
-      return result;
-    } catch (error) {
-      console.error(`[MODERATION] Scene classification failed for ${sha256} (non-fatal):`, error.message);
-      return null;
-    }
-  })();
-
-  // Run moderation and scene classification in parallel
-  const [moderationSettled, sceneSettled] = await Promise.allSettled([
-    moderationPromise,
-    sceneClassificationPromise
-  ]);
-
-  // Moderation is required — rethrow if it failed
-  if (moderationSettled.status === 'rejected') {
-    throw moderationSettled.reason;
-  }
-  moderationResult = moderationSettled.value;
-
-  // Scene classification is optional — use null if it failed
-  if (sceneSettled.status === 'fulfilled' && sceneSettled.value && !sceneSettled.value.skipped) {
-    sceneClassification = sceneSettled.value;
-    console.log(`[MODERATION] Scene classification complete for ${sha256}: ${sceneClassification.labels?.length || 0} labels`);
-  } else if (sceneSettled.status === 'fulfilled' && sceneSettled.value?.skipped) {
-    console.log(`[MODERATION] Scene classification skipped for ${sha256}: ${sceneSettled.value.reason}`);
-  }
-
-  const aiDetectionPolicy = {
-    ...aiDetectionPolicyBase,
-    aiDetectionRan: !!moderationResult.raw?.aiDetection,
-    aiDetectionSkipped: moderationResult.raw?.skippedAIDetection === true || aiDetectionPolicyBase.aiDetectionAllowed === false,
-  };
-
-  // Step 3.5: Fetch VTT transcript and analyze text content + extract topics
+  // Step 3: Fetch VTT transcript and analyze text content + extract topics.
   let textScores = null;
   let topicProfile = null;
   let transcriptPending = false;
@@ -507,143 +369,22 @@ export async function moderateVideo(videoData, env, fetchFn = fetch) {
     // Don't fail moderation if VTT analysis fails
   }
 
-  // Step 4: Classify result into action categories
-  // Merge KV-based admin thresholds over env vars (KV takes priority)
-  let effectiveEnv = env;
-  try {
-    const kvThresholds = await getKVThresholds(env.MODERATION_KV);
-    if (kvThresholds) {
-      effectiveEnv = { ...env, ...kvThresholdsToEnv(kvThresholds) };
-    }
-  } catch (e) {
-    console.warn('[MODERATION] Failed to load KV thresholds, using env defaults:', e.message);
-  }
-  const classification = classifyModerationResult({
-    maxScores: moderationResult.scores,
-    flaggedFrames: moderationResult.flaggedFrames,
-    text_scores: textScores
-  }, effectiveEnv);
-
-  const policyContext = {
-    originalVine: shouldForceServeable,
-    originalVineLegacyFallback: originalVineSkipsAIDetection && !shouldForceServeable,
-    enforcementOverridden: false,
-    overrideReason: null,
-    originalAction: classification.action
-  };
-
-  const downstreamSignals = deriveDownstreamSignals(classification, { originalVine: shouldForceServeable });
-
-  let finalClassification = shouldForceServeable
-    ? (() => {
-      const overridden = applyOriginalVineEnforcementOverride(classification);
-      if (classification.action !== overridden.action) {
-        policyContext.enforcementOverridden = true;
-        policyContext.overrideReason = 'original-vine-serveable';
-      }
-      return overridden;
-    })()
-    : classification;
-
-  // Step 4.25: ProofMode downgrade rule — valid ProofMode capture attestation
-  // downgrades an AI-driven QUARANTINE to REVIEW so humans decide (content stays visible).
-  if (
-    c2pa.state === 'valid_proofmode'
-    && finalClassification.action === 'QUARANTINE'
-    && (finalClassification.category === 'ai_generated' || finalClassification.category === 'deepfake')
-  ) {
-    console.log(`[MODERATION] ${sha256} - ProofMode downgrade: QUARANTINE → REVIEW`);
-    policyContext.originalAction = finalClassification.action;
-    policyContext.enforcementOverridden = true;
-    policyContext.overrideReason = 'proofmode-capture-authenticated';
-    finalClassification = {
-      ...finalClassification,
-      action: 'REVIEW',
-      reason: `${finalClassification.reason} | proofmode-capture-authenticated`,
-      requiresSecondaryVerification: false,
-    };
-  }
-
-  // Step 4.5: If AI-flagged, submit to Reality Defender for secondary verification (fire-and-forget)
-  if (finalClassification.requiresSecondaryVerification && env.REALITY_DEFENDER_API_KEY) {
-    try {
-      const { submitToRealityDefender } = await import('./realness-client.mjs');
-      const rdResult = await submitToRealityDefender(sha256, videoUrl, env);
-      if (rdResult.submitted) {
-        console.log(`[MODERATION] ${sha256} - Submitted to Reality Defender for secondary AI verification (requestId=${rdResult.requestId})`);
-      } else if (!rdResult.cached) {
-        console.warn(`[MODERATION] ${sha256} - Failed to submit to Reality Defender: ${rdResult.error}`);
-      }
-    } catch (err) {
-      console.error(`[MODERATION] ${sha256} - Reality Defender submission error:`, err.message);
-      // Non-fatal: don't block moderation if Reality Defender is unavailable
-    }
-  }
-
-  // Step 5: Return complete result
-  return {
-    // Classification
-    ...finalClassification,
-
-    // Provider used
-    provider: moderationResult.provider,
-    processingTime: moderationResult.processingTime,
-
-    // Detailed subcategories for fine-grained filtering
-    detailedCategories: moderationResult.details,
-
-    // Video metadata
+  console.log(`[MODERATION] ${sha256} - defaulting to playable team review; external Hive moderation/classification skipped`);
+  return buildManualReviewResult({
     sha256,
     uploadedBy,
     uploadedAt,
     metadata,
-
-    // CDN URL for reference
-    cdnUrl: videoUrl,
-
-    // Nostr event ID (for linking back to the original video event)
+    videoUrl,
     nostrEventId,
-
-    // Nostr event context (if found)
     nostrContext,
-
-    // Explicit policy metadata for serveability vs downstream moderation signals
-    policyContext,
-    aiDetectionPolicy,
-    downstreamSignals,
-
-    // Text analysis scores from VTT transcript (null if no VTT available)
-    text_scores: textScores,
-
-    // Raw provider data (for debugging/auditing)
-    providerRaw: moderationResult.raw,
-
-    // Full raw classifier data from Hive AI (all classes, all frames)
-    // Used by downstream recommendation systems (funnelcake, gorse)
-    rawClassifierData: moderationResult.rawClassifierData || null,
-
-    // Scene classification result from Hive AI VLM (Vision Language Model)
-    // Contains topics, setting, objects, activities, mood, description, and recommendation labels
-    // null if HIVE_VLM_API_KEY is not configured or classification failed
-    sceneClassification: sceneClassification || null,
-
-    // Topic profile extracted from VTT transcript text
-    // Contains topics with confidence scores, primary_topic, has_speech, language_hint
-    // null if no VTT transcript is available
-    topicProfile: topicProfile || null,
-
-    // C2PA / ProofMode verification result from divine-inquisitor.
-    // state ∈ {valid_proofmode, valid_c2pa, valid_ai_signed, invalid, absent, unchecked}.
-    // valid_ai_signed is handled earlier via short-circuit; valid_proofmode may have
-    // downgraded the action above.
     c2pa,
-
-    // Interpreted upstream Video Seal watermark payload
-    // Always present so downstream consumers can rely on a stable signal shape
     videoseal,
-
-    // Deferred transcript processing state metadata.
+    textScores,
+    topicProfile,
+    originalVine: shouldForceServeable,
+    originalVineLegacyFallback: originalVineSkipsAIDetection && !shouldForceServeable,
     transcriptPending,
     transcriptRetryAfterSeconds
-  };
+  });
 }

@@ -43,12 +43,14 @@ max_retries = 3
 [vars]
 MODERATION_ENABLED = "true"
 CDN_DOMAIN = "media.divine.video"  # CDN domain for video access
-PRIMARY_MODERATION_PROVIDER = "hiveai"  # Use Hive.AI for content moderation + AI detection
+PRIMARY_MODERATION_PROVIDER = "manual-review"  # New uploads stay playable and wait for team review
 
 # Zero Trust JWT verification (for /api/v1/moderate endpoint)
 TEAM_DOMAIN = "https://divinevideo.cloudflareaccess.com"  # Cloudflare Access team domain
 
-# Thresholds for content classification (0.0 - 1.0)
+# Legacy automated-classifier thresholds (0.0 - 1.0). The upload pipeline no longer
+# calls external moderation providers; these remain for isolated classifier/provider tests
+# and any explicit future tooling that opts back into automated scoring.
 # NSFW / Adult Content
 NSFW_THRESHOLD_HIGH = "0.8"           # Age-restricted
 NSFW_THRESHOLD_MEDIUM = "0.6"         # Human review
@@ -82,7 +84,7 @@ AI_GENERATED_THRESHOLD_HIGH = "0.8"   # Age-restricted
 AI_GENERATED_THRESHOLD_MEDIUM = "0.6" # Human review
 
 # Divine-inquisitor C2PA/ProofMode verification service (github.com/divinevideo/divine-inquisitor)
-# Called from the pipeline before Hive — valid_ai_signed short-circuits Hive, valid_proofmode downgrades AI-QUARANTINE to REVIEW
+# Called for human-review context only; it no longer short-circuits uploads to automated enforcement.
 INQUISITOR_BASE_URL = "https://inquisitor.divine.video"
 
 # divine-ai-detector service base URL. The Worker posts per-signal detection
@@ -135,11 +137,8 @@ crons = ["* * * * *", "*/5 * * * *"]
 # FARO_RELAY_URL - Nostr relay for faro moderation events
 # SIGHTENGINE_API_USER - (optional, for fallback)
 # SIGHTENGINE_API_SECRET - (optional, for fallback)
-# HIVE_API_KEY - Hive.AI V2 API token for AI-generated content and deepfake detection (api.thehive.ai)
-# HIVE_VLM_API_KEY - Hive.AI V3 API token for VLM (Vision Language Model) classification
-#   Self-serve, uses the chat/completions endpoint at api.thehive.ai/api/v3/chat/completions
-#   Pricing: ~$0.001/video (much cheaper than V2 scene classification)
-# HIVE_VLM_PROMPT - (optional) Custom prompt for VLM classification (overrides default)
+# HIVE_* secrets are intentionally unused by upload moderation and classification entry points.
+# Do not set them for production unless re-enabling an explicit, reviewed Hive integration.
 # RELAY_ADMIN_URL - Funnelcake admin API endpoint for cache purge / event deletion
 # REALITY_DEFENDER_API_KEY - Reality Defender API key for secondary AI verification (api.prd.realitydefender.xyz)
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
