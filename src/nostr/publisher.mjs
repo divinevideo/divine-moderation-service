@@ -11,7 +11,7 @@ import { hexToBytes } from '@noble/hashes/utils';
 /**
  * NIP-32 label mapping for content categories
  */
-const CATEGORY_LABELS = {
+export const CATEGORY_LABELS = {
   'nudity': 'nudity',
   'violence': 'violence',
   'gore': 'gore',
@@ -192,10 +192,12 @@ function createReportEvent(report, privateKeyHex) {
  * @param {number} labelData.score - AI confidence score (0-1)
  * @param {string} [labelData.cdnUrl] - URL to video
  * @param {string} [labelData.nostrEventId] - Original Nostr event ID if known
+ * @param {string} [labelData.source] - 'human-moderator' (default) or 'automated' (Hive/RD/etc.)
  * @param {Object} env - Environment with Nostr credentials
+ * @param {Object} [mockRelay] - Mock relay for testing
  * @returns {Promise<Object>} Published event details
  */
-export async function publishLabelEvent(labelData, env) {
+export async function publishLabelEvent(labelData, env, mockRelay = null) {
   const { sha256, category, status, score, cdnUrl, nostrEventId } = labelData;
 
   // Validate configuration
@@ -218,6 +220,16 @@ export async function publishLabelEvent(labelData, env) {
   console.log(`[LABEL] Publishing kind 1985 label: ${category}=${status} for ${sha256.substring(0, 16)}...`);
 
   try {
+    if (mockRelay) {
+      await mockRelay.publish(event);
+      return {
+        published: true,
+        eventId: event.id,
+        pubkey: event.pubkey,
+        relay: relayUrl
+      };
+    }
+
     // Connect and publish
     const relayOptions = {};
     if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
@@ -254,6 +266,8 @@ export async function publishLabelEvent(labelData, env) {
  */
 function createLabelEvent(labelData, privateKeyHex) {
   const { sha256, category, status, score, cdnUrl, nostrEventId } = labelData;
+  const source = labelData.source === 'automated' ? 'automated' : 'human-moderator';
+  const verified = source === 'human-moderator';
 
   // Get the standard label name
   const labelName = CATEGORY_LABELS[category] || category;
@@ -267,22 +281,22 @@ function createLabelEvent(labelData, privateKeyHex) {
   ];
 
   // For confirmed labels, add the positive label
-  // For rejected labels, add a "not-X" label to indicate human verified it's NOT this
+  // For rejected labels, add a "not-X" label to indicate the labeler says it is NOT this
   if (status === 'confirmed') {
     // Positive label with metadata
     const metadata = JSON.stringify({
       confidence: score,
-      verified: true,
-      source: 'human-moderator',
+      verified,
+      source,
       sha256: sha256
     });
     tags.push(['l', labelName, namespace, metadata]);
   } else if (status === 'rejected') {
-    // Negative label - human verified this is NOT the category
+    // Negative label - labeler says this is NOT the category
     const metadata = JSON.stringify({
       confidence: score,
-      verified: true,
-      source: 'human-moderator',
+      verified,
+      source,
       rejected: true,
       sha256: sha256
     });
@@ -303,9 +317,10 @@ function createLabelEvent(labelData, privateKeyHex) {
   tags.push(['x', sha256]);  // Content hash reference
 
   // Build content (human-readable summary)
+  const subject = source === 'automated' ? 'Automated moderator flagged' : 'Human moderator verified';
   const content = status === 'confirmed'
-    ? `Human moderator verified: This content contains ${labelName} (AI confidence: ${(score * 100).toFixed(0)}%)`
-    : `Human moderator verified: This content does NOT contain ${labelName} (AI false positive, was ${(score * 100).toFixed(0)}%)`;
+    ? `${subject}: This content contains ${labelName} (confidence: ${(score * 100).toFixed(0)}%)`
+    : `${subject}: This content does NOT contain ${labelName} (was ${(score * 100).toFixed(0)}%)`;
 
   // Create unsigned event
   const unsignedEvent = {
