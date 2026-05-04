@@ -6,6 +6,7 @@
 
 import { validateQueueMessage } from './schemas/queue-message.mjs';
 import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
+import { applyForceProvider, shouldQueueHiveRecheck } from './moderation/report-trigger.mjs';
 import { publishToFaro, publishToContentRelay, publishLabelEvent } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
@@ -3683,6 +3684,25 @@ async function runMigration() {
           } catch (eventErr) {
             console.error(`[API] Failed to record AI report event for ${sha256}:`, eventErr.message);
           }
+        } else if (env.MODERATION_QUEUE) {
+          const allowed = await shouldQueueHiveRecheck(env.BLOSSOM_DB, sha256);
+          if (allowed) {
+            await env.MODERATION_QUEUE.send({
+              sha256,
+              r2Key: `videos/${sha256}.mp4`,
+              uploadedAt: Date.now(),
+              metadata: {
+                source: 'user-report',
+                forceProvider: 'hiveai',
+                reportType: report_type,
+                reportedBy: reporter_pubkey,
+                ...(reason ? { reportReason: reason } : {})
+              }
+            });
+            console.log(`[API] Queued Hive recheck for reported content ${sha256} (report_type=${report_type})`);
+          } else {
+            console.log(`[API] Skipped Hive recheck for ${sha256} - rate-limited (recent hiveai run)`);
+          }
         }
 
         return new Response(JSON.stringify({ success: true, ...result }), {
@@ -4352,15 +4372,19 @@ async function runMigration() {
         ).bind(sha256).first();
 
         const forceAIDetection = shouldForceAIDetection(metadata);
+        const forcedProviderEnv = applyForceProvider(env, metadata);
+        const providerOverridden = forcedProviderEnv !== env;
 
-        if (existingResult && !forceAIDetection) {
+        if (existingResult && !forceAIDetection && !providerOverridden) {
           console.log(`[MODERATION] ⚠️ SKIPPED ${sha256} - already moderated`);
           console.log(`[MODERATION] Previous result: action=${existingResult.action}, moderated_at=${existingResult.moderated_at}`);
           message.ack();
           continue;
         }
 
-        if (existingResult && forceAIDetection) {
+        if (existingResult && providerOverridden) {
+          console.log(`[MODERATION] Step 4: Provider override requested for already moderated ${sha256}; previous action=${existingResult.action}; new provider=${metadata?.forceProvider}`);
+        } else if (existingResult && forceAIDetection) {
           console.log(`[MODERATION] Step 4: Forced AI detection requested for already moderated ${sha256}; previous action=${existingResult.action}`);
         } else {
           console.log(`[MODERATION] Step 4: No existing result found, starting analysis for ${sha256}`);
@@ -4375,7 +4399,7 @@ async function runMigration() {
           metadata,
           videoSealPayload,
           videoSealBitAccuracy
-        }, env);
+        }, forcedProviderEnv);
 
         if (result.uploadedBy) {
           try {

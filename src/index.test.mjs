@@ -277,6 +277,93 @@ describe('HTTP hostname routing', () => {
     });
   });
 
+  it('queues a Hive moderation recheck when a non-AI report is submitted', async () => {
+    const queued = [];
+    const reporterPubkey = 'b'.repeat(64);
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_QUEUE: {
+        async send(message) {
+          queued.push(message);
+        }
+      }
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: reporterPubkey,
+          report_type: 'nudity',
+          reason: 'explicit content'
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      sha256: SHA256,
+      r2Key: `videos/${SHA256}.mp4`,
+      metadata: {
+        source: 'user-report',
+        forceProvider: 'hiveai',
+        reportType: 'nudity',
+        reportedBy: reporterPubkey
+      }
+    });
+  });
+
+  it('skips queuing a Hive recheck when one already ran within the rate-limit window', async () => {
+    const queued = [];
+    const recentIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'REVIEW',
+          provider: 'hiveai',
+          scores: JSON.stringify({}),
+          categories: JSON.stringify([]),
+          moderated_at: recentIso,
+          reviewed_by: null,
+          reviewed_at: null,
+        }]])
+      }),
+      MODERATION_QUEUE: {
+        async send(message) {
+          queued.push(message);
+        }
+      }
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: 'c'.repeat(64),
+          report_type: 'violence',
+          reason: 'graphic'
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(queued).toHaveLength(0);
+  });
+
   it('requires admin auth for AI detection stats', async () => {
     const response = await worker.fetch(
       new Request('https://moderation.admin.divine.video/admin/api/ai-detection/stats'),
