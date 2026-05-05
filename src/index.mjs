@@ -4859,10 +4859,11 @@ async function handleModerationResult(result, env) {
     }
   }
 
-  // Send DM to creator for non-SAFE actions (non-blocking)
-  // DMs sent for permanent actions only. QUARANTINE is temporary (pending secondary
-  // verification) — DM fires when it resolves to PERMANENT_BAN via auto-escalation.
-  if (['PERMANENT_BAN', 'AGE_RESTRICTED'].includes(action) && uploadedBy && env.NOSTR_PRIVATE_KEY) {
+  // Send DM to creator for non-SAFE actions (non-blocking).
+  // QUARANTINE now also DMs because the relay-side hide makes the video
+  // disappear from public feeds; without a heads-up the creator would just
+  // see their upload vanish. The under-review template explains the 24h SLA.
+  if (['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE'].includes(action) && uploadedBy && env.NOSTR_PRIVATE_KEY) {
     try {
       const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
       await sendModerationDM(uploadedBy, sha256, action, reason, env, null, { categories: result.categories, title: result.nostrContext?.title, publishedAt: result.nostrContext?.publishedAt });
