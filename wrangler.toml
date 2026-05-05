@@ -117,6 +117,12 @@ RELAY_POLLING_RELAY_URL = "wss://relay.divine.video"  # Relay to poll for new vi
 RELAY_POLLING_LOOKBACK_HOURS = "1"                # How far back to look for events (in hours)
 RELAY_POLLING_LIMIT = "100"                       # Max events to fetch per poll
 
+# Funnelcake admin URL — destination for notifyRelay() NIP-98 add/remove
+# webhooks against /api/moderation/quarantine. Empty string = relay-side
+# enforcement disabled (notifyRelay returns skipped). Signed with NOSTR_PRIVATE_KEY,
+# so the corresponding pubkey must be in funnelcake's ADMIN_PUBKEYS.
+FUNNELCAKE_ADMIN_URL = "https://relay.divine.video"
+
 # Creator-delete pipeline feature flag (default off; flip to "true" via `wrangler secret put` or [vars] once ready)
 CREATOR_DELETE_PIPELINE_ENABLED = "false"
 # Relay used to fetch creator kind 5 delete events and target video events.
