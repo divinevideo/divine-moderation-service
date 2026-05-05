@@ -19,6 +19,7 @@ function createDbMock({
   aiDetectionReviewRows = [],
   aiDetectionRecentRows = [],
   moderationWrites = [],
+  reporterCount = 1,
 } = {}) {
   return {
     prepare(sql) {
@@ -60,6 +61,9 @@ function createDbMock({
           }
           if (sql.includes('FROM ai_detection_events')) {
             return aiDetectionStatsRow;
+          }
+          if (sql.includes('FROM user_reports') && sql.includes('COUNT(DISTINCT reporter_pubkey)')) {
+            return { cnt: reporterCount };
           }
           return null;
         },
@@ -273,12 +277,13 @@ describe('HTTP hostname routing', () => {
     });
   });
 
-  it('writes an AGE_RESTRICTED moderation row when a report flags NSFW content', async () => {
+  it('writes an AGE_RESTRICTED moderation row when a 2nd distinct reporter flags NSFW content', async () => {
     const queued = [];
     const moderationWrites = [];
     const reporterPubkey = 'b'.repeat(64);
     const env = createEnv({
-      BLOSSOM_DB: createDbMock({ moderationWrites }),
+      // Simulate the mock D1 returning count=2 (this report makes it the 2nd distinct reporter).
+      BLOSSOM_DB: createDbMock({ moderationWrites, reporterCount: 2 }),
       MODERATION_QUEUE: {
         async send(message) {
           queued.push(message);
@@ -310,6 +315,75 @@ describe('HTTP hostname routing', () => {
     expect(bound.bindings[0]).toBe(SHA256);
     expect(bound.bindings[1]).toBe('AGE_RESTRICTED');
     expect(bound.bindings[2]).toBe('user-report');
+  });
+
+  it('rejects /api/v1/report with malformed sha256', async () => {
+    const env = createEnv();
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: 'not-a-real-hash',
+          reporter_pubkey: 'a'.repeat(64),
+          report_type: 'nudity'
+        })
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: expect.stringMatching(/sha256/i) });
+  });
+
+  it('rejects /api/v1/report with malformed reporter_pubkey', async () => {
+    const env = createEnv();
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: 'not-a-pubkey',
+          report_type: 'nudity'
+        })
+      }),
+      env
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: expect.stringMatching(/reporter_pubkey/i) });
+  });
+
+  it('first NSFW report from a single reporter writes REVIEW (not yet AGE_RESTRICTED)', async () => {
+    const moderationWrites = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({ moderationWrites })
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: 'a'.repeat(64),
+          report_type: 'nudity'
+        })
+      }),
+      env
+    );
+    expect(response.status).toBe(200);
+    expect(moderationWrites).toHaveLength(1);
+    // First reporter alone → REVIEW (anti-grief floor); only second distinct reporter promotes to AGE_RESTRICTED.
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
   });
 
   it('writes a REVIEW moderation row when a report flags non-NSFW content', async () => {

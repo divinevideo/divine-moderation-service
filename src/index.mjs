@@ -3626,25 +3626,52 @@ async function runMigration() {
       }
 
       try {
-        const { sha256, reporter_pubkey, report_type, reason } = await request.json();
+        const body = await request.json();
+        const reporter_pubkey = body?.reporter_pubkey;
+        const report_type = body?.report_type;
+        const reason = body?.reason;
+        const rawSha = typeof body?.sha256 === 'string' ? body.sha256.toLowerCase() : null;
 
-        if (!sha256 || !reporter_pubkey || !report_type) {
-          return new Response(JSON.stringify({ error: 'sha256, reporter_pubkey, and report_type are required' }), {
+        if (!rawSha || !isValidSha256(rawSha)) {
+          return new Response(JSON.stringify({ error: 'Valid sha256 (64-char lowercase hex) required' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' }
           });
         }
+        if (!isValidPubkey(reporter_pubkey)) {
+          return new Response(JSON.stringify({ error: 'Valid reporter_pubkey (64-char hex) required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        if (typeof report_type !== 'string' || report_type.trim().length === 0) {
+          return new Response(JSON.stringify({ error: 'report_type is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        const sha256 = rawSha;
 
         const result = await addReport(env.BLOSSOM_DB, { sha256, reporter_pubkey, report_type, reason });
 
-        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... escalate=${result.escalate}`);
+        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... distinctReporters=${result.distinctReporterCount}`);
 
         // Write a moderation_results row directly so the team's FLAGGED dashboard
         // (action IN REVIEW/AGE_RESTRICTED/PERMANENT_BAN AND reviewed_by IS NULL)
-        // surfaces the reported item. NSFW-typed reports auto age-restrict pending
-        // team confirmation; everything else lands in REVIEW until a moderator decides.
+        // surfaces the reported item.
+        //
+        // Policy:
+        //   - Non-NSFW report (single tier): action = REVIEW
+        //   - NSFW report: action = REVIEW on first reporter; auto AGE_RESTRICTED
+        //     once 2+ DISTINCT reporter_pubkeys have flagged the same sha256.
+        //     The 2-distinct-reporter floor defends against single-token griefing
+        //     where one API caller could otherwise auto age-restrict any sha256
+        //     by varying the reporter_pubkey field.
+        //
+        // ON CONFLICT short-circuits if a moderator already reviewed the row
+        // (reviewed_by IS NOT NULL) so human decisions are never overwritten.
         const isNsfw = isNsfwReportType(report_type);
-        const reportAction = isNsfw ? 'AGE_RESTRICTED' : 'REVIEW';
+        const reportAction = (isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
         const nowIso = new Date().toISOString();
         const reportCategories = isNsfw ? ['adult'] : [];
         try {
@@ -3654,14 +3681,24 @@ async function runMigration() {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(sha256) DO UPDATE SET
               action = CASE
-                WHEN moderation_results.action IN ('PERMANENT_BAN') THEN moderation_results.action
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.action
+                WHEN moderation_results.action = 'PERMANENT_BAN' THEN moderation_results.action
                 WHEN excluded.action = 'AGE_RESTRICTED' AND moderation_results.action IN ('SAFE', 'REVIEW') THEN excluded.action
                 WHEN excluded.action = 'REVIEW' AND moderation_results.action = 'SAFE' THEN excluded.action
                 ELSE moderation_results.action
               END,
-              provider = excluded.provider,
-              categories = excluded.categories,
-              moderated_at = excluded.moderated_at
+              provider = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.provider
+                ELSE excluded.provider
+              END,
+              categories = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.categories
+                ELSE excluded.categories
+              END,
+              moderated_at = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.moderated_at
+                ELSE excluded.moderated_at
+              END
           `).bind(
             sha256,
             reportAction,
@@ -3672,6 +3709,7 @@ async function runMigration() {
               source: 'user-report',
               reportType: report_type,
               reportedBy: reporter_pubkey,
+              distinctReporterCount: result.distinctReporterCount,
               reason: reason ?? null,
             }),
             nowIso,
@@ -3680,7 +3718,7 @@ async function runMigration() {
             null,
             null,
           ).run();
-          console.log(`[API] Recorded ${reportAction} from user report for ${sha256} (type=${report_type}, nsfw=${isNsfw})`);
+          console.log(`[API] Recorded ${reportAction} from user report for ${sha256} (type=${report_type}, nsfw=${isNsfw}, distinctReporters=${result.distinctReporterCount})`);
         } catch (writeErr) {
           console.error(`[API] Failed to write moderation row for reported ${sha256}:`, writeErr.message);
         }
@@ -4333,6 +4371,20 @@ async function runMigration() {
    */
   async queue(batch, env) {
     console.log(`[MODERATION] Processing batch of ${batch.messages.length} videos`);
+
+    // Reactive moderation kill-switch. When enabled, drain (ack) every message
+    // without invoking the legacy moderate-video pipeline. Used to safely retire
+    // the queue path after the pivot to report-driven moderation. In-flight
+    // messages from before deploy are absorbed without writing manual-review
+    // rows that would re-flood the team's REVIEW queue.
+    if (env.REACTIVE_MODERATION_ONLY === 'true') {
+      console.log(`[MODERATION] REACTIVE_MODERATION_ONLY=true — ack-and-skip ${batch.messages.length} message(s)`);
+      for (const message of batch.messages) {
+        message.ack();
+      }
+      return;
+    }
+
     await initAIDetectionEventsTable(env.BLOSSOM_DB);
 
     for (const message of batch.messages) {
