@@ -68,8 +68,13 @@ describe('DM Sender - Message Templates', () => {
   it('should produce correct message for QUARANTINE', () => {
     const message = getMessageForAction('QUARANTINE', 'potential violation', 'ghi789');
 
-    expect(message).toContain('temporarily hidden');
-    expect(message).toContain('moderator will take a look');
+    expect(message).toContain('under review');
+    // Creators need to know roughly when to expect a decision; the 24h SLA
+    // is what we promise in policy and what the plan calls for explicitly.
+    expect(message).toMatch(/24 hours|24h|within a day/i);
+    // Author can still see their own under-review content via direct link;
+    // surfacing that prevents "did I get shadow-banned?" confusion.
+    expect(message).toMatch(/your profile|signed in|direct link/i);
     expect(message).toContain('divine.video/video/ghi789');
   });
 
@@ -379,7 +384,7 @@ describe('DM Sender - selectTemplate (Category-Specific)', () => {
     const msg = selectTemplate('QUARANTINE', 'custom reason', null, 'abc123');
 
     // QUARANTINE template is generic per spec — reason param is unused
-    expect(msg).toContain('temporarily hidden');
+    expect(msg).toContain('under review');
     expect(msg).not.toContain('custom reason');
   });
 
@@ -442,7 +447,7 @@ describe('DM Sender - selectTemplate (Category-Specific)', () => {
   it('should produce QUARANTINE template with reply invitation', () => {
     const msg = selectTemplate('QUARANTINE', null, '{"deepfake": 0.85}', 'ghi789');
 
-    expect(msg).toContain('temporarily hidden');
+    expect(msg).toContain('under review');
     expect(msg).toContain('reply to this message');
     expect(msg).toContain('divine.video/video/ghi789');
   });
