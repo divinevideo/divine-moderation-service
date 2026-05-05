@@ -58,10 +58,31 @@ const AI_REPORT_TYPES = new Set([
   'deepfake',
 ]);
 
+const NSFW_REPORT_TYPES = new Set([
+  'nudity',
+  'porn',
+  'pornography',
+  'nsfw',
+  'sexual',
+  'sexual_content',
+  'sexual-content',
+  'explicit',
+  'adult',
+  'adult_content',
+  'adult-content',
+]);
+
+function normalizeReportType(reportType) {
+  if (typeof reportType !== 'string') return '';
+  return reportType.trim().toLowerCase().replace(/\s+/g, '_');
+}
+
 export function isAiReportType(reportType) {
-  if (typeof reportType !== 'string') return false;
-  const normalized = reportType.trim().toLowerCase().replace(/\s+/g, '_');
-  return AI_REPORT_TYPES.has(normalized);
+  return AI_REPORT_TYPES.has(normalizeReportType(reportType));
+}
+
+export function isNsfwReportType(reportType) {
+  return NSFW_REPORT_TYPES.has(normalizeReportType(reportType));
 }
 
 /**

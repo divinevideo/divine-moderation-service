@@ -18,6 +18,7 @@ function createDbMock({
   aiDetectionPolicyRows = [],
   aiDetectionReviewRows = [],
   aiDetectionRecentRows = [],
+  moderationWrites = [],
 } = {}) {
   return {
     prepare(sql) {
@@ -44,6 +45,9 @@ function createDbMock({
               metadata_json: bindings[10],
               created_at: bindings[11],
             });
+          }
+          if (/INSERT INTO moderation_results/i.test(sql)) {
+            moderationWrites.push({ sql, bindings: [...bindings] });
           }
           return { success: true };
         },
@@ -190,7 +194,7 @@ describe('HTTP hostname routing', () => {
     });
   });
 
-  it('queues legacy /api/v1/scan requests', async () => {
+  it('does NOT queue legacy /api/v1/scan requests in reactive moderation mode', async () => {
     const queued = [];
     const env = createEnv({
       MODERATION_API_KEY: 'legacy-token',
@@ -214,23 +218,21 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(202);
-    expect(queued).toHaveLength(1);
-    expect(queued[0]).toMatchObject({
+    expect(queued).toHaveLength(0);
+    await expect(response.json()).resolves.toMatchObject({
       sha256: SHA256,
-      r2Key: `blobs/${SHA256}`,
-      metadata: {
-        source: 'blossom',
-        videoUrl: `https://media.divine.video/${SHA256}`
-      }
+      queued: false,
+      reason: 'reactive_moderation'
     });
   });
 
-  it('queues a forced AI recheck when users report content as AI-generated', async () => {
+  it('writes a REVIEW row and records AI telemetry when users report AI-generated content', async () => {
     const queued = [];
     const aiDetectionEvents = [];
+    const moderationWrites = [];
     const reporterPubkey = 'b'.repeat(64);
     const env = createEnv({
-      BLOSSOM_DB: createDbMock({ aiDetectionEvents }),
+      BLOSSOM_DB: createDbMock({ aiDetectionEvents, moderationWrites }),
       MODERATION_QUEUE: {
         async send(message) {
           queued.push(message);
@@ -256,17 +258,11 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(queued).toHaveLength(1);
-    expect(queued[0]).toMatchObject({
-      sha256: SHA256,
-      r2Key: `videos/${SHA256}.mp4`,
-      metadata: {
-        source: 'user-report',
-        forceAIDetection: true,
-        reportType: 'ai_generated',
-        reportedBy: reporterPubkey
-      }
-    });
+    expect(queued).toHaveLength(0);
+    expect(moderationWrites).toHaveLength(1);
+    expect(moderationWrites[0].bindings[0]).toBe(SHA256);
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
+    expect(moderationWrites[0].bindings[2]).toBe('user-report');
     expect(aiDetectionEvents).toHaveLength(1);
     expect(aiDetectionEvents[0]).toMatchObject({
       sha256: SHA256,
@@ -277,11 +273,12 @@ describe('HTTP hostname routing', () => {
     });
   });
 
-  it('queues a Hive moderation recheck when a non-AI report is submitted', async () => {
+  it('writes an AGE_RESTRICTED moderation row when a report flags NSFW content', async () => {
     const queued = [];
+    const moderationWrites = [];
     const reporterPubkey = 'b'.repeat(64);
     const env = createEnv({
-      BLOSSOM_DB: createDbMock(),
+      BLOSSOM_DB: createDbMock({ moderationWrites }),
       MODERATION_QUEUE: {
         async send(message) {
           queued.push(message);
@@ -307,35 +304,19 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(queued).toHaveLength(1);
-    expect(queued[0]).toMatchObject({
-      sha256: SHA256,
-      r2Key: `videos/${SHA256}.mp4`,
-      metadata: {
-        source: 'user-report',
-        forceProvider: 'hiveai',
-        reportType: 'nudity',
-        reportedBy: reporterPubkey
-      }
-    });
+    expect(queued).toHaveLength(0);
+    expect(moderationWrites).toHaveLength(1);
+    const [bound] = moderationWrites;
+    expect(bound.bindings[0]).toBe(SHA256);
+    expect(bound.bindings[1]).toBe('AGE_RESTRICTED');
+    expect(bound.bindings[2]).toBe('user-report');
   });
 
-  it('skips queuing a Hive recheck when one already ran within the rate-limit window', async () => {
+  it('writes a REVIEW moderation row when a report flags non-NSFW content', async () => {
     const queued = [];
-    const recentIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const moderationWrites = [];
     const env = createEnv({
-      BLOSSOM_DB: createDbMock({
-        moderationResults: new Map([[SHA256, {
-          sha256: SHA256,
-          action: 'REVIEW',
-          provider: 'hiveai',
-          scores: JSON.stringify({}),
-          categories: JSON.stringify([]),
-          moderated_at: recentIso,
-          reviewed_by: null,
-          reviewed_at: null,
-        }]])
-      }),
+      BLOSSOM_DB: createDbMock({ moderationWrites }),
       MODERATION_QUEUE: {
         async send(message) {
           queued.push(message);
@@ -354,7 +335,7 @@ describe('HTTP hostname routing', () => {
           sha256: SHA256,
           reporter_pubkey: 'c'.repeat(64),
           report_type: 'violence',
-          reason: 'graphic'
+          reason: 'graphic violence'
         })
       }),
       env
@@ -362,6 +343,11 @@ describe('HTTP hostname routing', () => {
 
     expect(response.status).toBe(200);
     expect(queued).toHaveLength(0);
+    expect(moderationWrites).toHaveLength(1);
+    const [bound] = moderationWrites;
+    expect(bound.bindings[0]).toBe(SHA256);
+    expect(bound.bindings[1]).toBe('REVIEW');
+    expect(bound.bindings[2]).toBe('user-report');
   });
 
   it('requires admin auth for AI detection stats', async () => {

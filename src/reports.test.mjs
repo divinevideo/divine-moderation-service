@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType } from './reports.mjs';
+import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType, isNsfwReportType } from './reports.mjs';
 
 const SHA256 = ('a'.repeat(63) + '1').slice(0, 64);
 const REPORTER1 = ('b'.repeat(63) + '1').slice(0, 64);
@@ -43,6 +43,26 @@ describe('reports', () => {
       expect(isAiReportType('violence')).toBe(false);
       expect(isAiReportType('spam')).toBe(false);
       expect(isAiReportType(null)).toBe(false);
+    });
+  });
+
+  describe('isNsfwReportType', () => {
+    it('matches nudity/porn/nsfw labels case-insensitively', () => {
+      expect(isNsfwReportType('nudity')).toBe(true);
+      expect(isNsfwReportType('PORN')).toBe(true);
+      expect(isNsfwReportType('nsfw')).toBe(true);
+      expect(isNsfwReportType('sexual_content')).toBe(true);
+      expect(isNsfwReportType('explicit')).toBe(true);
+      expect(isNsfwReportType('Adult Content')).toBe(true);
+    });
+
+    it('does not match non-NSFW report labels', () => {
+      expect(isNsfwReportType('violence')).toBe(false);
+      expect(isNsfwReportType('hate')).toBe(false);
+      expect(isNsfwReportType('spam')).toBe(false);
+      expect(isNsfwReportType('ai_generated')).toBe(false);
+      expect(isNsfwReportType(null)).toBe(false);
+      expect(isNsfwReportType(undefined)).toBe(false);
     });
   });
 

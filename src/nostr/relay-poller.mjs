@@ -59,38 +59,15 @@ export async function pollRelayForVideos(env, options = {}) {
           continue;
         }
 
-        // Extract video URL from event
-        const videoUrl = extractVideoUrlFromEvent(event, env);
-
-        // Queue for moderation
-        try {
-          await env.MODERATION_QUEUE.send({
-            sha256,
-            uploadedBy: event.pubkey,
-            uploadedAt: event.created_at * 1000, // Convert to milliseconds
-            metadata: {
-              source: 'relay-poller',
-              relay: relayUrl,
-              eventId: event.id,
-              videoUrl
-            }
-          });
-
-          results.queuedForModeration++;
-          results.events.push({
-            sha256: sha256.substring(0, 16) + '...',
-            eventId: event.id?.substring(0, 16) + '...',
-            pubkey: event.pubkey?.substring(0, 16) + '...'
-          });
-
-          console.log(`[RELAY-POLLER] Queued ${sha256.substring(0, 16)}... for moderation`);
-        } catch (queueError) {
-          results.errors.push({
-            sha256: sha256.substring(0, 16) + '...',
-            error: queueError.message
-          });
-          console.error(`[RELAY-POLLER] Failed to queue ${sha256.substring(0, 16)}...:`, queueError);
-        }
+        // Reactive moderation: do NOT queue new uploads from the relay.
+        // Pre-screening is disabled; moderation runs only when a user reports content.
+        // Still record the observation so the cron's poll log stays informative.
+        results.events.push({
+          sha256: sha256.substring(0, 16) + '...',
+          eventId: event.id?.substring(0, 16) + '...',
+          pubkey: event.pubkey?.substring(0, 16) + '...',
+          status: 'reactive_skip'
+        });
       }
     } catch (error) {
       console.error(`[RELAY-POLLER] Failed to poll ${relayUrl}:`, error);
