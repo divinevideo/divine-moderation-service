@@ -32,6 +32,7 @@ import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
 import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
+import { cachedStat } from './admin/cache.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -1570,94 +1571,54 @@ export default {
       console.log(`[${requestId}] Fetching stats`);
 
       try {
-        // All stats from D1 - fast SQL queries instead of KV iteration
-        const [totalResult, moderationStats, pendingStats] = await Promise.all([
-          // Total videos (excluding deleted/error)
-          env.BLOSSOM_DB.prepare(`
-            SELECT COUNT(DISTINCT sha256) as total
-            FROM bunny_webhook_events
-            WHERE sha256 IS NOT NULL
-              AND status_name NOT IN ('error', 'deleted')
-          `).first(),
-          // Moderation breakdown by action (all, for "Total Moderated" and "Safe" cards)
-          env.BLOSSOM_DB.prepare(`
-            SELECT
-              action,
-              COUNT(*) as count
-            FROM moderation_results
-            GROUP BY action
-          `).all(),
-          // Pending review breakdown (unreviewed, for "AI Flagged" and queue counts)
-          env.BLOSSOM_DB.prepare(`
-            SELECT
-              action,
-              COUNT(*) as count
-            FROM moderation_results
-            WHERE reviewed_by IS NULL
-            GROUP BY action
-          `).all()
-        ]);
+        const fresh = url.searchParams.get('fresh') === '1';
+        const stats = await cachedStat(env, ctx, 'admin-stats', 60, async () => {
+          // All stats from D1 - fast SQL queries instead of KV iteration
+          const [totalResult, moderationStats, pendingStats] = await Promise.all([
+            env.BLOSSOM_DB.prepare(`
+              SELECT COUNT(DISTINCT sha256) as total
+              FROM bunny_webhook_events
+              WHERE sha256 IS NOT NULL
+                AND status_name NOT IN ('error', 'deleted')
+            `).first(),
+            env.BLOSSOM_DB.prepare(`
+              SELECT action, COUNT(*) as count FROM moderation_results GROUP BY action
+            `).all(),
+            env.BLOSSOM_DB.prepare(`
+              SELECT action, COUNT(*) as count FROM moderation_results
+              WHERE reviewed_by IS NULL GROUP BY action
+            `).all(),
+          ]);
 
-        const totalInD1 = totalResult?.total || 0;
-
-        // Parse total moderation stats
-        let totalModerated = 0;
-        let safeCount = 0;
-        let reviewCount = 0;
-        let ageRestrictedCount = 0;
-        let permanentBanCount = 0;
-
-        for (const row of (moderationStats?.results || [])) {
-          const count = row.count || 0;
-          totalModerated += count;
-          switch (row.action) {
-            case 'SAFE': safeCount = count; break;
-            case 'REVIEW': reviewCount = count; break;
-            case 'AGE_RESTRICTED': ageRestrictedCount = count; break;
-            case 'PERMANENT_BAN': permanentBanCount = count; break;
+          const totalInD1 = totalResult?.total || 0;
+          const breakdown = { safe: 0, review: 0, ageRestricted: 0, permanentBan: 0 };
+          let totalModerated = 0;
+          for (const row of (moderationStats?.results || [])) {
+            const count = row.count || 0;
+            totalModerated += count;
+            if (row.action === 'SAFE') breakdown.safe = count;
+            else if (row.action === 'REVIEW') breakdown.review = count;
+            else if (row.action === 'AGE_RESTRICTED') breakdown.ageRestricted = count;
+            else if (row.action === 'PERMANENT_BAN') breakdown.permanentBan = count;
           }
-        }
 
-        // Parse pending review stats (items not yet reviewed by a human)
-        let pendingReviewCount = 0;
-        let pendingQuarantineCount = 0;
-        let pendingAgeRestrictedCount = 0;
-        let pendingPermanentBanCount = 0;
-
-        for (const row of (pendingStats?.results || [])) {
-          const count = row.count || 0;
-          switch (row.action) {
-            case 'REVIEW': pendingReviewCount = count; break;
-            case 'QUARANTINE': pendingQuarantineCount = count; break;
-            case 'AGE_RESTRICTED': pendingAgeRestrictedCount = count; break;
-            case 'PERMANENT_BAN': pendingPermanentBanCount = count; break;
+          const pending = { review: 0, quarantine: 0, ageRestricted: 0, permanentBan: 0 };
+          for (const row of (pendingStats?.results || [])) {
+            const count = row.count || 0;
+            if (row.action === 'REVIEW') pending.review = count;
+            else if (row.action === 'QUARANTINE') pending.quarantine = count;
+            else if (row.action === 'AGE_RESTRICTED') pending.ageRestricted = count;
+            else if (row.action === 'PERMANENT_BAN') pending.permanentBan = count;
           }
-        }
 
-        const pendingFlagged = pendingReviewCount + pendingQuarantineCount + pendingAgeRestrictedCount + pendingPermanentBanCount;
-        const untriaged = Math.max(0, totalInD1 - totalModerated);
+          const pendingFlagged = pending.review + pending.quarantine + pending.ageRestricted + pending.permanentBan;
+          const untriaged = Math.max(0, totalInD1 - totalModerated);
 
-        console.log(`[${requestId}] Stats: total=${totalInD1}, moderated=${totalModerated}, untriaged=${untriaged}, pendingFlagged=${pendingFlagged} in ${Date.now() - startTime}ms`);
-        return new Response(JSON.stringify({
-          totalInD1,
-          totalModerated,
-          untriaged,
-          pendingFlagged,
-          breakdown: {
-            safe: safeCount,
-            review: reviewCount,
-            ageRestricted: ageRestrictedCount,
-            permanentBan: permanentBanCount
-          },
-          pending: {
-            review: pendingReviewCount,
-            quarantine: pendingQuarantineCount,
-            ageRestricted: pendingAgeRestrictedCount,
-            permanentBan: pendingPermanentBanCount
-          }
-        }), {
-          headers: JSON_HEADERS
-        });
+          return { totalInD1, totalModerated, untriaged, pendingFlagged, breakdown, pending };
+        }, { fresh });
+
+        console.log(`[${requestId}] Stats: total=${stats.totalInD1}, moderated=${stats.totalModerated}, untriaged=${stats.untriaged}, pendingFlagged=${stats.pendingFlagged} in ${Date.now() - startTime}ms${fresh ? ' (fresh)' : ''}`);
+        return new Response(JSON.stringify(stats), { headers: JSON_HEADERS });
       } catch (error) {
         console.error(`[${requestId}] Failed to get stats:`, error);
         return new Response(JSON.stringify({ error: error.message }), {
@@ -1677,12 +1638,16 @@ export default {
 
       try {
         const estimatedCostCents = Number(env.HIVE_AI_DETECTION_ESTIMATED_COST_CENTS);
-        const stats = await getAIDetectionStats(env.BLOSSOM_DB, {
-          window: url.searchParams.get('window') || '24h',
-          estimatedCostCents: Number.isFinite(estimatedCostCents) && estimatedCostCents > 0
-            ? estimatedCostCents
-            : null,
-        });
+        const windowValue = url.searchParams.get('window') || '24h';
+        const fresh = url.searchParams.get('fresh') === '1';
+        const stats = await cachedStat(env, ctx, `ai-detection-stats:${windowValue}`, 60, () =>
+          getAIDetectionStats(env.BLOSSOM_DB, {
+            window: windowValue,
+            estimatedCostCents: Number.isFinite(estimatedCostCents) && estimatedCostCents > 0
+              ? estimatedCostCents
+              : null,
+          }),
+          { fresh });
         return new Response(JSON.stringify(stats), {
           headers: JSON_HEADERS
         });
