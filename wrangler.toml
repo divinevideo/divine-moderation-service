@@ -26,6 +26,7 @@ id = "10af689fc82140ed9159eef3c1c47079"
 binding = "BLOSSOM_DB"
 database_name = "blossom-webhook-events"
 database_id = "829f06cf-294b-4491-8611-30fc53df2589"
+migrations_dir = "migrations"
 
 # Queue producer configuration (for testing)
 [[queues.producers]]
