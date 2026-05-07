@@ -10,6 +10,17 @@ export default defineWorkersConfig({
   test: {
     testTimeout: 30000,
     hookTimeout: 30000,
+    // Scope test discovery to the canonical source/script locations.
+    // Without this, vitest also walks .worktrees/ and .claude/worktrees/
+    // and runs duplicate copies of every test (which can pull in code
+    // referencing schemas/columns that don't exist on the current branch).
+    include: ['src/**/*.test.mjs', 'scripts/**/*.test.mjs'],
+    exclude: [
+      '**/node_modules/**',
+      '**/.worktrees/**',
+      '**/.claude/worktrees/**',
+      '**/.deploy-worktrees/**',
+    ],
     poolOptions: {
       workers: {
         singleWorker: true,

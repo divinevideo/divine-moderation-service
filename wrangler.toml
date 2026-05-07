@@ -26,6 +26,7 @@ id = "10af689fc82140ed9159eef3c1c47079"
 binding = "BLOSSOM_DB"
 database_name = "blossom-webhook-events"
 database_id = "829f06cf-294b-4491-8611-30fc53df2589"
+migrations_dir = "migrations"
 
 # Queue producer configuration (for testing)
 [[queues.producers]]
@@ -123,6 +124,12 @@ RELAY_POLLING_LIMIT = "100"                       # Max events to fetch per poll
 # so the corresponding pubkey must be in funnelcake's ADMIN_PUBKEYS.
 FUNNELCAKE_ADMIN_URL = "https://relay.divine.video"
 
+# Legacy moderation_results lookup-column backfill (perf/dashboard-speedup).
+# Off by default; flip to "true" via `wrangler secret put` after the manual
+# trigger /admin/api/backfill/run has been verified on a small batch.
+BACKFILL_ENABLED = "false"
+BACKFILL_ROWS_PER_TICK = "200"
+
 # Creator-delete pipeline feature flag (default off; flip to "true" via `wrangler secret put` or [vars] once ready)
 CREATOR_DELETE_PIPELINE_ENABLED = "false"
 # Relay used to fetch creator kind 5 delete events and target video events.
@@ -145,7 +152,9 @@ crons = ["* * * * *", "*/5 * * * *"]
 # SIGHTENGINE_API_SECRET - (optional, for fallback)
 # HIVE_* secrets are intentionally unused by upload moderation and classification entry points.
 # Do not set them for production unless re-enabling an explicit, reviewed Hive integration.
-# RELAY_ADMIN_URL - Funnelcake admin API endpoint for cache purge / event deletion
+# RELAY_ADMIN_URL - relay-admin API host. Default in src/index.mjs is api-relay-prod.divine.video
+# (divine-relay-admin-api-prod worker, has NOSTR_NSEC binding). Override to
+# api-relay-staging.divine.video or relay.admin.divine.video only when needed.
 # REALITY_DEFENDER_API_KEY - Reality Defender API key for secondary AI verification (api.prd.realitydefender.xyz)
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
 # ATPROTO_LABELER_WEBHOOK_URL - URL of the divine-labeler webhook endpoint (https://labels.divine.video/webhook/moderation-result)

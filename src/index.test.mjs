@@ -277,6 +277,93 @@ describe('HTTP hostname routing', () => {
     });
   });
 
+  it('queues a Hive moderation recheck when a non-AI report is submitted', async () => {
+    const queued = [];
+    const reporterPubkey = 'b'.repeat(64);
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_QUEUE: {
+        async send(message) {
+          queued.push(message);
+        }
+      }
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: reporterPubkey,
+          report_type: 'nudity',
+          reason: 'explicit content'
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      sha256: SHA256,
+      r2Key: `videos/${SHA256}.mp4`,
+      metadata: {
+        source: 'user-report',
+        forceProvider: 'hiveai',
+        reportType: 'nudity',
+        reportedBy: reporterPubkey
+      }
+    });
+  });
+
+  it('skips queuing a Hive recheck when one already ran within the rate-limit window', async () => {
+    const queued = [];
+    const recentIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'REVIEW',
+          provider: 'hiveai',
+          scores: JSON.stringify({}),
+          categories: JSON.stringify([]),
+          moderated_at: recentIso,
+          reviewed_by: null,
+          reviewed_at: null,
+        }]])
+      }),
+      MODERATION_QUEUE: {
+        async send(message) {
+          queued.push(message);
+        }
+      }
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: 'c'.repeat(64),
+          report_type: 'violence',
+          reason: 'graphic'
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(queued).toHaveLength(0);
+  });
+
   it('requires admin auth for AI detection stats', async () => {
     const response = await worker.fetch(
       new Request('https://moderation.admin.divine.video/admin/api/ai-detection/stats'),
@@ -653,7 +740,16 @@ describe('Admin video lookup', () => {
     }
   });
 
-  it('returns mirrored relay context fields in the admin video list payload', async () => {
+  it('returns stored relay context fields in the admin video list without per-row fan-out', async () => {
+    // Contract change (perf/dashboard-speedup):
+    //   /admin/api/videos used to fire one funnelcake REST call per row
+    //   to fill eventId/title/author/etc on every page render. The
+    //   columns were stored in moderation_results all along — we just
+    //   weren't selecting them. Now the handler reads those columns
+    //   directly and never calls funnelcake on the list endpoint.
+    //   Detail view (/admin/api/video/:id) keeps the on-demand
+    //   funnelcake fetch so client/content fields still render when a
+    //   moderator opens a card.
     const originalFetch = globalThis.fetch;
     const originalWebSocket = globalThis.WebSocket;
     const restCalls = [];
@@ -666,35 +762,12 @@ describe('Admin video lookup', () => {
 
     globalThis.fetch = async (url) => {
       restCalls.push(String(url));
-      if (String(url) === `https://relay.divine.video/api/videos/${SHA256}`) {
-        return new Response(JSON.stringify({
-          event: {
-            id: 'd'.repeat(64),
-            pubkey: 'b'.repeat(64),
-            created_at: 1700000000,
-            kind: 34236,
-            tags: [
-              ['d', SHA256],
-              ['title', 'REST title'],
-              ['published_at', '1389756506'],
-              ['imeta', 'url https://media.divine.video/rest-content.mp4', `x ${SHA256}`]
-            ],
-            content: 'REST description',
-            sig: 'e'.repeat(128)
-          },
-          stats: {
-            author_name: 'REST author'
-          }
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
       throw new Error(`Unexpected fetch: ${url}`);
     };
 
     try {
+      // Row with metadata columns populated — dashboard reads these
+      // directly, no funnelcake fetch needed.
       const moderationRow = {
         sha256: SHA256,
         action: 'REVIEW',
@@ -704,7 +777,12 @@ describe('Admin video lookup', () => {
         moderated_at: '2026-03-07T00:00:00.000Z',
         reviewed_by: null,
         reviewed_at: null,
-        uploaded_by: null
+        uploaded_by: 'b'.repeat(64),
+        event_id: 'd'.repeat(64),
+        title: 'REST title',
+        author: 'REST author',
+        content_url: 'https://media.divine.video/rest-content.mp4',
+        published_at: '1389756506'
       };
 
       const response = await worker.fetch(
@@ -725,18 +803,23 @@ describe('Admin video lookup', () => {
           sha256: SHA256,
           uploaded_by: 'b'.repeat(64),
           eventId: 'd'.repeat(64),
-          divineUrl: `https://divine.video/video/${SHA256}`,
+          divineUrl: `https://divine.video/video/${'d'.repeat(64)}`,
           nostrContext: {
             title: 'REST title',
             author: 'REST author',
             url: 'https://media.divine.video/rest-content.mp4',
             publishedAt: 1389756506,
-            content: 'REST description',
+            // client/content are not stored. List view leaves them null;
+            // detail view fills them via on-demand funnelcake.
+            client: null,
+            content: null,
             eventId: 'd'.repeat(64)
           }
         }]
       });
-      expect(restCalls).toEqual([`https://relay.divine.video/api/videos/${SHA256}`]);
+      // Regression gate: if anyone reintroduces the per-row fan-out,
+      // restCalls will not be empty.
+      expect(restCalls).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;
@@ -1860,6 +1943,74 @@ describe('notifyBlossom integration via admin moderate endpoint', () => {
     } finally {
       globalThis.fetch = origFetch;
       globalThis.WebSocket = OrigWebSocket;
+    }
+  });
+
+  it('warns and surfaces a CF-Access-specific error when relay-admin returns a CF Access 302', async () => {
+    const sha256 = 'e'.repeat(64);
+    const eventId = 'f'.repeat(64);
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      RELAY_ADMIN_URL: 'https://relay-admin.test',
+      // CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET intentionally absent
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+    };
+
+    const origFetch = globalThis.fetch;
+    const OrigWebSocket = globalThis.WebSocket;
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(' ')); };
+    globalThis.fetch = async (url) => {
+      if (typeof url === 'string' && url.startsWith('https://relay-admin.test')) {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://divinevideo.cloudflareaccess.com/cdn-cgi/access/login/relay.admin.divine.video?...'
+          }
+        });
+      }
+      // Disable Nostr relay lookups
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+    globalThis.WebSocket = class {
+      constructor() {}
+      addEventListener(event, handler) {
+        if (event === 'close') queueMicrotask(handler);
+      }
+      close() {}
+      send() {}
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/event/${eventId}/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // Omit sha256 to force the direct deleteRelayEventIds([eventId]) path
+          // (no Nostr lookup short-circuit). This exercises callRelayAdminAction.
+          body: JSON.stringify({ reason: 'test' })
+        }),
+        env
+      );
+
+      expect(response.status).toBe(502);
+      const body = await response.json();
+      const errStr = String(body.error || '') + ' ' + JSON.stringify(body.relayResult || {});
+      expect(errStr).toMatch(/cloudflare access|cloudflareaccess|service token|CF_ACCESS/i);
+      // Defensive warning fires whenever secrets are missing at request time
+      expect(warnings.some(w => /CF_ACCESS_CLIENT_ID|service token|relay\.admin/i.test(w))).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+      globalThis.WebSocket = OrigWebSocket;
+      console.warn = origWarn;
     }
   });
 

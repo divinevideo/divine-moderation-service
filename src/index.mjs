@@ -6,6 +6,7 @@
 
 import { validateQueueMessage } from './schemas/queue-message.mjs';
 import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
+import { applyForceProvider, shouldQueueHiveRecheck } from './moderation/report-trigger.mjs';
 import { publishToFaro, publishToContentRelay, publishLabelEvent } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
@@ -31,6 +32,10 @@ import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
 import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
 import { notifyRelay } from './relay-notifier.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
+import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
+import { cachedStat } from './admin/cache.mjs';
+import { latestBunnyEventBySha, latestBunnyEventForSha, countLatestBunnyEvents } from './admin/bunny-events.mjs';
+import { runBackfill } from './admin/backfill-lookup-columns.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -65,7 +70,13 @@ const CATEGORY_TO_LABEL = {
 
 const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
 const API_HOSTNAME = 'moderation-api.divine.video';
-const DEFAULT_RELAY_ADMIN_URL = 'https://relay.admin.divine.video';
+// api-relay-prod.divine.video targets divine-relay-admin-api-prod which has the
+// NOSTR_NSEC Secrets Store binding required by handleModerate -> getSecretKey.
+// relay.admin.divine.video routes to a stale divine-relay-admin-api deployment
+// that lacks the binding and crashes with "Cannot read properties of undefined
+// (reading 'get')" / Cloudflare Error 1101 on every moderate call. Override
+// via env.RELAY_ADMIN_URL if needed for staging or rollback.
+const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const VALID_MODERATION_ACTIONS = new Set(['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN']);
 
@@ -720,11 +731,31 @@ async function processPendingTranscriptReprocess(env) {
 }
 
 async function callRelayAdminAction(env, payload) {
+  const hasCfAccessSecrets = !!(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET);
+  if (!hasCfAccessSecrets) {
+    console.warn('[RELAY-ADMIN] CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET not configured on this worker — calls to relay.admin.divine.video will be blocked by Cloudflare Access. See project memory cf_access_relay_admin_secrets.md.');
+  }
+
   const response = await fetch(`${getRelayAdminUrl(env)}/api/moderate`, {
     method: 'POST',
     headers: getRelayAdminHeaders(env),
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    redirect: 'manual'
   });
+
+  // Detect Cloudflare Access bouncing the request to the login page.
+  // *.admin.divine.video is behind CF Access; without a valid service token,
+  // any call returns a 302 to <team>.cloudflareaccess.com. Surface a self-
+  // documenting error instead of a generic "HTTP 302".
+  if (response.status === 302) {
+    const location = response.headers.get('location') || '';
+    if (/cloudflareaccess\.com/i.test(location)) {
+      const hint = hasCfAccessSecrets
+        ? 'service token may be invalid, expired, or not authorized for this Access application'
+        : 'CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET secrets are not set on this worker';
+      throw new Error(`Relay admin call blocked by Cloudflare Access (${hint}). See project memory cf_access_relay_admin_secrets.md.`);
+    }
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data?.success === false) {
@@ -990,7 +1021,7 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
   const cdnUrl = `https://${env.CDN_DOMAIN || 'media.divine.video'}/${hash}`;
   if (hash) {
     const moderatedRow = await env.BLOSSOM_DB.prepare(`
-      SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, review_notes, uploaded_by, raw_response, videoseal
+      SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}, review_notes, raw_response, videoseal
       FROM moderation_results
       WHERE sha256 = ?
     `).bind(hash).first();
@@ -1028,15 +1059,7 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
       }, env);
     }
 
-    const untriagedRow = await env.BLOSSOM_DB.prepare(`
-      SELECT sha256, video_guid, hls_url, mp4_url, thumbnail_url, received_at, status_name
-      FROM bunny_webhook_events e1
-      WHERE e1.sha256 = ?
-        AND received_at = (
-          SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-        )
-      LIMIT 1
-    `).bind(hash).first();
+    const untriagedRow = await latestBunnyEventForSha(env, hash);
 
     if (untriagedRow && !['error', 'deleted'].includes(untriagedRow.status_name)) {
       let nostrContext = null;
@@ -1141,15 +1164,7 @@ async function getStoredAdminPlaybackCandidates(sha256, env) {
       FROM moderation_results
       WHERE sha256 = ?
     `).bind(sha256).first(),
-    env.BLOSSOM_DB.prepare(`
-      SELECT mp4_url, hls_url
-      FROM bunny_webhook_events e1
-      WHERE e1.sha256 = ?
-        AND received_at = (
-          SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-        )
-      LIMIT 1
-    `).bind(sha256).first(),
+    latestBunnyEventForSha(env, sha256),
     env.MODERATION_KV.get(`moderation:${sha256}`)
   ]);
 
@@ -1506,9 +1521,11 @@ export default {
       const sortParam = url.searchParams.get('sort');
       const orderDirection = sortParam === 'oldest' ? 'ASC' : 'DESC';
 
-      // Query D1 with pagination
+      // Query D1 with pagination. The wide SELECT pulls every column the
+      // dashboard needs so we can render directly from the row — no
+      // per-card funnelcake fetch.
       const query = `
-        SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, uploaded_by
+        SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}
         FROM moderation_results
         ${whereClause}
         ORDER BY moderated_at ${orderDirection}
@@ -1518,44 +1535,32 @@ export default {
 
       const result = await env.BLOSSOM_DB.prepare(query).bind(...params).all();
       const rows = result.results || [];
-
-      // Check if there are more results
       const hasMore = rows.length > limit;
-      const videoRows = rows.slice(0, limit).map(row => ({
-        sha256: row.sha256,
-        action: row.action,
-        provider: row.provider,
-        scores: row.scores ? JSON.parse(row.scores) : {},
-        categories: row.categories ? JSON.parse(row.categories) : [],
-        processedAt: new Date(row.moderated_at).getTime(),
-        moderated_at: row.moderated_at,
-        reviewed_by: row.reviewed_by,
-        reviewed_at: row.reviewed_at,
-        uploaded_by: row.uploaded_by || null
+      const pageRows = rows.slice(0, limit);
+
+      const videos = pageRows.map((row) => buildAdminVideoFromRow(row, {
+        cdnDomain: env.CDN_DOMAIN || 'media.divine.video',
       }));
 
-      // Reuse the existing relay-aware per-item lookup so dashboard cards can render
-      // publisher/post metadata immediately instead of starting from an "unknown" state.
-      const videos = await Promise.all(videoRows.map(async (video) => {
-        try {
-          const enriched = await getAdminLookupVideo(video.sha256, env);
-          if (!enriched) {
-            return video;
+      // Batch uploader_enforcement lookups: one query for every unique
+      // uploader on this page, instead of one per row.
+      const uploaderPubkeys = [...new Set(videos.map((v) => v.uploaded_by).filter(Boolean))];
+      if (uploaderPubkeys.length > 0) {
+        const placeholders = uploaderPubkeys.map(() => '?').join(',');
+        const enf = await env.BLOSSOM_DB.prepare(
+          `SELECT pubkey, approval_required, relay_banned FROM uploader_enforcement WHERE pubkey IN (${placeholders})`,
+        ).bind(...uploaderPubkeys).all();
+        const byPubkey = new Map((enf.results || []).map((r) => [r.pubkey, r]));
+        for (const v of videos) {
+          if (v.uploaded_by) {
+            v.uploaderEnforcement = byPubkey.get(v.uploaded_by) || {
+              pubkey: v.uploaded_by,
+              approval_required: 0,
+              relay_banned: 0,
+            };
           }
-
-          return {
-            ...video,
-            uploaded_by: enriched.uploaded_by || video.uploaded_by || null,
-            eventId: enriched.eventId || null,
-            divineUrl: enriched.divineUrl || null,
-            lookupId: enriched.lookupId || null,
-            nostrContext: enriched.nostrContext || null
-          };
-        } catch (error) {
-          console.error(`[${requestId}] Failed to enrich dashboard row ${video.sha256}:`, error.message);
-          return video;
         }
-      }));
+      }
 
       console.log(`[${requestId}] Returning ${videos.length} videos in ${Date.now() - startTime}ms`);
       return new Response(JSON.stringify({
@@ -1579,94 +1584,54 @@ export default {
       console.log(`[${requestId}] Fetching stats`);
 
       try {
-        // All stats from D1 - fast SQL queries instead of KV iteration
-        const [totalResult, moderationStats, pendingStats] = await Promise.all([
-          // Total videos (excluding deleted/error)
-          env.BLOSSOM_DB.prepare(`
-            SELECT COUNT(DISTINCT sha256) as total
-            FROM bunny_webhook_events
-            WHERE sha256 IS NOT NULL
-              AND status_name NOT IN ('error', 'deleted')
-          `).first(),
-          // Moderation breakdown by action (all, for "Total Moderated" and "Safe" cards)
-          env.BLOSSOM_DB.prepare(`
-            SELECT
-              action,
-              COUNT(*) as count
-            FROM moderation_results
-            GROUP BY action
-          `).all(),
-          // Pending review breakdown (unreviewed, for "AI Flagged" and queue counts)
-          env.BLOSSOM_DB.prepare(`
-            SELECT
-              action,
-              COUNT(*) as count
-            FROM moderation_results
-            WHERE reviewed_by IS NULL
-            GROUP BY action
-          `).all()
-        ]);
+        const fresh = url.searchParams.get('fresh') === '1';
+        const stats = await cachedStat(env, ctx, 'admin-stats', 60, async () => {
+          // All stats from D1 - fast SQL queries instead of KV iteration
+          const [totalResult, moderationStats, pendingStats] = await Promise.all([
+            env.BLOSSOM_DB.prepare(`
+              SELECT COUNT(DISTINCT sha256) as total
+              FROM bunny_webhook_events
+              WHERE sha256 IS NOT NULL
+                AND status_name NOT IN ('error', 'deleted')
+            `).first(),
+            env.BLOSSOM_DB.prepare(`
+              SELECT action, COUNT(*) as count FROM moderation_results GROUP BY action
+            `).all(),
+            env.BLOSSOM_DB.prepare(`
+              SELECT action, COUNT(*) as count FROM moderation_results
+              WHERE reviewed_by IS NULL GROUP BY action
+            `).all(),
+          ]);
 
-        const totalInD1 = totalResult?.total || 0;
-
-        // Parse total moderation stats
-        let totalModerated = 0;
-        let safeCount = 0;
-        let reviewCount = 0;
-        let ageRestrictedCount = 0;
-        let permanentBanCount = 0;
-
-        for (const row of (moderationStats?.results || [])) {
-          const count = row.count || 0;
-          totalModerated += count;
-          switch (row.action) {
-            case 'SAFE': safeCount = count; break;
-            case 'REVIEW': reviewCount = count; break;
-            case 'AGE_RESTRICTED': ageRestrictedCount = count; break;
-            case 'PERMANENT_BAN': permanentBanCount = count; break;
+          const totalInD1 = totalResult?.total || 0;
+          const breakdown = { safe: 0, review: 0, ageRestricted: 0, permanentBan: 0 };
+          let totalModerated = 0;
+          for (const row of (moderationStats?.results || [])) {
+            const count = row.count || 0;
+            totalModerated += count;
+            if (row.action === 'SAFE') breakdown.safe = count;
+            else if (row.action === 'REVIEW') breakdown.review = count;
+            else if (row.action === 'AGE_RESTRICTED') breakdown.ageRestricted = count;
+            else if (row.action === 'PERMANENT_BAN') breakdown.permanentBan = count;
           }
-        }
 
-        // Parse pending review stats (items not yet reviewed by a human)
-        let pendingReviewCount = 0;
-        let pendingQuarantineCount = 0;
-        let pendingAgeRestrictedCount = 0;
-        let pendingPermanentBanCount = 0;
-
-        for (const row of (pendingStats?.results || [])) {
-          const count = row.count || 0;
-          switch (row.action) {
-            case 'REVIEW': pendingReviewCount = count; break;
-            case 'QUARANTINE': pendingQuarantineCount = count; break;
-            case 'AGE_RESTRICTED': pendingAgeRestrictedCount = count; break;
-            case 'PERMANENT_BAN': pendingPermanentBanCount = count; break;
+          const pending = { review: 0, quarantine: 0, ageRestricted: 0, permanentBan: 0 };
+          for (const row of (pendingStats?.results || [])) {
+            const count = row.count || 0;
+            if (row.action === 'REVIEW') pending.review = count;
+            else if (row.action === 'QUARANTINE') pending.quarantine = count;
+            else if (row.action === 'AGE_RESTRICTED') pending.ageRestricted = count;
+            else if (row.action === 'PERMANENT_BAN') pending.permanentBan = count;
           }
-        }
 
-        const pendingFlagged = pendingReviewCount + pendingQuarantineCount + pendingAgeRestrictedCount + pendingPermanentBanCount;
-        const untriaged = Math.max(0, totalInD1 - totalModerated);
+          const pendingFlagged = pending.review + pending.quarantine + pending.ageRestricted + pending.permanentBan;
+          const untriaged = Math.max(0, totalInD1 - totalModerated);
 
-        console.log(`[${requestId}] Stats: total=${totalInD1}, moderated=${totalModerated}, untriaged=${untriaged}, pendingFlagged=${pendingFlagged} in ${Date.now() - startTime}ms`);
-        return new Response(JSON.stringify({
-          totalInD1,
-          totalModerated,
-          untriaged,
-          pendingFlagged,
-          breakdown: {
-            safe: safeCount,
-            review: reviewCount,
-            ageRestricted: ageRestrictedCount,
-            permanentBan: permanentBanCount
-          },
-          pending: {
-            review: pendingReviewCount,
-            quarantine: pendingQuarantineCount,
-            ageRestricted: pendingAgeRestrictedCount,
-            permanentBan: pendingPermanentBanCount
-          }
-        }), {
-          headers: JSON_HEADERS
-        });
+          return { totalInD1, totalModerated, untriaged, pendingFlagged, breakdown, pending };
+        }, { fresh });
+
+        console.log(`[${requestId}] Stats: total=${stats.totalInD1}, moderated=${stats.totalModerated}, untriaged=${stats.untriaged}, pendingFlagged=${stats.pendingFlagged} in ${Date.now() - startTime}ms${fresh ? ' (fresh)' : ''}`);
+        return new Response(JSON.stringify(stats), { headers: JSON_HEADERS });
       } catch (error) {
         console.error(`[${requestId}] Failed to get stats:`, error);
         return new Response(JSON.stringify({ error: error.message }), {
@@ -1686,12 +1651,16 @@ export default {
 
       try {
         const estimatedCostCents = Number(env.HIVE_AI_DETECTION_ESTIMATED_COST_CENTS);
-        const stats = await getAIDetectionStats(env.BLOSSOM_DB, {
-          window: url.searchParams.get('window') || '24h',
-          estimatedCostCents: Number.isFinite(estimatedCostCents) && estimatedCostCents > 0
-            ? estimatedCostCents
-            : null,
-        });
+        const windowValue = url.searchParams.get('window') || '24h';
+        const fresh = url.searchParams.get('fresh') === '1';
+        const stats = await cachedStat(env, ctx, `ai-detection-stats:${windowValue}`, 60, () =>
+          getAIDetectionStats(env.BLOSSOM_DB, {
+            window: windowValue,
+            estimatedCostCents: Number.isFinite(estimatedCostCents) && estimatedCostCents > 0
+              ? estimatedCostCents
+              : null,
+          }),
+          { fresh });
         return new Response(JSON.stringify(stats), {
           headers: JSON_HEADERS
         });
@@ -1700,6 +1669,31 @@ export default {
         return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: JSON_HEADERS
+        });
+      }
+    }
+
+    // Manual trigger for the legacy backfill cron. Useful when ops wants
+    // to dry-run before flipping BACKFILL_ENABLED, or to force-progress
+    // a stalled backfill. Honors BACKFILL_ENABLED.
+    if (url.pathname === '/admin/api/backfill/run' && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to /admin/api/backfill/run`);
+        return authError;
+      }
+      const count = Math.min(Number(url.searchParams.get('count') || '200'), 500);
+      try {
+        const result = await runBackfill(env, {
+          limit: count,
+          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256),
+        });
+        return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
+      } catch (error) {
+        console.error(`[${requestId}] Backfill manual run failed:`, error);
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: JSON_HEADERS,
         });
       }
     }
@@ -1717,34 +1711,23 @@ export default {
       console.log(`[${requestId}] Fetching untriaged videos: limit=${limit}, offset=${offset}`);
 
       try {
-        // Get recent finished videos from D1, excluding those with later deleted/error status
-        // Uses subquery to get only the LATEST status for each sha256
-        const result = await env.BLOSSOM_DB.prepare(`
-          SELECT sha256, video_guid, hls_url, mp4_url, thumbnail_url, received_at
-          FROM bunny_webhook_events e1
-          WHERE sha256 IS NOT NULL
-            AND received_at = (
-              SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-            )
-            AND status_name NOT IN ('error', 'deleted')
-          ORDER BY received_at DESC
-          LIMIT ? OFFSET ?
-        `).bind(limit, offset).all();
+        const rows = await latestBunnyEventBySha(env, { limit, offset });
 
-        // Check which ones are already moderated
-        const unmoderatedRows = [];
-        for (const row of result.results) {
-          const existingResult = await env.MODERATION_KV.get(`moderation:${row.sha256}`);
-          if (!existingResult) {
-            unmoderatedRows.push(row);
-          }
-        }
+        // Filter to rows that haven't been moderated yet. Old code did
+        // a sequential `for` loop with await — this is one parallel batch.
+        const moderationFlags = await Promise.all(
+          rows.map((row) => env.MODERATION_KV.get(`moderation:${row.sha256}`)),
+        );
+        const unmoderatedRows = rows.filter((_, i) => !moderationFlags[i]);
 
-        // Fetch Nostr context in parallel for all unmoderated videos
+        // Fetch Nostr context per unmoderated row, with a 1-hour KV cache
+        // so the next page render doesn't pay the WS roundtrip cost.
         const nostrPromises = unmoderatedRows.map(async (row) => {
+          const cacheKey = `nostr:event:${row.sha256}`;
           try {
-            const event = await fetchNostrEventBySha256(row.sha256, ['wss://relay.divine.video'], env);
-            if (event) {
+            const cached = await env.MODERATION_KV.get(cacheKey);
+            if (cached) {
+              const event = JSON.parse(cached);
               const metadata = parseVideoEventMetadata(event);
               return {
                 sha256: row.sha256,
@@ -1753,7 +1736,21 @@ export default {
                 author: metadata?.author || null,
                 client: metadata?.client || null,
                 content: metadata?.content || event.content || null,
-                pubkey: event.pubkey || null
+                pubkey: event.pubkey || null,
+              };
+            }
+            const event = await fetchNostrEventBySha256(row.sha256, ['wss://relay.divine.video'], env);
+            if (event) {
+              ctx.waitUntil(env.MODERATION_KV.put(cacheKey, JSON.stringify(event), { expirationTtl: 3600 }));
+              const metadata = parseVideoEventMetadata(event);
+              return {
+                sha256: row.sha256,
+                eventId: event.id,
+                title: metadata?.title || null,
+                author: metadata?.author || null,
+                client: metadata?.client || null,
+                content: metadata?.content || event.content || null,
+                pubkey: event.pubkey || null,
               };
             }
           } catch (e) {
@@ -1763,10 +1760,9 @@ export default {
         });
 
         const nostrResults = await Promise.all(nostrPromises);
-        const nostrMap = new Map(nostrResults.map(r => [r.sha256, r]));
+        const nostrMap = new Map(nostrResults.map((r) => [r.sha256, r]));
 
-        // Build videos with Nostr context
-        const videos = unmoderatedRows.map(row => {
+        const videos = unmoderatedRows.map((row) => {
           const nostr = nostrMap.get(row.sha256) || {};
           return {
             sha256: row.sha256,
@@ -1784,32 +1780,21 @@ export default {
               author: nostr.author,
               client: nostr.client,
               content: nostr.content,
-              pubkey: nostr.pubkey ? nostr.pubkey.substring(0, 16) + '...' : null
-            }
+              pubkey: nostr.pubkey ? `${nostr.pubkey.substring(0, 16)}...` : null,
+            },
           };
         });
 
-        // Get total count of untriaged (same logic - latest status not deleted/error)
-        const countResult = await env.BLOSSOM_DB.prepare(`
-          SELECT COUNT(*) as total FROM (
-            SELECT sha256
-            FROM bunny_webhook_events e1
-            WHERE sha256 IS NOT NULL
-              AND received_at = (
-                SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-              )
-              AND status_name NOT IN ('error', 'deleted')
-          )
-        `).first();
+        const total = await cachedStat(env, ctx, 'untriaged-total', 60, () => countLatestBunnyEvents(env));
 
         return new Response(JSON.stringify({
           videos,
-          total: countResult?.total || 0,
+          total,
           offset,
           limit,
-          hasMore: offset + limit < (countResult?.total || 0)
+          hasMore: offset + limit < total,
         }), {
-          headers: JSON_HEADERS
+          headers: JSON_HEADERS,
         });
       } catch (error) {
         console.error('[ADMIN] Failed to fetch untriaged videos:', error);
@@ -1932,11 +1917,14 @@ export default {
         : await deleteRelayEventIds([eventId], env, reason);
 
       if (!relayResult.success) {
+        const failureError = Array.isArray(relayResult.failures) && relayResult.failures[0]?.error
+          ? relayResult.failures[0].error
+          : null;
         return new Response(JSON.stringify({
           success: false,
           eventId,
           relayResult,
-          error: relayResult.error || relayResult.reason || 'Failed to delete relay event'
+          error: relayResult.error || failureError || relayResult.reason || 'Failed to delete relay event'
         }), {
           status: 502,
           headers: { 'Content-Type': 'application/json' }
@@ -3692,6 +3680,25 @@ async function runMigration() {
           } catch (eventErr) {
             console.error(`[API] Failed to record AI report event for ${sha256}:`, eventErr.message);
           }
+        } else if (env.MODERATION_QUEUE) {
+          const allowed = await shouldQueueHiveRecheck(env.BLOSSOM_DB, sha256);
+          if (allowed) {
+            await env.MODERATION_QUEUE.send({
+              sha256,
+              r2Key: `videos/${sha256}.mp4`,
+              uploadedAt: Date.now(),
+              metadata: {
+                source: 'user-report',
+                forceProvider: 'hiveai',
+                reportType: report_type,
+                reportedBy: reporter_pubkey,
+                ...(reason ? { reportReason: reason } : {})
+              }
+            });
+            console.log(`[API] Queued Hive recheck for reported content ${sha256} (report_type=${report_type})`);
+          } else {
+            console.log(`[API] Skipped Hive recheck for ${sha256} - rate-limited (recent hiveai run)`);
+          }
         }
 
         return new Response(JSON.stringify({ success: true, ...result }), {
@@ -3954,7 +3961,7 @@ async function runMigration() {
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
         const offset = parseInt(url.searchParams.get('offset') || '0', 10);
 
-        let query = 'SELECT sha256, action, provider, scores, moderated_at, reviewed_by, reviewed_at, uploaded_by FROM moderation_results';
+        let query = `SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')} FROM moderation_results`;
         const conditions = [];
         const bindings = [];
 
@@ -4378,15 +4385,19 @@ async function runMigration() {
         ).bind(sha256).first();
 
         const forceAIDetection = shouldForceAIDetection(metadata);
+        const forcedProviderEnv = applyForceProvider(env, metadata);
+        const providerOverridden = forcedProviderEnv !== env;
 
-        if (existingResult && !forceAIDetection) {
+        if (existingResult && !forceAIDetection && !providerOverridden) {
           console.log(`[MODERATION] ⚠️ SKIPPED ${sha256} - already moderated`);
           console.log(`[MODERATION] Previous result: action=${existingResult.action}, moderated_at=${existingResult.moderated_at}`);
           message.ack();
           continue;
         }
 
-        if (existingResult && forceAIDetection) {
+        if (existingResult && providerOverridden) {
+          console.log(`[MODERATION] Step 4: Provider override requested for already moderated ${sha256}; previous action=${existingResult.action}; new provider=${metadata?.forceProvider}`);
+        } else if (existingResult && forceAIDetection) {
           console.log(`[MODERATION] Step 4: Forced AI detection requested for already moderated ${sha256}; previous action=${existingResult.action}`);
         } else {
           console.log(`[MODERATION] Step 4: No existing result found, starting analysis for ${sha256}`);
@@ -4401,7 +4412,7 @@ async function runMigration() {
           metadata,
           videoSealPayload,
           videoSealBitAccuracy
-        }, env);
+        }, forcedProviderEnv);
 
         if (result.uploadedBy) {
           try {
@@ -4557,22 +4568,35 @@ async function runMigration() {
   async scheduled(event, env, ctx) {
     if (event.cron === '* * * * *') {
       // Every-minute: creator-delete pipeline (gated by feature flag)
-      if (env.CREATOR_DELETE_PIPELINE_ENABLED !== 'true') {
-        return;
+      if (env.CREATOR_DELETE_PIPELINE_ENABLED === 'true') {
+        const relayUrl = env.CREATOR_DELETE_RELAY_URL || 'wss://relay.divine.video';
+        try {
+          const result = await runCreatorDeleteCron({
+            db: env.BLOSSOM_DB,
+            kv: env.MODERATION_KV,
+            queryKind5Since: async (sinceSeconds) =>
+              fetchKind5EventsSince(sinceSeconds, relayUrl, env),
+            fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env),
+            callBlossomDelete: (sha256) => notifyBlossom(sha256, 'DELETE', env)
+          });
+          console.log(`[CREATOR-DELETE-CRON] Processed ${result.processed}, errors: ${result.errors.length}`);
+        } catch (e) {
+          console.error('[CREATOR-DELETE-CRON] failed:', e);
+        }
       }
-      const relayUrl = env.CREATOR_DELETE_RELAY_URL || 'wss://relay.divine.video';
+
+      // Every-minute: backfill legacy moderation_results lookup columns.
+      // Gated by BACKFILL_ENABLED. Helper short-circuits when disabled or
+      // when another run holds the KV mutex.
       try {
-        const result = await runCreatorDeleteCron({
-          db: env.BLOSSOM_DB,
-          kv: env.MODERATION_KV,
-          queryKind5Since: async (sinceSeconds) =>
-            fetchKind5EventsSince(sinceSeconds, relayUrl, env),
-          fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env),
-          callBlossomDelete: (sha256) => notifyBlossom(sha256, 'DELETE', env)
+        const result = await runBackfill(env, {
+          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256),
         });
-        console.log(`[CREATOR-DELETE-CRON] Processed ${result.processed}, errors: ${result.errors.length}`);
+        if (!result.skipped) {
+          console.log(`[BACKFILL] picked=${result.picked} updated=${result.updated} missing=${result.missing} errored=${result.errored}`);
+        }
       } catch (e) {
-        console.error('[CREATOR-DELETE-CRON] failed:', e);
+        console.error('[BACKFILL] failed:', e);
       }
       return;
     }
