@@ -35,6 +35,7 @@ import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-help
 import { cachedStat } from './admin/cache.mjs';
 import { latestBunnyEventBySha, latestBunnyEventForSha, countLatestBunnyEvents } from './admin/bunny-events.mjs';
 import { runBackfill } from './admin/backfill-lookup-columns.mjs';
+import { runRelayDecisionBackfill } from './admin/backfill-relay-decisions.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -886,7 +887,21 @@ async function enrichAdminLookupVideo(video, env) {
 
   let enriched = { ...video };
 
-  if (enriched.sha256 && (!enriched.eventId || !enriched.divineUrl || !enriched.nostrContext)) {
+  // After PR #136 widened the SELECT, eventId/divineUrl/nostrContext
+  // are populated directly from moderation_results — but
+  // buildStoredLookupMetadata hardcodes nostrContext.client/content
+  // to null because those fields aren't stored on the row. The
+  // single-video detail view (/admin/api/video/:id) needs them, so
+  // trigger funnelcake when the stored nostrContext lacks both. List
+  // endpoints don't go through this helper any more, so this fetch
+  // only fires per detail-view click — by design.
+  const ctx = enriched.nostrContext;
+  const needsFunnelcake = !enriched.eventId
+    || !enriched.divineUrl
+    || !ctx
+    || (ctx.client == null && ctx.content == null);
+
+  if (enriched.sha256 && needsFunnelcake) {
     const funnelcakeVideo = await fetchFunnelcakeLookupVideo(enriched.lookupId || enriched.eventId || enriched.sha256).catch((error) => {
       console.error(`[ADMIN] Failed to fetch relay context for ${enriched.sha256}:`, error.message);
       return null;
@@ -1670,6 +1685,37 @@ export default {
         return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
       } catch (error) {
         console.error(`[${requestId}] Backfill manual run failed:`, error);
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: JSON_HEADERS,
+        });
+      }
+    }
+
+    // Backfill relay moderation events from D1 decisions for historical rows.
+    // Useful while rebuilding relay state after ingest gaps.
+    if (url.pathname === '/admin/api/backfill/decisions' && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to /admin/api/backfill/decisions`);
+        return authError;
+      }
+
+      const count = Math.min(Number(url.searchParams.get('count') || '200'), 500);
+      const concurrency = Math.max(1, Math.min(Number(url.searchParams.get('concurrency') || '5'), 20));
+      const dryRun = ['1', 'true', 'yes'].includes(String(url.searchParams.get('dryRun') || '').toLowerCase());
+      const publishFaro = ['1', 'true', 'yes'].includes(String(url.searchParams.get('publishFaro') || '').toLowerCase());
+
+      try {
+        const result = await runRelayDecisionBackfill(env, {
+          limit: count,
+          concurrency,
+          dryRun,
+          publishFaro,
+        });
+        return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
+      } catch (error) {
+        console.error(`[${requestId}] Relay decision backfill manual run failed:`, error);
         return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: JSON_HEADERS,
@@ -3967,7 +4013,12 @@ async function runMigration() {
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
         const offset = parseInt(url.searchParams.get('offset') || '0', 10);
 
-        let query = `SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')} FROM moderation_results`;
+        // Public API contract — keep this column list pinned to what
+        // downstream services already consume. Do NOT widen with the
+        // admin columns: that would leak event_id/title/author/content_url/
+        // published_at to consumers (e.g. divine-relay-manager) who may
+        // reject unexpected fields or do strict-equality checks.
+        let query = 'SELECT sha256, action, provider, scores, moderated_at, reviewed_by, reviewed_at, uploaded_by FROM moderation_results';
         const conditions = [];
         const bindings = [];
 
@@ -4853,6 +4904,7 @@ async function handleModerationResult(result, env) {
   const downstreamContext = buildDownstreamPublishContext(result);
 
   console.log(`[MODERATION] handleModerationResult called for ${sha256} with action ${action}`);
+  let contentRelayPublished = false;
 
   // Publish Nostr notifications for flagged content
   if (downstreamContext.publishReport) {
@@ -4864,6 +4916,7 @@ async function handleModerationResult(result, env) {
       // Also publish to content relay so it can stop serving flagged events
       try {
         await publishToContentRelay(reportData, env);
+        contentRelayPublished = true;
         console.log(`[MODERATION] ${sha256} - Nostr ${reportData.type} event published to content relay`);
       } catch (relayError) {
         console.error(`[MODERATION] ${sha256} - Content relay publish failed:`, relayError);
@@ -4908,6 +4961,18 @@ async function handleModerationResult(result, env) {
   if (env.NOSTR_PRIVATE_KEY) {
     const { notifyReporters: notifyReportersOfOutcome } = await import('./nostr/dm-sender.mjs');
     notifyReportersOfOutcome(sha256, action, env, '[MODERATION]').catch(() => {});
+  }
+
+  if (contentRelayPublished) {
+    try {
+      await env.BLOSSOM_DB.prepare(`
+        UPDATE moderation_results
+        SET relay_published_action = ?, relay_published_at = ?
+        WHERE sha256 = ?
+      `).bind(action, new Date().toISOString(), sha256).run();
+    } catch (markerErr) {
+      console.warn(`[MODERATION] Failed to persist relay publish marker for ${sha256}:`, markerErr.message);
+    }
   }
 
   // Write normalized moderation labels to ClickHouse

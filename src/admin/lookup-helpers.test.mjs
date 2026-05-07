@@ -93,6 +93,35 @@ describe('buildAdminVideoFromRow', () => {
     expect(out.nostrContext.pubkey).toBe(`${row.uploaded_by.substring(0, 16)}...`);
   });
 
+  it('handles a row with event_id but no title/author (post-backfill 404 partial)', () => {
+    // Backfill records lookup_attempted_at on a 404; legacy rows that
+    // funnelcake doesn't know about end up with event_id still null
+    // but lookup_attempted_at set. Conversely, some rows may have
+    // event_id stored from a recent moderation but title/author null.
+    // Confirm the helper produces null nostrContext fields rather than
+    // pulling stale or undefined values from elsewhere.
+    const row = {
+      sha256: 'a'.repeat(64),
+      action: 'SAFE',
+      moderated_at: '2026-05-05T00:00:00Z',
+      uploaded_by: 'b'.repeat(64),
+      event_id: 'c'.repeat(64),
+      title: null,
+      author: null,
+      content_url: null,
+      published_at: null,
+    };
+    const out = buildAdminVideoFromRow(row, { cdnDomain: 'media.divine.video' });
+    expect(out.eventId).toBe(row.event_id);
+    expect(out.divineUrl).toBe(`https://divine.video/video/${row.event_id}`);
+    expect(out.nostrContext).not.toBeNull();
+    expect(out.nostrContext.title).toBeNull();
+    expect(out.nostrContext.author).toBeNull();
+    expect(out.nostrContext.url).toBeNull();
+    expect(out.nostrContext.publishedAt).toBeNull();
+    expect(out.nostrContext.eventId).toBe(row.event_id);
+  });
+
   it('handles JSON columns gracefully when malformed', () => {
     const row = {
       sha256: 'a'.repeat(64),

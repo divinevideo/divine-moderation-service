@@ -80,6 +80,27 @@ describe('latestBunnyEventBySha', () => {
     expect(rows.find((r) => r.sha256 === SHA_C)).toBeUndefined();
   });
 
+  it('excludes a sha that finished then was deleted (regression)', async () => {
+    // The old correlated subquery did MAX(received_at) over ALL rows,
+    // then required the latest row's status not be deleted. A naive CTE
+    // that filters status_name BEFORE ranking would resurrect this sha:
+    // dropping the deleted row makes the older 'finished' row the
+    // "latest". This test pins the correct semantic.
+    const SHA_D = 'd'.repeat(64);
+    await env.BLOSSOM_DB.prepare(
+      `INSERT INTO bunny_webhook_events (sha256, video_guid, hls_url, status_name, received_at) VALUES (?,?,?,?,?)`,
+    ).bind(SHA_D, 'g-d-1', 'D-finished', 'finished', 100).run();
+    await env.BLOSSOM_DB.prepare(
+      `INSERT INTO bunny_webhook_events (sha256, video_guid, hls_url, status_name, received_at) VALUES (?,?,?,?,?)`,
+    ).bind(SHA_D, 'g-d-2', 'D-deleted', 'deleted', 200).run();
+
+    const rows = await latestBunnyEventBySha(env);
+    expect(rows.find((r) => r.sha256 === SHA_D)).toBeUndefined();
+
+    // 2 valid shas (A, B); C and D must be excluded.
+    expect(await countLatestBunnyEvents(env)).toBe(2);
+  });
+
   it('honors LIMIT and OFFSET', async () => {
     const first = await latestBunnyEventBySha(env, { limit: 1, offset: 0 });
     const second = await latestBunnyEventBySha(env, { limit: 1, offset: 1 });

@@ -37,8 +37,14 @@ export async function runBackfill(env, options = {}) {
     return { skipped: 'disabled' };
   }
 
-  // Mutex: prevent the every-minute cron and a manual trigger from
-  // double-fetching the same shas.
+  // Best-effort mutex: prevents the every-minute cron and a manual
+  // trigger from double-fetching the same shas. Intentionally NOT
+  // strict — KV doesn't expose CAS, and read-then-write is racy under
+  // exactly-simultaneous calls. Two callers could both observe no
+  // lock and both proceed; the worst case is one duplicate batch of
+  // funnelcake calls (the UPDATE WHERE event_id IS NULL keeps the DB
+  // writes idempotent, so no data corruption). The 5-minute TTL
+  // doubles as a deadlock fuse if the worker dies mid-batch.
   const existingLock = await env.MODERATION_KV.get(LOCK_KEY);
   if (existingLock) {
     return { skipped: 'locked' };

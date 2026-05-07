@@ -2072,7 +2072,7 @@
 
     <div class="control-group">
       <label>&nbsp;</label>
-      <button onclick="loadVideos()">Refresh</button>
+      <button onclick="refreshDashboard()">Refresh</button>
     </div>
   </div>
 
@@ -2629,10 +2629,22 @@
       }
     }
 
-    // Load REAL stats from the stats API - actual totals, not page counts
-    async function loadRealStats() {
+    // Refresh button entry point: force-bypass the stats KV cache
+    // (60s TTL) and reload the video grid. loadVideos() drives the
+    // grid; loadRealStats(true) and loadAIDetectionStats(true) pass
+    // ?fresh=1 to skip the cache read while still writing back so
+    // concurrent Refresh clicks don't stampede.
+    function refreshDashboard() {
+      loadVideos();
+      loadRealStats(true);
+      loadAIDetectionStats(true);
+    }
+
+    // Load REAL stats from the stats API - actual totals, not page counts.
+    // forceFresh=true bypasses the 60s KV cache (Refresh button passes it).
+    async function loadRealStats(forceFresh = false) {
       try {
-        const response = await fetch('/admin/api/stats');
+        const response = await fetch('/admin/api/stats' + (forceFresh ? '?fresh=1' : ''));
         if (response.ok) {
           realStats = await response.json();
 
@@ -2698,10 +2710,12 @@
         + '</tbody></table>';
     }
 
-    async function loadAIDetectionStats() {
+    async function loadAIDetectionStats(forceFresh = false) {
       try {
         const windowValue = document.getElementById('ai-detection-window')?.value || '24h';
-        const response = await fetch('/admin/api/ai-detection/stats?window=' + encodeURIComponent(windowValue));
+        const params = new URLSearchParams({ window: windowValue });
+        if (forceFresh) params.set('fresh', '1');
+        const response = await fetch('/admin/api/ai-detection/stats?' + params.toString());
         if (!response.ok) throw new Error('HTTP ' + response.status);
         const stats = await response.json();
         const totals = stats.totals || {};
