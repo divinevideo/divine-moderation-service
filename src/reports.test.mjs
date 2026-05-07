@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType } from './reports.mjs';
+import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType, isNsfwReportType } from './reports.mjs';
 
 const SHA256 = ('a'.repeat(63) + '1').slice(0, 64);
 const REPORTER1 = ('b'.repeat(63) + '1').slice(0, 64);
@@ -46,6 +46,26 @@ describe('reports', () => {
     });
   });
 
+  describe('isNsfwReportType', () => {
+    it('matches nudity/porn/nsfw labels case-insensitively', () => {
+      expect(isNsfwReportType('nudity')).toBe(true);
+      expect(isNsfwReportType('PORN')).toBe(true);
+      expect(isNsfwReportType('nsfw')).toBe(true);
+      expect(isNsfwReportType('sexual_content')).toBe(true);
+      expect(isNsfwReportType('explicit')).toBe(true);
+      expect(isNsfwReportType('Adult Content')).toBe(true);
+    });
+
+    it('does not match non-NSFW report labels', () => {
+      expect(isNsfwReportType('violence')).toBe(false);
+      expect(isNsfwReportType('hate')).toBe(false);
+      expect(isNsfwReportType('spam')).toBe(false);
+      expect(isNsfwReportType('ai_generated')).toBe(false);
+      expect(isNsfwReportType(null)).toBe(false);
+      expect(isNsfwReportType(undefined)).toBe(false);
+    });
+  });
+
   describe('addReport', () => {
     it('should add a new report and not escalate', async () => {
       const result = await addReport(db, {
@@ -55,7 +75,7 @@ describe('reports', () => {
         reason: 'inappropriate content',
       });
 
-      expect(result).toEqual({ escalate: null });
+      expect(result).toMatchObject({ escalate: null, distinctReporterCount: 1 });
     });
 
     it('should deduplicate same reporter for same sha256', async () => {
@@ -106,7 +126,7 @@ describe('reports', () => {
         report_type: 'nudity',
       });
 
-      expect(result).toEqual({ escalate: 'REVIEW' });
+      expect(result).toMatchObject({ escalate: 'REVIEW', distinctReporterCount: 3 });
     });
 
     it('should escalate to AGE_RESTRICTED at 5 unique reporters', async () => {
@@ -121,7 +141,7 @@ describe('reports', () => {
         report_type: 'nudity',
       });
 
-      expect(result).toEqual({ escalate: 'AGE_RESTRICTED' });
+      expect(result).toMatchObject({ escalate: 'AGE_RESTRICTED', distinctReporterCount: 5 });
     });
   });
 

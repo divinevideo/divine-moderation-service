@@ -44,7 +44,8 @@ max_retries = 3
 [vars]
 MODERATION_ENABLED = "true"
 CDN_DOMAIN = "media.divine.video"  # CDN domain for video access
-PRIMARY_MODERATION_PROVIDER = "manual-review"  # New uploads stay playable and wait for team review
+PRIMARY_MODERATION_PROVIDER = "manual-review"  # legacy default; ignored when REACTIVE_MODERATION_ONLY=true
+REACTIVE_MODERATION_ONLY = "true"  # Reactive moderation: queue consumer ack-skips all messages; reports write D1 rows directly
 
 # Zero Trust JWT verification (for /api/v1/moderate endpoint)
 TEAM_DOMAIN = "https://divinevideo.cloudflareaccess.com"  # Cloudflare Access team domain

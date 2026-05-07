@@ -23,10 +23,13 @@ export async function initReportsTable(db) {
 }
 
 /**
- * Insert a report and return escalation level based on unique reporter count
+ * Insert a report and return both the legacy escalation level and the distinct
+ * reporter count so callers can apply per-report-type policy (e.g. NSFW needs
+ * 2 unique reporters before auto AGE_RESTRICTED to defend against single-token
+ * griefing).
  * @param {D1Database} db
  * @param {{sha256: string, reporter_pubkey: string, report_type: string, reason?: string}} report
- * @returns {Promise<{escalate: 'AGE_RESTRICTED'|'REVIEW'|null}>}
+ * @returns {Promise<{escalate: 'AGE_RESTRICTED'|'REVIEW'|null, distinctReporterCount: number}>}
  */
 export async function addReport(db, { sha256, reporter_pubkey, report_type, reason }) {
   await db.prepare(`
@@ -42,9 +45,11 @@ export async function addReport(db, { sha256, reporter_pubkey, report_type, reas
 
   const count = row?.cnt ?? 0;
 
-  if (count >= 5) return { escalate: 'AGE_RESTRICTED' };
-  if (count >= 3) return { escalate: 'REVIEW' };
-  return { escalate: null };
+  let escalate = null;
+  if (count >= 5) escalate = 'AGE_RESTRICTED';
+  else if (count >= 3) escalate = 'REVIEW';
+
+  return { escalate, distinctReporterCount: count };
 }
 
 const AI_REPORT_TYPES = new Set([
@@ -58,10 +63,31 @@ const AI_REPORT_TYPES = new Set([
   'deepfake',
 ]);
 
+const NSFW_REPORT_TYPES = new Set([
+  'nudity',
+  'porn',
+  'pornography',
+  'nsfw',
+  'sexual',
+  'sexual_content',
+  'sexual-content',
+  'explicit',
+  'adult',
+  'adult_content',
+  'adult-content',
+]);
+
+function normalizeReportType(reportType) {
+  if (typeof reportType !== 'string') return '';
+  return reportType.trim().toLowerCase().replace(/\s+/g, '_');
+}
+
 export function isAiReportType(reportType) {
-  if (typeof reportType !== 'string') return false;
-  const normalized = reportType.trim().toLowerCase().replace(/\s+/g, '_');
-  return AI_REPORT_TYPES.has(normalized);
+  return AI_REPORT_TYPES.has(normalizeReportType(reportType));
+}
+
+export function isNsfwReportType(reportType) {
+  return NSFW_REPORT_TYPES.has(normalizeReportType(reportType));
 }
 
 /**

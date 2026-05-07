@@ -18,7 +18,7 @@ import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
 import messagesHTML from './admin/messages.html';
-import { initReportsTable, addReport, isAiReportType } from './reports.mjs';
+import { initReportsTable, addReport, isAiReportType, isNsfwReportType } from './reports.mjs';
 import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforcement, applyUploaderEnforcementToResult } from './uploader-enforcement.mjs';
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { extractTopics, topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
@@ -1245,24 +1245,16 @@ async function handleLegacyScan(request, env) {
     });
   }
 
+  // Reactive moderation: do NOT queue new uploads for pre-screening.
+  // Content is playable by default; moderation runs only on user reports.
+  // (Previous behavior: queued every upload for the manual-review path.)
   const resolvedVideoUrl = videoUrl || `https://media.divine.video/${hash}`;
-  await env.MODERATION_QUEUE.send({
-    sha256: hash,
-    r2Key: `blobs/${hash}`,
-    uploadedBy: pubkey || undefined,
-    uploadedAt: Date.now(),
-    metadata: {
-      ...(metadata || {}),
-      source: source || 'api',
-      videoUrl: resolvedVideoUrl
-    }
-  });
-
-  console.log(`[SCAN] Queued ${hash} from ${source || 'api'}`);
+  console.log(`[SCAN] Skipped queue for ${hash} from ${source || 'api'} (reactive_moderation)`);
   return jsonResponse(202, {
     sha256: hash,
-    status: 'queued',
-    queued: true,
+    status: 'reactive',
+    queued: false,
+    reason: 'reactive_moderation',
     videoUrl: resolvedVideoUrl
   });
 }
@@ -1304,20 +1296,8 @@ async function handleLegacyBatchScan(request, env) {
       continue;
     }
 
-    const resolvedVideoUrl = videoUrl || `https://media.divine.video/${hash}`;
-    await env.MODERATION_QUEUE.send({
-      sha256: hash,
-      r2Key: `blobs/${hash}`,
-      uploadedBy: pubkey || undefined,
-      uploadedAt: Date.now(),
-      metadata: {
-        ...(metadata || {}),
-        source: source || defaultSource || 'batch-api',
-        videoUrl: resolvedVideoUrl
-      }
-    });
-
-    results.push({ sha256: hash, status: 'queued' });
+    // Reactive moderation: do NOT queue new uploads. Report 'reactive' instead of 'queued'.
+    results.push({ sha256: hash, status: 'reactive', queued: false });
     queued++;
   }
 
@@ -3633,62 +3613,114 @@ async function runMigration() {
       }
 
       try {
-        const { sha256, reporter_pubkey, report_type, reason } = await request.json();
+        const body = await request.json();
+        const reporter_pubkey = body?.reporter_pubkey;
+        const report_type = body?.report_type;
+        const reason = body?.reason;
+        const rawSha = typeof body?.sha256 === 'string' ? body.sha256.toLowerCase() : null;
 
-        if (!sha256 || !reporter_pubkey || !report_type) {
-          return new Response(JSON.stringify({ error: 'sha256, reporter_pubkey, and report_type are required' }), {
+        if (!rawSha || !isValidSha256(rawSha)) {
+          return new Response(JSON.stringify({ error: 'Valid sha256 (64-char lowercase hex) required' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' }
           });
         }
+        if (!isValidPubkey(reporter_pubkey)) {
+          return new Response(JSON.stringify({ error: 'Valid reporter_pubkey (64-char hex) required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        if (typeof report_type !== 'string' || report_type.trim().length === 0) {
+          return new Response(JSON.stringify({ error: 'report_type is required' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        const sha256 = rawSha;
 
         const result = await addReport(env.BLOSSOM_DB, { sha256, reporter_pubkey, report_type, reason });
 
-        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... escalate=${result.escalate}`);
+        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... distinctReporters=${result.distinctReporterCount}`);
 
-        if (isAiReportType(report_type) && env.MODERATION_QUEUE) {
-          const reportedAt = new Date().toISOString();
-          await env.MODERATION_QUEUE.send({
+        // Write a moderation_results row directly so the team's FLAGGED dashboard
+        // (action IN REVIEW/AGE_RESTRICTED/PERMANENT_BAN AND reviewed_by IS NULL)
+        // surfaces the reported item.
+        //
+        // Policy:
+        //   - Non-NSFW report (single tier): action = REVIEW
+        //   - NSFW report: action = REVIEW on first reporter; auto AGE_RESTRICTED
+        //     once 2+ DISTINCT reporter_pubkeys have flagged the same sha256.
+        //     The 2-distinct-reporter floor defends against single-token griefing
+        //     where one API caller could otherwise auto age-restrict any sha256
+        //     by varying the reporter_pubkey field.
+        //
+        // ON CONFLICT short-circuits if a moderator already reviewed the row
+        // (reviewed_by IS NOT NULL) so human decisions are never overwritten.
+        const isNsfw = isNsfwReportType(report_type);
+        const reportAction = (isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
+        const nowIso = new Date().toISOString();
+        const reportCategories = isNsfw ? ['adult'] : [];
+        try {
+          await env.BLOSSOM_DB.prepare(`
+            INSERT INTO moderation_results (
+              sha256, action, provider, scores, categories, raw_response, moderated_at, reviewed_by, reviewed_at, review_notes, uploaded_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sha256) DO UPDATE SET
+              action = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.action
+                WHEN moderation_results.action = 'PERMANENT_BAN' THEN moderation_results.action
+                WHEN excluded.action = 'AGE_RESTRICTED' AND moderation_results.action IN ('SAFE', 'REVIEW') THEN excluded.action
+                WHEN excluded.action = 'REVIEW' AND moderation_results.action = 'SAFE' THEN excluded.action
+                ELSE moderation_results.action
+              END,
+              provider = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.provider
+                ELSE excluded.provider
+              END,
+              categories = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.categories
+                ELSE excluded.categories
+              END,
+              moderated_at = CASE
+                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.moderated_at
+                ELSE excluded.moderated_at
+              END
+          `).bind(
             sha256,
-            r2Key: `videos/${sha256}.mp4`,
-            uploadedAt: Date.now(),
-            metadata: {
+            reportAction,
+            'user-report',
+            JSON.stringify({}),
+            JSON.stringify(reportCategories),
+            JSON.stringify({
               source: 'user-report',
-              forceAIDetection: true,
               reportType: report_type,
               reportedBy: reporter_pubkey,
-              ...(reason ? { reportReason: reason } : {})
-            }
-          });
-          console.log(`[API] Queued forced AI detection for reported content ${sha256}`);
+              distinctReporterCount: result.distinctReporterCount,
+              reason: reason ?? null,
+            }),
+            nowIso,
+            null,
+            null,
+            null,
+            null,
+          ).run();
+          console.log(`[API] Recorded ${reportAction} from user report for ${sha256} (type=${report_type}, nsfw=${isNsfw}, distinctReporters=${result.distinctReporterCount})`);
+        } catch (writeErr) {
+          console.error(`[API] Failed to write moderation row for reported ${sha256}:`, writeErr.message);
+        }
 
+        // Preserve existing AI-detection telemetry: AI-typed reports still record
+        // an ai_detection_events row so dashboards keep their report counts.
+        if (isAiReportType(report_type)) {
           try {
             await recordAIDetectionEvent(env.BLOSSOM_DB, buildAIReportEvent({
               sha256,
               reportType: report_type,
-              createdAt: reportedAt,
+              createdAt: nowIso,
             }));
           } catch (eventErr) {
             console.error(`[API] Failed to record AI report event for ${sha256}:`, eventErr.message);
-          }
-        } else if (env.MODERATION_QUEUE) {
-          const allowed = await shouldQueueHiveRecheck(env.BLOSSOM_DB, sha256);
-          if (allowed) {
-            await env.MODERATION_QUEUE.send({
-              sha256,
-              r2Key: `videos/${sha256}.mp4`,
-              uploadedAt: Date.now(),
-              metadata: {
-                source: 'user-report',
-                forceProvider: 'hiveai',
-                reportType: report_type,
-                reportedBy: reporter_pubkey,
-                ...(reason ? { reportReason: reason } : {})
-              }
-            });
-            console.log(`[API] Queued Hive recheck for reported content ${sha256} (report_type=${report_type})`);
-          } else {
-            console.log(`[API] Skipped Hive recheck for ${sha256} - rate-limited (recent hiveai run)`);
           }
         }
 
@@ -4326,6 +4358,20 @@ async function runMigration() {
    */
   async queue(batch, env) {
     console.log(`[MODERATION] Processing batch of ${batch.messages.length} videos`);
+
+    // Reactive moderation kill-switch. When enabled, drain (ack) every message
+    // without invoking the legacy moderate-video pipeline. Used to safely retire
+    // the queue path after the pivot to report-driven moderation. In-flight
+    // messages from before deploy are absorbed without writing manual-review
+    // rows that would re-flood the team's REVIEW queue.
+    if (env.REACTIVE_MODERATION_ONLY === 'true') {
+      console.log(`[MODERATION] REACTIVE_MODERATION_ONLY=true — ack-and-skip ${batch.messages.length} message(s)`);
+      for (const message of batch.messages) {
+        message.ack();
+      }
+      return;
+    }
+
     await initAIDetectionEventsTable(env.BLOSSOM_DB);
 
     for (const message of batch.messages) {
