@@ -30,6 +30,7 @@ import { parseRetryAfterSeconds } from './http-utils.mjs';
 import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
 import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
 import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
+import { notifyRelay } from './relay-notifier.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { cachedStat } from './admin/cache.mjs';
@@ -1972,7 +1973,7 @@ export default {
       // Get existing moderation result — check D1 first, fall back to KV
       let existing = null;
       const d1Row = await env.BLOSSOM_DB.prepare(
-        'SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, uploaded_by FROM moderation_results WHERE sha256 = ?'
+        'SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, uploaded_by, event_id FROM moderation_results WHERE sha256 = ?'
       ).bind(sha256).first();
 
       if (d1Row) {
@@ -2110,6 +2111,14 @@ export default {
         return blossomFailureResponse(sha256, action, blossomResult.error);
       }
 
+      // Symmetric add/remove on funnelcake's quarantine Set so manual
+      // overrides also flip the relay-side hide.
+      const adminRelayEventId = d1Row?.event_id || null;
+      const adminRelayResult = await notifyRelay(sha256, adminRelayEventId, action, env);
+      if (!adminRelayResult.success && !adminRelayResult.skipped) {
+        console.warn(`[ADMIN] Relay notification failed: ${adminRelayResult.error}`);
+      }
+
       // For PERMANENT_BAN: also delete the event from the relay (funnelcake),
       // but only after Blossom confirms enforcement to avoid partial moderation.
       let relayDeleteResult = null;
@@ -2238,7 +2247,7 @@ export default {
       } else {
         // Fall back to D1
         const d1Row = await env.BLOSSOM_DB.prepare(
-          'SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at FROM moderation_results WHERE sha256 = ?'
+          'SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, event_id FROM moderation_results WHERE sha256 = ?'
         ).bind(sha256).first();
         if (d1Row) {
           existing = {
@@ -3876,12 +3885,29 @@ async function runMigration() {
           return blossomFailureResponse(sha256, action.toUpperCase(), blossomResult.error);
         }
 
+        // Symmetric add/remove on funnelcake's quarantine Set. Look up the
+        // event id from D1 (we don't have it on the request body for this
+        // external-API endpoint).
+        const apiEventIdRow = await env.BLOSSOM_DB.prepare(
+          'SELECT event_id FROM moderation_results WHERE sha256 = ?'
+        ).bind(sha256).first();
+        const apiRelayResult = await notifyRelay(
+          sha256,
+          apiEventIdRow?.event_id || null,
+          action.toUpperCase(),
+          env,
+        );
+        if (!apiRelayResult.success && !apiRelayResult.skipped) {
+          console.warn(`[API] Relay notification failed: ${apiRelayResult.error}`);
+        }
+
         return new Response(JSON.stringify({
           success: true,
           sha256,
           action: action.toUpperCase(),
           updated_at: new Date().toISOString(),
-          blossom_notified: blossomResult.success || false
+          blossom_notified: blossomResult.success || false,
+          relay_notified: apiRelayResult.success && !apiRelayResult.skipped,
         }), {
           headers: { 'Content-Type': 'application/json' }
         });
@@ -4882,6 +4908,18 @@ async function handleModerationResult(result, env) {
     console.warn(`[MODERATION] Blossom notification failed: ${blossomResult.error}`);
   }
 
+  // Tell funnelcake to add/remove the relay event from its quarantined Set.
+  // Symmetric with notifyBlossom — same fire-and-forget failure handling.
+  // PERMANENT_BAN is handled by deleteEventFromRelayBySha256 below; notifyRelay
+  // skips it internally so we don't double-act.
+  const relayEventId = result.nostrContext?.eventId || null;
+  const relayResult = await notifyRelay(sha256, relayEventId, action, env);
+  if (!relayResult.success && !relayResult.skipped) {
+    console.warn(`[MODERATION] Relay notification failed: ${relayResult.error}`);
+  } else if (relayResult.success && !relayResult.skipped) {
+    console.log(`[MODERATION] ${sha256} - Relay quarantine state updated for ${action}`);
+  }
+
   // For PERMANENT_BAN: delete the event from the relay so externally-hosted content
   // is no longer discoverable via funnelcake.
   if (action === 'PERMANENT_BAN') {
@@ -4891,10 +4929,11 @@ async function handleModerationResult(result, env) {
     }
   }
 
-  // Send DM to creator for non-SAFE actions (non-blocking)
-  // DMs sent for permanent actions only. QUARANTINE is temporary (pending secondary
-  // verification) — DM fires when it resolves to PERMANENT_BAN via auto-escalation.
-  if (['PERMANENT_BAN', 'AGE_RESTRICTED'].includes(action) && uploadedBy && env.NOSTR_PRIVATE_KEY) {
+  // Send DM to creator for non-SAFE actions (non-blocking).
+  // QUARANTINE now also DMs because the relay-side hide makes the video
+  // disappear from public feeds; without a heads-up the creator would just
+  // see their upload vanish. The under-review template explains the 24h SLA.
+  if (['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE'].includes(action) && uploadedBy && env.NOSTR_PRIVATE_KEY) {
     try {
       const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
       await sendModerationDM(uploadedBy, sha256, action, reason, env, null, { categories: result.categories, title: result.nostrContext?.title, publishedAt: result.nostrContext?.publishedAt });

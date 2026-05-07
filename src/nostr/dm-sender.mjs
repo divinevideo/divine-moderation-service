@@ -51,9 +51,12 @@ const TEMPLATES = {
   AGE_RESTRICTED: (reason, sha256, title, publishedAt) =>
     `${contentSubject(title)}${postedDate(publishedAt)} has been age-restricted because it was found to ${reason}. It's still available, but only visible to viewers who have confirmed their age.\n${contentLink(sha256)}\n${FOOTER}`,
 
-  // QUARANTINE intentionally ignores reason — the message is generic per spec
+  // QUARANTINE intentionally ignores reason — the message is generic per spec.
+  // Mentions the 24-hour SLA and reassures the creator that the video is
+  // still visible to them via direct link / their profile when signed in,
+  // since the relay-side hide otherwise looks like a silent shadow-ban.
   QUARANTINE: (_reason, sha256, title, publishedAt) =>
-    `${contentSubject(title)}${postedDate(publishedAt)} has been temporarily hidden while we review it. A moderator will take a look shortly. If you'd like to provide context, you can reply to this message.\n${contentLink(sha256)}\n${FOOTER}`,
+    `${contentSubject(title)}${postedDate(publishedAt)} is currently under review by our moderation team. A human moderator will take a look within 24 hours and either restore it or contact you with next steps.\n\nUntil then, the video is hidden from public feeds but still visible to you via the direct link below or from your profile when you're signed in. If you'd like to provide context, you can reply to this message.\n${contentLink(sha256)}\n${FOOTER}`,
 
   // Account-level suspension — no content link, not content-specific.
   // Used by relay-manager when banning a user's pubkey.

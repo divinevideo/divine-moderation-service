@@ -5,7 +5,7 @@
 // ABOUTME: Verifies NIP-56 (kind 1984) reporting events are created correctly
 
 import { describe, it, expect, vi } from 'vitest';
-import { publishToFaro } from './publisher.mjs';
+import { publishToFaro, publishLabelEvent } from './publisher.mjs';
 
 describe('Nostr Event Publisher', () => {
   it('should create a kind 1984 report event for QUARANTINE', async () => {
@@ -230,5 +230,110 @@ describe('Nostr Event Publisher', () => {
     }, env, mockRelay);
 
     expect(mockRelay.publish).not.toHaveBeenCalled();
+  });
+});
+
+describe('publishLabelEvent (automated source)', () => {
+  // The relay's content_labels_mv only ingests kind 1985 events from pubkeys in
+  // nostr.trusted_labelers. The nsfw_labeled_events_set MV then picks up anything
+  // in the 'content-warning' namespace. So an automated kind 1985 with the right
+  // namespace is the canonical signal we want to emit at QUARANTINE time.
+  const baseEnv = () => ({
+    NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+    NOSTR_RELAY_URL: 'wss://relay.divine.video',
+  });
+
+  function withMockRelay(env) {
+    const mockRelay = { publish: vi.fn().mockResolvedValue(undefined) };
+    return { mockRelay, env };
+  }
+
+  it('publishes a kind-1985 content-warning label when source=automated', async () => {
+    const { mockRelay, env } = withMockRelay(baseEnv());
+
+    const result = await publishLabelEvent({
+      sha256: 'a'.repeat(64),
+      category: 'ai_generated',
+      status: 'confirmed',
+      score: 0.97,
+      source: 'automated',
+      nostrEventId: 'd'.repeat(64),
+    }, env, mockRelay);
+
+    expect(result.published).toBe(true);
+    const event = mockRelay.publish.mock.calls[0][0];
+    expect(event.kind).toBe(1985);
+    // Namespace declaration for content-warning
+    expect(event.tags).toEqual(expect.arrayContaining([
+      ['L', 'content-warning'],
+    ]));
+    // Label tag in the content-warning namespace
+    const labelTag = event.tags.find((t) => t[0] === 'l' && t[2] === 'content-warning');
+    expect(labelTag).toBeDefined();
+    expect(labelTag[1]).toBe('ai-generated');
+    // References the relay event id
+    expect(event.tags).toEqual(expect.arrayContaining([
+      ['e', 'd'.repeat(64)],
+    ]));
+  });
+
+  it('marks automated labels as unverified in tag metadata', async () => {
+    const { mockRelay, env } = withMockRelay(baseEnv());
+
+    await publishLabelEvent({
+      sha256: 'a'.repeat(64),
+      category: 'deepfake',
+      status: 'confirmed',
+      score: 0.91,
+      source: 'automated',
+      nostrEventId: 'b'.repeat(64),
+    }, env, mockRelay);
+
+    const event = mockRelay.publish.mock.calls[0][0];
+    const labelTag = event.tags.find((t) => t[0] === 'l' && t[2] === 'content-warning');
+    expect(labelTag).toBeDefined();
+    const metadata = JSON.parse(labelTag[3]);
+    expect(metadata.source).toBe('automated');
+    expect(metadata.verified).toBe(false);
+    expect(metadata.confidence).toBe(0.91);
+  });
+
+  it('defaults to human-moderator when source is omitted (no regression)', async () => {
+    const { mockRelay, env } = withMockRelay(baseEnv());
+
+    await publishLabelEvent({
+      sha256: 'a'.repeat(64),
+      category: 'nudity',
+      status: 'confirmed',
+      score: 0.8,
+    }, env, mockRelay);
+
+    const event = mockRelay.publish.mock.calls[0][0];
+    const labelTag = event.tags.find((t) => t[0] === 'l' && t[2] === 'content-warning');
+    const metadata = JSON.parse(labelTag[3]);
+    expect(metadata.source).toBe('human-moderator');
+    expect(metadata.verified).toBe(true);
+  });
+
+  it('automated rejected labels are still emitted as not-{label}', async () => {
+    // Mirrors the human-moderator rejection shape — keeps the existing relay path
+    // for "this is NOT category X" intact when an automated source disagrees.
+    const { mockRelay, env } = withMockRelay(baseEnv());
+
+    await publishLabelEvent({
+      sha256: 'a'.repeat(64),
+      category: 'ai_generated',
+      status: 'rejected',
+      score: 0.04,
+      source: 'automated',
+      nostrEventId: 'c'.repeat(64),
+    }, env, mockRelay);
+
+    const event = mockRelay.publish.mock.calls[0][0];
+    const labelTag = event.tags.find((t) => t[0] === 'l' && t[2] === 'content-warning');
+    expect(labelTag[1]).toBe('not-ai-generated');
+    const metadata = JSON.parse(labelTag[3]);
+    expect(metadata.source).toBe('automated');
+    expect(metadata.rejected).toBe(true);
   });
 });

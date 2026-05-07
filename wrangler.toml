@@ -119,6 +119,12 @@ RELAY_POLLING_RELAY_URL = "wss://relay.divine.video"  # Relay to poll for new vi
 RELAY_POLLING_LOOKBACK_HOURS = "1"                # How far back to look for events (in hours)
 RELAY_POLLING_LIMIT = "100"                       # Max events to fetch per poll
 
+# Funnelcake admin URL — destination for notifyRelay() NIP-98 add/remove
+# webhooks against /api/moderation/quarantine. Empty string = relay-side
+# enforcement disabled (notifyRelay returns skipped). Signed with NOSTR_PRIVATE_KEY,
+# so the corresponding pubkey must be in funnelcake's ADMIN_PUBKEYS.
+FUNNELCAKE_ADMIN_URL = "https://relay.divine.video"
+
 # Legacy moderation_results lookup-column backfill (perf/dashboard-speedup).
 # Off by default; flip to "true" via `wrangler secret put` after the manual
 # trigger /admin/api/backfill/run has been verified on a small batch.
