@@ -1950,6 +1950,74 @@ describe('notifyBlossom integration via admin moderate endpoint', () => {
     }
   });
 
+  it('warns and surfaces a CF-Access-specific error when relay-admin returns a CF Access 302', async () => {
+    const sha256 = 'e'.repeat(64);
+    const eventId = 'f'.repeat(64);
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      RELAY_ADMIN_URL: 'https://relay-admin.test',
+      // CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET intentionally absent
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get() { return null; },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+    };
+
+    const origFetch = globalThis.fetch;
+    const OrigWebSocket = globalThis.WebSocket;
+    const warnings = [];
+    const origWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(' ')); };
+    globalThis.fetch = async (url) => {
+      if (typeof url === 'string' && url.startsWith('https://relay-admin.test')) {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://divinevideo.cloudflareaccess.com/cdn-cgi/access/login/relay.admin.divine.video?...'
+          }
+        });
+      }
+      // Disable Nostr relay lookups
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+    globalThis.WebSocket = class {
+      constructor() {}
+      addEventListener(event, handler) {
+        if (event === 'close') queueMicrotask(handler);
+      }
+      close() {}
+      send() {}
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/event/${eventId}/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // Omit sha256 to force the direct deleteRelayEventIds([eventId]) path
+          // (no Nostr lookup short-circuit). This exercises callRelayAdminAction.
+          body: JSON.stringify({ reason: 'test' })
+        }),
+        env
+      );
+
+      expect(response.status).toBe(502);
+      const body = await response.json();
+      const errStr = String(body.error || '') + ' ' + JSON.stringify(body.relayResult || {});
+      expect(errStr).toMatch(/cloudflare access|cloudflareaccess|service token|CF_ACCESS/i);
+      // Defensive warning fires whenever secrets are missing at request time
+      expect(warnings.some(w => /CF_ACCESS_CLIENT_ID|service token|relay\.admin/i.test(w))).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+      globalThis.WebSocket = OrigWebSocket;
+      console.warn = origWarn;
+    }
+  });
+
   it('returns 502 when Blossom webhook fails for /api/v1/quarantine', async () => {
     const sha256 = 'd'.repeat(64);
     const kvStore = new Map();

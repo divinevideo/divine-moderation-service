@@ -139,7 +139,9 @@ crons = ["* * * * *", "*/5 * * * *"]
 # SIGHTENGINE_API_SECRET - (optional, for fallback)
 # HIVE_* secrets are intentionally unused by upload moderation and classification entry points.
 # Do not set them for production unless re-enabling an explicit, reviewed Hive integration.
-# RELAY_ADMIN_URL - Funnelcake admin API endpoint for cache purge / event deletion
+# RELAY_ADMIN_URL - relay-admin API host. Default in src/index.mjs is api-relay-prod.divine.video
+# (divine-relay-admin-api-prod worker, has NOSTR_NSEC binding). Override to
+# api-relay-staging.divine.video or relay.admin.divine.video only when needed.
 # REALITY_DEFENDER_API_KEY - Reality Defender API key for secondary AI verification (api.prd.realitydefender.xyz)
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
 # ATPROTO_LABELER_WEBHOOK_URL - URL of the divine-labeler webhook endpoint (https://labels.divine.video/webhook/moderation-result)

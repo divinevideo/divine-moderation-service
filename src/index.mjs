@@ -65,7 +65,13 @@ const CATEGORY_TO_LABEL = {
 
 const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
 const API_HOSTNAME = 'moderation-api.divine.video';
-const DEFAULT_RELAY_ADMIN_URL = 'https://relay.admin.divine.video';
+// api-relay-prod.divine.video targets divine-relay-admin-api-prod which has the
+// NOSTR_NSEC Secrets Store binding required by handleModerate -> getSecretKey.
+// relay.admin.divine.video routes to a stale divine-relay-admin-api deployment
+// that lacks the binding and crashes with "Cannot read properties of undefined
+// (reading 'get')" / Cloudflare Error 1101 on every moderate call. Override
+// via env.RELAY_ADMIN_URL if needed for staging or rollback.
+const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const VALID_MODERATION_ACTIONS = new Set(['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN']);
 
@@ -720,11 +726,31 @@ async function processPendingTranscriptReprocess(env) {
 }
 
 async function callRelayAdminAction(env, payload) {
+  const hasCfAccessSecrets = !!(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET);
+  if (!hasCfAccessSecrets) {
+    console.warn('[RELAY-ADMIN] CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET not configured on this worker — calls to relay.admin.divine.video will be blocked by Cloudflare Access. See project memory cf_access_relay_admin_secrets.md.');
+  }
+
   const response = await fetch(`${getRelayAdminUrl(env)}/api/moderate`, {
     method: 'POST',
     headers: getRelayAdminHeaders(env),
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    redirect: 'manual'
   });
+
+  // Detect Cloudflare Access bouncing the request to the login page.
+  // *.admin.divine.video is behind CF Access; without a valid service token,
+  // any call returns a 302 to <team>.cloudflareaccess.com. Surface a self-
+  // documenting error instead of a generic "HTTP 302".
+  if (response.status === 302) {
+    const location = response.headers.get('location') || '';
+    if (/cloudflareaccess\.com/i.test(location)) {
+      const hint = hasCfAccessSecrets
+        ? 'service token may be invalid, expired, or not authorized for this Access application'
+        : 'CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET secrets are not set on this worker';
+      throw new Error(`Relay admin call blocked by Cloudflare Access (${hint}). See project memory cf_access_relay_admin_secrets.md.`);
+    }
+  }
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data?.success === false) {
@@ -1932,11 +1958,14 @@ export default {
         : await deleteRelayEventIds([eventId], env, reason);
 
       if (!relayResult.success) {
+        const failureError = Array.isArray(relayResult.failures) && relayResult.failures[0]?.error
+          ? relayResult.failures[0].error
+          : null;
         return new Response(JSON.stringify({
           success: false,
           eventId,
           relayResult,
-          error: relayResult.error || relayResult.reason || 'Failed to delete relay event'
+          error: relayResult.error || failureError || relayResult.reason || 'Failed to delete relay event'
         }), {
           status: 502,
           headers: { 'Content-Type': 'application/json' }
