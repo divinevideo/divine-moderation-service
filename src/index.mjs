@@ -65,7 +65,13 @@ const CATEGORY_TO_LABEL = {
 
 const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
 const API_HOSTNAME = 'moderation-api.divine.video';
-const DEFAULT_RELAY_ADMIN_URL = 'https://relay.admin.divine.video';
+// api-relay-prod.divine.video targets divine-relay-admin-api-prod which has the
+// NOSTR_NSEC Secrets Store binding required by handleModerate -> getSecretKey.
+// relay.admin.divine.video routes to a stale divine-relay-admin-api deployment
+// that lacks the binding and crashes with "Cannot read properties of undefined
+// (reading 'get')" / Cloudflare Error 1101 on every moderate call. Override
+// via env.RELAY_ADMIN_URL if needed for staging or rollback.
+const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const VALID_MODERATION_ACTIONS = new Set(['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN']);
 
