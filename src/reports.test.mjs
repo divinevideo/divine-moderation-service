@@ -75,7 +75,7 @@ describe('reports', () => {
         reason: 'inappropriate content',
       });
 
-      expect(result).toEqual({ escalate: null });
+      expect(result).toMatchObject({ escalate: null, distinctReporterCount: 1 });
     });
 
     it('should deduplicate same reporter for same sha256', async () => {
@@ -126,7 +126,7 @@ describe('reports', () => {
         report_type: 'nudity',
       });
 
-      expect(result).toEqual({ escalate: 'REVIEW' });
+      expect(result).toMatchObject({ escalate: 'REVIEW', distinctReporterCount: 3 });
     });
 
     it('should escalate to AGE_RESTRICTED at 5 unique reporters', async () => {
@@ -141,7 +141,7 @@ describe('reports', () => {
         report_type: 'nudity',
       });
 
-      expect(result).toEqual({ escalate: 'AGE_RESTRICTED' });
+      expect(result).toMatchObject({ escalate: 'AGE_RESTRICTED', distinctReporterCount: 5 });
     });
   });
 
