@@ -740,7 +740,16 @@ describe('Admin video lookup', () => {
     }
   });
 
-  it('returns mirrored relay context fields in the admin video list payload', async () => {
+  it('returns stored relay context fields in the admin video list without per-row fan-out', async () => {
+    // Contract change (perf/dashboard-speedup):
+    //   /admin/api/videos used to fire one funnelcake REST call per row
+    //   to fill eventId/title/author/etc on every page render. The
+    //   columns were stored in moderation_results all along — we just
+    //   weren't selecting them. Now the handler reads those columns
+    //   directly and never calls funnelcake on the list endpoint.
+    //   Detail view (/admin/api/video/:id) keeps the on-demand
+    //   funnelcake fetch so client/content fields still render when a
+    //   moderator opens a card.
     const originalFetch = globalThis.fetch;
     const originalWebSocket = globalThis.WebSocket;
     const restCalls = [];
@@ -753,35 +762,12 @@ describe('Admin video lookup', () => {
 
     globalThis.fetch = async (url) => {
       restCalls.push(String(url));
-      if (String(url) === `https://relay.divine.video/api/videos/${SHA256}`) {
-        return new Response(JSON.stringify({
-          event: {
-            id: 'd'.repeat(64),
-            pubkey: 'b'.repeat(64),
-            created_at: 1700000000,
-            kind: 34236,
-            tags: [
-              ['d', SHA256],
-              ['title', 'REST title'],
-              ['published_at', '1389756506'],
-              ['imeta', 'url https://media.divine.video/rest-content.mp4', `x ${SHA256}`]
-            ],
-            content: 'REST description',
-            sig: 'e'.repeat(128)
-          },
-          stats: {
-            author_name: 'REST author'
-          }
-        }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
       throw new Error(`Unexpected fetch: ${url}`);
     };
 
     try {
+      // Row with metadata columns populated — dashboard reads these
+      // directly, no funnelcake fetch needed.
       const moderationRow = {
         sha256: SHA256,
         action: 'REVIEW',
@@ -791,7 +777,12 @@ describe('Admin video lookup', () => {
         moderated_at: '2026-03-07T00:00:00.000Z',
         reviewed_by: null,
         reviewed_at: null,
-        uploaded_by: null
+        uploaded_by: 'b'.repeat(64),
+        event_id: 'd'.repeat(64),
+        title: 'REST title',
+        author: 'REST author',
+        content_url: 'https://media.divine.video/rest-content.mp4',
+        published_at: '1389756506'
       };
 
       const response = await worker.fetch(
@@ -812,18 +803,23 @@ describe('Admin video lookup', () => {
           sha256: SHA256,
           uploaded_by: 'b'.repeat(64),
           eventId: 'd'.repeat(64),
-          divineUrl: `https://divine.video/video/${SHA256}`,
+          divineUrl: `https://divine.video/video/${'d'.repeat(64)}`,
           nostrContext: {
             title: 'REST title',
             author: 'REST author',
             url: 'https://media.divine.video/rest-content.mp4',
             publishedAt: 1389756506,
-            content: 'REST description',
+            // client/content are not stored. List view leaves them null;
+            // detail view fills them via on-demand funnelcake.
+            client: null,
+            content: null,
             eventId: 'd'.repeat(64)
           }
         }]
       });
-      expect(restCalls).toEqual([`https://relay.divine.video/api/videos/${SHA256}`]);
+      // Regression gate: if anyone reintroduces the per-row fan-out,
+      // restCalls will not be empty.
+      expect(restCalls).toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;

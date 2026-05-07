@@ -31,6 +31,7 @@ import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
 import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
 import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
+import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -990,7 +991,7 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
   const cdnUrl = `https://${env.CDN_DOMAIN || 'media.divine.video'}/${hash}`;
   if (hash) {
     const moderatedRow = await env.BLOSSOM_DB.prepare(`
-      SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, review_notes, uploaded_by, raw_response, videoseal
+      SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}, review_notes, raw_response, videoseal
       FROM moderation_results
       WHERE sha256 = ?
     `).bind(hash).first();
@@ -1506,9 +1507,11 @@ export default {
       const sortParam = url.searchParams.get('sort');
       const orderDirection = sortParam === 'oldest' ? 'ASC' : 'DESC';
 
-      // Query D1 with pagination
+      // Query D1 with pagination. The wide SELECT pulls every column the
+      // dashboard needs so we can render directly from the row — no
+      // per-card funnelcake fetch.
       const query = `
-        SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, uploaded_by
+        SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}
         FROM moderation_results
         ${whereClause}
         ORDER BY moderated_at ${orderDirection}
@@ -1518,44 +1521,32 @@ export default {
 
       const result = await env.BLOSSOM_DB.prepare(query).bind(...params).all();
       const rows = result.results || [];
-
-      // Check if there are more results
       const hasMore = rows.length > limit;
-      const videoRows = rows.slice(0, limit).map(row => ({
-        sha256: row.sha256,
-        action: row.action,
-        provider: row.provider,
-        scores: row.scores ? JSON.parse(row.scores) : {},
-        categories: row.categories ? JSON.parse(row.categories) : [],
-        processedAt: new Date(row.moderated_at).getTime(),
-        moderated_at: row.moderated_at,
-        reviewed_by: row.reviewed_by,
-        reviewed_at: row.reviewed_at,
-        uploaded_by: row.uploaded_by || null
+      const pageRows = rows.slice(0, limit);
+
+      const videos = pageRows.map((row) => buildAdminVideoFromRow(row, {
+        cdnDomain: env.CDN_DOMAIN || 'media.divine.video',
       }));
 
-      // Reuse the existing relay-aware per-item lookup so dashboard cards can render
-      // publisher/post metadata immediately instead of starting from an "unknown" state.
-      const videos = await Promise.all(videoRows.map(async (video) => {
-        try {
-          const enriched = await getAdminLookupVideo(video.sha256, env);
-          if (!enriched) {
-            return video;
+      // Batch uploader_enforcement lookups: one query for every unique
+      // uploader on this page, instead of one per row.
+      const uploaderPubkeys = [...new Set(videos.map((v) => v.uploaded_by).filter(Boolean))];
+      if (uploaderPubkeys.length > 0) {
+        const placeholders = uploaderPubkeys.map(() => '?').join(',');
+        const enf = await env.BLOSSOM_DB.prepare(
+          `SELECT pubkey, approval_required, relay_banned FROM uploader_enforcement WHERE pubkey IN (${placeholders})`,
+        ).bind(...uploaderPubkeys).all();
+        const byPubkey = new Map((enf.results || []).map((r) => [r.pubkey, r]));
+        for (const v of videos) {
+          if (v.uploaded_by) {
+            v.uploaderEnforcement = byPubkey.get(v.uploaded_by) || {
+              pubkey: v.uploaded_by,
+              approval_required: 0,
+              relay_banned: 0,
+            };
           }
-
-          return {
-            ...video,
-            uploaded_by: enriched.uploaded_by || video.uploaded_by || null,
-            eventId: enriched.eventId || null,
-            divineUrl: enriched.divineUrl || null,
-            lookupId: enriched.lookupId || null,
-            nostrContext: enriched.nostrContext || null
-          };
-        } catch (error) {
-          console.error(`[${requestId}] Failed to enrich dashboard row ${video.sha256}:`, error.message);
-          return video;
         }
-      }));
+      }
 
       console.log(`[${requestId}] Returning ${videos.length} videos in ${Date.now() - startTime}ms`);
       return new Response(JSON.stringify({
@@ -3948,7 +3939,7 @@ async function runMigration() {
         const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
         const offset = parseInt(url.searchParams.get('offset') || '0', 10);
 
-        let query = 'SELECT sha256, action, provider, scores, moderated_at, reviewed_by, reviewed_at, uploaded_by FROM moderation_results';
+        let query = `SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')} FROM moderation_results`;
         const conditions = [];
         const bindings = [];
 
