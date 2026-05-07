@@ -118,6 +118,12 @@ RELAY_POLLING_RELAY_URL = "wss://relay.divine.video"  # Relay to poll for new vi
 RELAY_POLLING_LOOKBACK_HOURS = "1"                # How far back to look for events (in hours)
 RELAY_POLLING_LIMIT = "100"                       # Max events to fetch per poll
 
+# Legacy moderation_results lookup-column backfill (perf/dashboard-speedup).
+# Off by default; flip to "true" via `wrangler secret put` after the manual
+# trigger /admin/api/backfill/run has been verified on a small batch.
+BACKFILL_ENABLED = "false"
+BACKFILL_ROWS_PER_TICK = "200"
+
 # Creator-delete pipeline feature flag (default off; flip to "true" via `wrangler secret put` or [vars] once ready)
 CREATOR_DELETE_PIPELINE_ENABLED = "false"
 # Relay used to fetch creator kind 5 delete events and target video events.

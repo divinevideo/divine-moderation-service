@@ -34,6 +34,7 @@ import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { cachedStat } from './admin/cache.mjs';
 import { latestBunnyEventBySha, latestBunnyEventForSha, countLatestBunnyEvents } from './admin/bunny-events.mjs';
+import { runBackfill } from './admin/backfill-lookup-columns.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -1641,6 +1642,31 @@ export default {
         return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: JSON_HEADERS
+        });
+      }
+    }
+
+    // Manual trigger for the legacy backfill cron. Useful when ops wants
+    // to dry-run before flipping BACKFILL_ENABLED, or to force-progress
+    // a stalled backfill. Honors BACKFILL_ENABLED.
+    if (url.pathname === '/admin/api/backfill/run' && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to /admin/api/backfill/run`);
+        return authError;
+      }
+      const count = Math.min(Number(url.searchParams.get('count') || '200'), 500);
+      try {
+        const result = await runBackfill(env, {
+          limit: count,
+          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256),
+        });
+        return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
+      } catch (error) {
+        console.error(`[${requestId}] Backfill manual run failed:`, error);
+        return new Response(JSON.stringify({ error: error.message }), {
+          status: 500,
+          headers: JSON_HEADERS,
         });
       }
     }
@@ -4487,22 +4513,35 @@ async function runMigration() {
   async scheduled(event, env, ctx) {
     if (event.cron === '* * * * *') {
       // Every-minute: creator-delete pipeline (gated by feature flag)
-      if (env.CREATOR_DELETE_PIPELINE_ENABLED !== 'true') {
-        return;
+      if (env.CREATOR_DELETE_PIPELINE_ENABLED === 'true') {
+        const relayUrl = env.CREATOR_DELETE_RELAY_URL || 'wss://relay.divine.video';
+        try {
+          const result = await runCreatorDeleteCron({
+            db: env.BLOSSOM_DB,
+            kv: env.MODERATION_KV,
+            queryKind5Since: async (sinceSeconds) =>
+              fetchKind5EventsSince(sinceSeconds, relayUrl, env),
+            fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env),
+            callBlossomDelete: (sha256) => notifyBlossom(sha256, 'DELETE', env)
+          });
+          console.log(`[CREATOR-DELETE-CRON] Processed ${result.processed}, errors: ${result.errors.length}`);
+        } catch (e) {
+          console.error('[CREATOR-DELETE-CRON] failed:', e);
+        }
       }
-      const relayUrl = env.CREATOR_DELETE_RELAY_URL || 'wss://relay.divine.video';
+
+      // Every-minute: backfill legacy moderation_results lookup columns.
+      // Gated by BACKFILL_ENABLED. Helper short-circuits when disabled or
+      // when another run holds the KV mutex.
       try {
-        const result = await runCreatorDeleteCron({
-          db: env.BLOSSOM_DB,
-          kv: env.MODERATION_KV,
-          queryKind5Since: async (sinceSeconds) =>
-            fetchKind5EventsSince(sinceSeconds, relayUrl, env),
-          fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env),
-          callBlossomDelete: (sha256) => notifyBlossom(sha256, 'DELETE', env)
+        const result = await runBackfill(env, {
+          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256),
         });
-        console.log(`[CREATOR-DELETE-CRON] Processed ${result.processed}, errors: ${result.errors.length}`);
+        if (!result.skipped) {
+          console.log(`[BACKFILL] picked=${result.picked} updated=${result.updated} missing=${result.missing} errored=${result.errored}`);
+        }
       } catch (e) {
-        console.error('[CREATOR-DELETE-CRON] failed:', e);
+        console.error('[BACKFILL] failed:', e);
       }
       return;
     }
