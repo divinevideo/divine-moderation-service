@@ -33,6 +33,7 @@ import { buildDownstreamPublishContext } from './moderation/downstream-publishin
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { cachedStat } from './admin/cache.mjs';
+import { latestBunnyEventBySha, latestBunnyEventForSha, countLatestBunnyEvents } from './admin/bunny-events.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -1030,15 +1031,7 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
       }, env);
     }
 
-    const untriagedRow = await env.BLOSSOM_DB.prepare(`
-      SELECT sha256, video_guid, hls_url, mp4_url, thumbnail_url, received_at, status_name
-      FROM bunny_webhook_events e1
-      WHERE e1.sha256 = ?
-        AND received_at = (
-          SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-        )
-      LIMIT 1
-    `).bind(hash).first();
+    const untriagedRow = await latestBunnyEventForSha(env, hash);
 
     if (untriagedRow && !['error', 'deleted'].includes(untriagedRow.status_name)) {
       let nostrContext = null;
@@ -1143,15 +1136,7 @@ async function getStoredAdminPlaybackCandidates(sha256, env) {
       FROM moderation_results
       WHERE sha256 = ?
     `).bind(sha256).first(),
-    env.BLOSSOM_DB.prepare(`
-      SELECT mp4_url, hls_url
-      FROM bunny_webhook_events e1
-      WHERE e1.sha256 = ?
-        AND received_at = (
-          SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-        )
-      LIMIT 1
-    `).bind(sha256).first(),
+    latestBunnyEventForSha(env, sha256),
     env.MODERATION_KV.get(`moderation:${sha256}`)
   ]);
 
@@ -1673,34 +1658,23 @@ export default {
       console.log(`[${requestId}] Fetching untriaged videos: limit=${limit}, offset=${offset}`);
 
       try {
-        // Get recent finished videos from D1, excluding those with later deleted/error status
-        // Uses subquery to get only the LATEST status for each sha256
-        const result = await env.BLOSSOM_DB.prepare(`
-          SELECT sha256, video_guid, hls_url, mp4_url, thumbnail_url, received_at
-          FROM bunny_webhook_events e1
-          WHERE sha256 IS NOT NULL
-            AND received_at = (
-              SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-            )
-            AND status_name NOT IN ('error', 'deleted')
-          ORDER BY received_at DESC
-          LIMIT ? OFFSET ?
-        `).bind(limit, offset).all();
+        const rows = await latestBunnyEventBySha(env, { limit, offset });
 
-        // Check which ones are already moderated
-        const unmoderatedRows = [];
-        for (const row of result.results) {
-          const existingResult = await env.MODERATION_KV.get(`moderation:${row.sha256}`);
-          if (!existingResult) {
-            unmoderatedRows.push(row);
-          }
-        }
+        // Filter to rows that haven't been moderated yet. Old code did
+        // a sequential `for` loop with await — this is one parallel batch.
+        const moderationFlags = await Promise.all(
+          rows.map((row) => env.MODERATION_KV.get(`moderation:${row.sha256}`)),
+        );
+        const unmoderatedRows = rows.filter((_, i) => !moderationFlags[i]);
 
-        // Fetch Nostr context in parallel for all unmoderated videos
+        // Fetch Nostr context per unmoderated row, with a 1-hour KV cache
+        // so the next page render doesn't pay the WS roundtrip cost.
         const nostrPromises = unmoderatedRows.map(async (row) => {
+          const cacheKey = `nostr:event:${row.sha256}`;
           try {
-            const event = await fetchNostrEventBySha256(row.sha256, ['wss://relay.divine.video'], env);
-            if (event) {
+            const cached = await env.MODERATION_KV.get(cacheKey);
+            if (cached) {
+              const event = JSON.parse(cached);
               const metadata = parseVideoEventMetadata(event);
               return {
                 sha256: row.sha256,
@@ -1709,7 +1683,21 @@ export default {
                 author: metadata?.author || null,
                 client: metadata?.client || null,
                 content: metadata?.content || event.content || null,
-                pubkey: event.pubkey || null
+                pubkey: event.pubkey || null,
+              };
+            }
+            const event = await fetchNostrEventBySha256(row.sha256, ['wss://relay.divine.video'], env);
+            if (event) {
+              ctx.waitUntil(env.MODERATION_KV.put(cacheKey, JSON.stringify(event), { expirationTtl: 3600 }));
+              const metadata = parseVideoEventMetadata(event);
+              return {
+                sha256: row.sha256,
+                eventId: event.id,
+                title: metadata?.title || null,
+                author: metadata?.author || null,
+                client: metadata?.client || null,
+                content: metadata?.content || event.content || null,
+                pubkey: event.pubkey || null,
               };
             }
           } catch (e) {
@@ -1719,10 +1707,9 @@ export default {
         });
 
         const nostrResults = await Promise.all(nostrPromises);
-        const nostrMap = new Map(nostrResults.map(r => [r.sha256, r]));
+        const nostrMap = new Map(nostrResults.map((r) => [r.sha256, r]));
 
-        // Build videos with Nostr context
-        const videos = unmoderatedRows.map(row => {
+        const videos = unmoderatedRows.map((row) => {
           const nostr = nostrMap.get(row.sha256) || {};
           return {
             sha256: row.sha256,
@@ -1740,32 +1727,21 @@ export default {
               author: nostr.author,
               client: nostr.client,
               content: nostr.content,
-              pubkey: nostr.pubkey ? nostr.pubkey.substring(0, 16) + '...' : null
-            }
+              pubkey: nostr.pubkey ? `${nostr.pubkey.substring(0, 16)}...` : null,
+            },
           };
         });
 
-        // Get total count of untriaged (same logic - latest status not deleted/error)
-        const countResult = await env.BLOSSOM_DB.prepare(`
-          SELECT COUNT(*) as total FROM (
-            SELECT sha256
-            FROM bunny_webhook_events e1
-            WHERE sha256 IS NOT NULL
-              AND received_at = (
-                SELECT MAX(received_at) FROM bunny_webhook_events e2 WHERE e2.sha256 = e1.sha256
-              )
-              AND status_name NOT IN ('error', 'deleted')
-          )
-        `).first();
+        const total = await cachedStat(env, ctx, 'untriaged-total', 60, () => countLatestBunnyEvents(env));
 
         return new Response(JSON.stringify({
           videos,
-          total: countResult?.total || 0,
+          total,
           offset,
           limit,
-          hasMore: offset + limit < (countResult?.total || 0)
+          hasMore: offset + limit < total,
         }), {
-          headers: JSON_HEADERS
+          headers: JSON_HEADERS,
         });
       } catch (error) {
         console.error('[ADMIN] Failed to fetch untriaged videos:', error);
