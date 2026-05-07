@@ -35,7 +35,6 @@ import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-help
 import { cachedStat } from './admin/cache.mjs';
 import { latestBunnyEventBySha, latestBunnyEventForSha, countLatestBunnyEvents } from './admin/bunny-events.mjs';
 import { runBackfill } from './admin/backfill-lookup-columns.mjs';
-import { runRelayDecisionBackfill } from './admin/backfill-relay-decisions.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
@@ -1685,37 +1684,6 @@ export default {
         return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
       } catch (error) {
         console.error(`[${requestId}] Backfill manual run failed:`, error);
-        return new Response(JSON.stringify({ error: error.message }), {
-          status: 500,
-          headers: JSON_HEADERS,
-        });
-      }
-    }
-
-    // Backfill relay moderation events from D1 decisions for historical rows.
-    // Useful while rebuilding relay state after ingest gaps.
-    if (url.pathname === '/admin/api/backfill/decisions' && request.method === 'POST') {
-      const authError = await requireAuth(request, env);
-      if (authError) {
-        console.log(`[${requestId}] Unauthorized access to /admin/api/backfill/decisions`);
-        return authError;
-      }
-
-      const count = Math.min(Number(url.searchParams.get('count') || '200'), 500);
-      const concurrency = Math.max(1, Math.min(Number(url.searchParams.get('concurrency') || '5'), 20));
-      const dryRun = ['1', 'true', 'yes'].includes(String(url.searchParams.get('dryRun') || '').toLowerCase());
-      const publishFaro = ['1', 'true', 'yes'].includes(String(url.searchParams.get('publishFaro') || '').toLowerCase());
-
-      try {
-        const result = await runRelayDecisionBackfill(env, {
-          limit: count,
-          concurrency,
-          dryRun,
-          publishFaro,
-        });
-        return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
-      } catch (error) {
-        console.error(`[${requestId}] Relay decision backfill manual run failed:`, error);
         return new Response(JSON.stringify({ error: error.message }), {
           status: 500,
           headers: JSON_HEADERS,
@@ -4971,7 +4939,7 @@ async function handleModerationResult(result, env) {
         WHERE sha256 = ?
       `).bind(action, new Date().toISOString(), sha256).run();
     } catch (markerErr) {
-      console.warn(`[MODERATION] Failed to persist relay publish marker for ${sha256}:`, markerErr.message);
+      console.warn(`[MODERATION] Failed to persist relay publish marker for ${sha256}:`, markerErr?.message || String(markerErr));
     }
   }
 
