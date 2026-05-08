@@ -38,10 +38,17 @@ export async function cachedStat(env, ctx, key, ttlSeconds, compute, options = {
   const fresh = await compute();
   const writePromise = env.MODERATION_KV.put(fullKey, JSON.stringify(fresh), {
     expirationTtl: ttlSeconds,
+  }).catch((err) => {
+    // KV writes can fail transiently. The freshly computed value is
+    // still good — we just won't have it cached for the next caller.
+    // Log and move on; never let a cache-write failure mask a
+    // successful compute.
+    console.error('[cachedStat] KV put failed:', err?.message || err);
   });
   // Production: hand the write to ctx.waitUntil and return immediately.
   // Tests / unusual call sites without ctx: await the write so we don't
-  // throw on `ctx.waitUntil` being undefined.
+  // throw on `ctx.waitUntil` being undefined. The .catch above ensures
+  // a KV outage never propagates as a thrown error from cachedStat.
   if (ctx && typeof ctx.waitUntil === 'function') {
     ctx.waitUntil(writePromise);
   } else {

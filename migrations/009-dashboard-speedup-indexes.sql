@@ -24,4 +24,13 @@ CREATE INDEX IF NOT EXISTS idx_moderation_unreviewed
 -- Tracks the last time the backfill cron tried to populate this
 -- row's lookup metadata. Lets us skip rows we already tried for 7
 -- days (avoids hammering funnelcake on permanent 404s).
+--
+-- NOTE: SQLite does NOT support ADD COLUMN IF NOT EXISTS (D1 inherits
+-- this). Wrangler's migrations table prevents reruns under normal
+-- deploys, but if an operator ever has to manually re-apply this file
+-- (e.g. via `wrangler d1 execute --file=...`), the ALTER TABLE will
+-- error with "duplicate column name". That's the safe failure: nothing
+-- was already corrupted. Either drop the ALTER line for the manual
+-- replay, or split this concern into a separate migration file in a
+-- future change.
 ALTER TABLE moderation_results ADD COLUMN lookup_attempted_at TEXT;
