@@ -4000,7 +4000,7 @@
       return `
         <div class="video-card ${actionClass}" data-sha256="${sha256}">
           <div class="video-thumbnail">
-            <video src="${playableVideoUrl}" muted loop preload="none" controls onmouseenter="this.play()" onmouseleave="this.pause()"></video>
+            <video src="${playableVideoUrl}" muted loop preload="none" poster="https://media.divine.video/${sha256}.jpg" controls onmouseenter="this.play()" onmouseleave="this.pause()"></video>
             <div class="video-overlay">
               <span class="badge ${actionClass}">${action}</span>
               ${manualOverride ? '<span class="badge override-badge">MANUAL</span>' : ''}
