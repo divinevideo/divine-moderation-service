@@ -2849,6 +2849,27 @@ export default {
           }
         }
 
+        // GCS direct fallback. The Blossom CDN sits in front of GCS bucket
+        // `divine-blossom-media` (publicly readable). When the CDN returns
+        // 404 because of moderation enforcement / VCL, the underlying
+        // bytes are still on GCS at the same sha256 path. Cheaper than a
+        // relay roundtrip, and works for every divine-hosted upload —
+        // CSAM-handled-upstream-at-GCS still applies.
+        const gcsBucket = env.GCS_BUCKET || 'divine-blossom-media';
+        const gcsUrl = `https://storage.googleapis.com/${gcsBucket}/${sha256}`;
+        if (gcsUrl !== cdnUrl && gcsUrl !== adminBypassUrl) {
+          try {
+            const gcsResponse = await fetch(gcsUrl, upstreamRequestInit);
+            if (gcsResponse.ok) {
+              console.log(`[ADMIN] Serving video from gcs-direct: ${sha256}`);
+              return createAdminVideoProxyResponse(gcsResponse, 'gcs-direct');
+            }
+            console.warn(`[ADMIN] GCS direct returned ${gcsResponse.status} for ${sha256}`);
+          } catch (gcsFetchError) {
+            console.warn(`[ADMIN] GCS direct fetch threw for ${sha256}: ${gcsFetchError.message}`);
+          }
+        }
+
         // Last-resort fallback: ask the relay for the Nostr event and try
         // its imeta `url`. KV-cached so a 50-card dashboard render doesn't
         // open 50 parallel WebSockets — each cache miss writes a 5-min
