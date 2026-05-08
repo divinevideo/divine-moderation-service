@@ -2797,6 +2797,34 @@ export default {
           }
         }
 
+        // Last-resort fallback: ask the relay for the Nostr event and try
+        // its imeta `url`. This catches the case where the moderation
+        // pipeline stored content_url as the cdn URL (because nostrContext
+        // wasn't captured at moderate time) — that candidate is correctly
+        // skipped above, leaving us with nothing. For external Blossom
+        // videos (Plebs, etc.) the imeta url is the only working source.
+        try {
+          const event = await fetchNostrEventBySha256(sha256, ['wss://relay.divine.video'], env);
+          if (event) {
+            const metadata = parseVideoEventMetadata(event);
+            const relayUrl = metadata?.url || null;
+            if (relayUrl && relayUrl !== cdnUrl && relayUrl !== adminBypassUrl) {
+              try {
+                const relayResponse = await fetch(relayUrl, upstreamRequestInit);
+                if (relayResponse.ok) {
+                  console.log(`[ADMIN] Serving video from nostr-imeta-url: ${sha256}`);
+                  return createAdminVideoProxyResponse(relayResponse, 'nostr-imeta-url');
+                }
+                console.warn(`[ADMIN] Nostr imeta url returned ${relayResponse.status} for ${sha256}`);
+              } catch (relayFetchError) {
+                console.warn(`[ADMIN] Nostr imeta url fetch failed for ${sha256}: ${relayFetchError.message}`);
+              }
+            }
+          }
+        } catch (relayLookupError) {
+          console.warn(`[ADMIN] Nostr event lookup failed for ${sha256}: ${relayLookupError.message}`);
+        }
+
         return new Response(JSON.stringify({
           error: 'Video not found',
           sha256
@@ -4478,7 +4506,13 @@ async function runMigration() {
           result.nostrContext?.title || null,
           result.nostrContext?.author || null,
           result.nostrEventId || null,
-          result.nostrContext?.url || result.cdnUrl || null,
+          // Only store the actual upstream URL (Blossom imeta) here.
+          // Falling back to result.cdnUrl writes media.divine.video/{sha},
+          // which is exactly the URL the admin-video proxy already tried
+          // and got 404 from — and the proxy then dedups it out, leaving
+          // no working candidate. Better to leave null so the proxy's
+          // nostr-imeta-url last-resort lookup can run.
+          result.nostrContext?.url || null,
           result.nostrContext?.publishedAt || null,
           JSON.stringify(result.videoseal || null),
           transcriptPending,
