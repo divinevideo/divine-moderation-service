@@ -3121,7 +3121,7 @@
 
       return '<div class="video-card triage" data-sha256="' + sha256 + '" style="border-color: #8b5cf6;">' +
         '<div class="video-thumbnail">' +
-          '<video src="' + videoUrl + '" muted loop preload="metadata" poster="' + thumbUrl + '" controls onmouseenter="this.play()" onmouseleave="this.pause(); this.currentTime=0;"></video>' +
+          '<video src="' + videoUrl + '" muted loop preload="none" poster="' + thumbUrl + '" controls onmouseenter="this.play()" onmouseleave="this.pause(); this.currentTime=0;"></video>' +
           '<div class="video-overlay">' +
             '<span class="badge" style="background: #8b5cf6;">NEW</span>' +
           '</div>' +
@@ -3986,7 +3986,7 @@
       return `
         <div class="video-card ${actionClass}" data-sha256="${sha256}">
           <div class="video-thumbnail">
-            <video src="${playableVideoUrl}" muted loop preload="auto" controls onmouseenter="this.play()" onmouseleave="this.pause()"></video>
+            <video src="${playableVideoUrl}" muted loop preload="none" controls onmouseenter="this.play()" onmouseleave="this.pause()"></video>
             <div class="video-overlay">
               <span class="badge ${actionClass}">${action}</span>
               ${manualOverride ? '<span class="badge override-badge">MANUAL</span>' : ''}
