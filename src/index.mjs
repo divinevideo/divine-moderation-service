@@ -2758,9 +2758,19 @@ export default {
       try {
         const upstreamRequestInit = buildAdminVideoProxyRequestInit(request);
 
-        // CDN fetch (unauthenticated) — works for SAFE/unmoderated content
-        const cdnResponse = await fetch(cdnUrl, upstreamRequestInit);
-        if (cdnResponse.ok) {
+        // CDN fetch (unauthenticated) — works for SAFE/unmoderated content.
+        // Per-fetch try/catch: a network error here MUST NOT abort the
+        // whole chain — every later fallback (admin bypass, stored
+        // candidates, nostr imeta) is exactly what's supposed to cover for
+        // a flaky CDN. Without this guard one DNS hiccup or origin
+        // timeout produced a 500 on a video that other paths could serve.
+        let cdnResponse = null;
+        try {
+          cdnResponse = await fetch(cdnUrl, upstreamRequestInit);
+        } catch (cdnFetchError) {
+          console.warn(`[ADMIN] CDN fetch threw for ${sha256}: ${cdnFetchError.message}`);
+        }
+        if (cdnResponse && cdnResponse.ok) {
           const contentType = cdnResponse.headers.get('Content-Type') || 'video/mp4';
 
           // If the format is browser-playable, serve directly
@@ -2772,35 +2782,54 @@ export default {
           // Non-browser format (e.g. video/3gpp, video/x-matroska) — try transcoded 720p MP4 from Blossom
           console.log(`[ADMIN] CDN returned non-playable ${contentType}, trying transcoded 720p for ${sha256}`);
           const transcodeUrl = `https://${cdnDomain}/${sha256}/720p.mp4`;
-          const transcodeResponse = await fetch(transcodeUrl, upstreamRequestInit);
-          if (transcodeResponse.ok) {
-            console.log(`[ADMIN] Serving transcoded 720p MP4 for ${sha256}`);
-            return createAdminVideoProxyResponse(transcodeResponse, 'cdn-transcode');
+          try {
+            const transcodeResponse = await fetch(transcodeUrl, upstreamRequestInit);
+            if (transcodeResponse.ok) {
+              console.log(`[ADMIN] Serving transcoded 720p MP4 for ${sha256}`);
+              return createAdminVideoProxyResponse(transcodeResponse, 'cdn-transcode');
+            }
+            console.warn(`[ADMIN] Transcoded 720p not available (${transcodeResponse.status}) for ${sha256}`);
+          } catch (transcodeFetchError) {
+            console.warn(`[ADMIN] Transcoded 720p fetch threw for ${sha256}: ${transcodeFetchError.message}`);
           }
-          console.warn(`[ADMIN] Transcoded 720p not available (${transcodeResponse.status}) for ${sha256}`);
         }
 
-        // CDN returned non-200 or non-playable with no transcode available
-        // Fall back to admin bypass endpoint which serves regardless of moderation status
+        // CDN returned non-200 or non-playable with no transcode available.
+        // Fall back to admin bypass endpoint which serves regardless of
+        // moderation status. Per-fetch try/catch — same reasoning as above.
         if (env.BLOSSOM_WEBHOOK_SECRET) {
-          console.log(`[ADMIN] CDN returned ${cdnResponse.status}, trying admin bypass for ${sha256}`);
-          const bypassResponse = await fetch(
-            adminBypassUrl,
-            buildAdminVideoProxyRequestInit(request, {
-              'Authorization': `Bearer ${env.BLOSSOM_WEBHOOK_SECRET}`
-            })
-          );
-          if (bypassResponse.ok) {
-            console.log(`[ADMIN] Serving video from admin bypass: ${sha256}`);
-            const moderationStatus = bypassResponse.headers.get('X-Moderation-Status');
-            return createAdminVideoProxyResponse(bypassResponse, 'blossom-admin', {
-              'X-Moderation-Status': moderationStatus
-            });
+          const cdnStatus = cdnResponse ? cdnResponse.status : 'threw';
+          console.log(`[ADMIN] CDN returned ${cdnStatus}, trying admin bypass for ${sha256}`);
+          try {
+            const bypassResponse = await fetch(
+              adminBypassUrl,
+              buildAdminVideoProxyRequestInit(request, {
+                'Authorization': `Bearer ${env.BLOSSOM_WEBHOOK_SECRET}`
+              })
+            );
+            if (bypassResponse.ok) {
+              console.log(`[ADMIN] Serving video from admin bypass: ${sha256}`);
+              const moderationStatus = bypassResponse.headers.get('X-Moderation-Status');
+              return createAdminVideoProxyResponse(bypassResponse, 'blossom-admin', {
+                'X-Moderation-Status': moderationStatus
+              });
+            }
+            console.error(`[ADMIN] Admin bypass returned ${bypassResponse.status} for ${sha256}`);
+          } catch (bypassFetchError) {
+            console.warn(`[ADMIN] Admin bypass fetch threw for ${sha256}: ${bypassFetchError.message}`);
           }
-          console.error(`[ADMIN] Admin bypass returned ${bypassResponse.status} for ${sha256}`);
         }
 
-        const storedPlaybackCandidates = await getStoredAdminPlaybackCandidates(sha256, env);
+        // KV/D1 lookup for alternate playback URLs cached at moderate time.
+        // If the helper itself throws (e.g. KV transient error), don't
+        // abort the chain — the nostr imeta fallback below may still
+        // succeed.
+        let storedPlaybackCandidates = [];
+        try {
+          storedPlaybackCandidates = await getStoredAdminPlaybackCandidates(sha256, env);
+        } catch (storedLookupError) {
+          console.warn(`[ADMIN] Stored playback lookup threw for ${sha256}: ${storedLookupError.message}`);
+        }
         for (const candidate of storedPlaybackCandidates) {
           if (candidate.url === cdnUrl || candidate.url === adminBypassUrl) {
             continue;
@@ -2821,31 +2850,46 @@ export default {
         }
 
         // Last-resort fallback: ask the relay for the Nostr event and try
-        // its imeta `url`. This catches the case where the moderation
-        // pipeline stored content_url as the cdn URL (because nostrContext
-        // wasn't captured at moderate time) — that candidate is correctly
-        // skipped above, leaving us with nothing. For external Blossom
-        // videos (Plebs, etc.) the imeta url is the only working source.
+        // its imeta `url`. KV-cached so a 50-card dashboard render doesn't
+        // open 50 parallel WebSockets — each cache miss writes a 5-min
+        // entry (positive imeta url, or sentinel "" for "no event"), so
+        // subsequent requests skip the relay roundtrip entirely.
+        const imetaCacheKey = `admin-video-imeta:${sha256}`;
+        let imetaUrl = null;
         try {
-          const event = await fetchNostrEventBySha256(sha256, ['wss://relay.divine.video'], env);
-          if (event) {
-            const metadata = parseVideoEventMetadata(event);
-            const relayUrl = metadata?.url || null;
-            if (relayUrl && relayUrl !== cdnUrl && relayUrl !== adminBypassUrl) {
-              try {
-                const relayResponse = await fetch(relayUrl, upstreamRequestInit);
-                if (relayResponse.ok) {
-                  console.log(`[ADMIN] Serving video from nostr-imeta-url: ${sha256}`);
-                  return createAdminVideoProxyResponse(relayResponse, 'nostr-imeta-url');
-                }
-                console.warn(`[ADMIN] Nostr imeta url returned ${relayResponse.status} for ${sha256}`);
-              } catch (relayFetchError) {
-                console.warn(`[ADMIN] Nostr imeta url fetch failed for ${sha256}: ${relayFetchError.message}`);
+          const cached = env.MODERATION_KV ? await env.MODERATION_KV.get(imetaCacheKey) : null;
+          if (cached !== null) {
+            imetaUrl = cached === '' ? null : cached;
+          } else {
+            const event = await fetchNostrEventBySha256(sha256, ['wss://relay.divine.video'], env);
+            const metadata = event ? parseVideoEventMetadata(event) : null;
+            imetaUrl = metadata?.url || null;
+            if (env.MODERATION_KV) {
+              const writePromise = env.MODERATION_KV.put(imetaCacheKey, imetaUrl || '', {
+                expirationTtl: 300
+              }).catch((err) => {
+                console.warn(`[ADMIN] imeta cache write failed for ${sha256}: ${err.message}`);
+              });
+              if (ctx && typeof ctx.waitUntil === 'function') {
+                ctx.waitUntil(writePromise);
               }
             }
           }
         } catch (relayLookupError) {
           console.warn(`[ADMIN] Nostr event lookup failed for ${sha256}: ${relayLookupError.message}`);
+        }
+
+        if (imetaUrl && imetaUrl !== cdnUrl && imetaUrl !== adminBypassUrl) {
+          try {
+            const relayResponse = await fetch(imetaUrl, upstreamRequestInit);
+            if (relayResponse.ok) {
+              console.log(`[ADMIN] Serving video from nostr-imeta-url: ${sha256}`);
+              return createAdminVideoProxyResponse(relayResponse, 'nostr-imeta-url');
+            }
+            console.warn(`[ADMIN] Nostr imeta url returned ${relayResponse.status} for ${sha256}`);
+          } catch (relayFetchError) {
+            console.warn(`[ADMIN] Nostr imeta url fetch failed for ${sha256}: ${relayFetchError.message}`);
+          }
         }
 
         return new Response(JSON.stringify({
