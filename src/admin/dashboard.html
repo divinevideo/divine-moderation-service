@@ -497,6 +497,68 @@
       object-fit: contain;
     }
 
+    /* Card thumbnail: shown in the grid in place of a <video>. Clicking
+       opens the full-screen #video-modal. Browser-native lazy-loading
+       handles the off-screen card images for free. */
+    .video-card-thumb {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      cursor: pointer;
+      display: block;
+      background: #0a0a0a;
+    }
+    .video-card-thumb-fallback {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0a0a0a;
+      color: #666;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .video-card-thumb-fallback:hover { color: #fff; background: #1a1a1a; }
+
+    /* Full-screen video player modal (singleton). */
+    #video-modal.modal.show {
+      display: flex;
+      background: rgba(0, 0, 0, 0.95);
+      padding: 0;
+    }
+    #video-modal .modal-content {
+      background: #000;
+      border: none;
+      border-radius: 0;
+      max-width: 95vw;
+      max-height: 95vh;
+      width: auto;
+      overflow: visible;
+      position: relative;
+    }
+    #video-modal video {
+      display: block;
+      max-width: 95vw;
+      max-height: 95vh;
+      width: auto;
+      height: auto;
+    }
+    #video-modal .modal-close {
+      position: absolute;
+      top: -8px;
+      right: -8px;
+      z-index: 10;
+      background: rgba(0,0,0,0.85);
+      color: #fff;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      font-size: 28px;
+      border: 1px solid #555;
+    }
+
     .video-overlay {
       position: absolute;
       top: 10px;
@@ -3133,9 +3195,10 @@
       const creatorInfoButton = '<button class="action-btn secondary" onclick="openCreatorInfo(\'' + sha256 + '\')">Creator Info</button>';
       const uploaderHistoryPanel = createUploaderHistoryPanel(video);
 
+      const triageThumbSrc = thumbUrl || ('https://media.divine.video/' + sha256 + '.jpg');
       return '<div class="video-card triage" data-sha256="' + sha256 + '" style="border-color: #8b5cf6;">' +
         '<div class="video-thumbnail">' +
-          '<video src="' + videoUrl + '" muted loop preload="none" poster="' + thumbUrl + '" controls onmouseenter="this.play()" onmouseleave="this.pause(); this.currentTime=0;"></video>' +
+          '<img class="video-card-thumb" src="' + triageThumbSrc + '" loading="lazy" alt="" onclick="openVideoModal(\'' + sha256 + '\')" onerror="handleVideoThumbError(this, \'' + sha256 + '\')">' +
           '<div class="video-overlay">' +
             '<span class="badge" style="background: #8b5cf6;">NEW</span>' +
           '</div>' +
@@ -4000,7 +4063,7 @@
       return `
         <div class="video-card ${actionClass}" data-sha256="${sha256}">
           <div class="video-thumbnail">
-            <video src="${playableVideoUrl}" muted loop preload="none" controls onmouseenter="this.play()" onmouseleave="this.pause()"></video>
+            <img class="video-card-thumb" src="https://media.divine.video/${sha256}.jpg" loading="lazy" alt="" onclick="openVideoModal('${sha256}')" onerror="handleVideoThumbError(this, '${sha256}')">
             <div class="video-overlay">
               <span class="badge ${actionClass}">${action}</span>
               ${manualOverride ? '<span class="badge override-badge">MANUAL</span>' : ''}
@@ -5236,6 +5299,13 @@
       if (modal && modal.classList.contains('show')) {
         return;
       }
+      const videoModal = document.getElementById('video-modal');
+      if (videoModal && videoModal.classList.contains('show')) {
+        if (e.key === 'Escape') {
+          closeVideoModal();
+        }
+        return;
+      }
 
       switch(e.key.toLowerCase()) {
         case 'r':
@@ -5250,6 +5320,39 @@
           break;
       }
     });
+
+    // Replace a broken thumbnail <img> with a clickable fallback that
+    // still opens the full-screen modal — covers external Blossom imports
+    // that don't have a divine-side auto-thumbnail.
+    function handleVideoThumbError(img, sha256) {
+      const fallback = document.createElement('div');
+      fallback.className = 'video-card-thumb-fallback';
+      fallback.textContent = '▶ Tap to view';
+      fallback.onclick = () => openVideoModal(sha256);
+      img.replaceWith(fallback);
+    }
+
+    // Card → full-screen modal video. The card itself never embeds a
+    // <video>, so dashboards no longer pay for 50 simultaneous video
+    // fetches just to render. The video element here is reused across
+    // opens; src is cleared on close so the browser stops fetching.
+    function openVideoModal(sha256) {
+      const modal = document.getElementById('video-modal');
+      const video = document.getElementById('video-modal-player');
+      video.src = '/admin/video/' + sha256 + '.mp4';
+      video.load();
+      modal.classList.add('show');
+      video.play().catch(() => { /* autoplay can be rejected by user-gesture rules; controls still work */ });
+    }
+
+    function closeVideoModal() {
+      const modal = document.getElementById('video-modal');
+      const video = document.getElementById('video-modal-player');
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
+      modal.classList.remove('show');
+    }
 
     // Load TRIAGE videos by default (new videos needing moderation)
     document.getElementById('lookup-input').addEventListener('keydown', (e) => {
@@ -5357,6 +5460,14 @@
         <button class="btn-cancel" onclick="closeEditModal()">Cancel</button>
         <button class="btn-save" onclick="saveEdits()">Save Changes</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Full-screen Video Player Modal (singleton) -->
+  <div class="modal" id="video-modal" onclick="if(event.target===this)closeVideoModal()">
+    <div class="modal-content">
+      <button class="modal-close" onclick="closeVideoModal()" aria-label="Close">&times;</button>
+      <video id="video-modal-player" controls playsinline></video>
     </div>
   </div>
 
