@@ -208,7 +208,12 @@ export async function pollRelayForReports(env, options = {}) {
     targetUnavailable: 0,
     errors: [],
     reports: [],
+    maxTerminalCreatedAt: null,
+    safeCheckpoint: null,
   };
+  const terminalCreatedAts = [];
+  const retryableCreatedAts = [];
+  let hasUnboundedRetryableError = false;
 
   console.log(`[REPORT-POLLER] Starting poll from ${relays.join(', ')} since ${new Date(since * 1000).toISOString()}`);
 
@@ -219,6 +224,9 @@ export async function pollRelayForReports(env, options = {}) {
 
       for (const report of reports) {
         results.totalReports++;
+        const reportCreatedAt = Number.isInteger(report?.created_at) && report.created_at > 0
+          ? report.created_at
+          : null;
 
         try {
           const outcome = await processReportEvent(report, {
@@ -235,8 +243,17 @@ export async function pollRelayForReports(env, options = {}) {
             results.alreadyProcessed++;
           } else if (outcome.status === 'target_unavailable') {
             results.targetUnavailable++;
+            if (reportCreatedAt !== null) {
+              retryableCreatedAts.push(reportCreatedAt);
+            } else {
+              hasUnboundedRetryableError = true;
+            }
           } else {
             results.skipped++;
+          }
+
+          if (outcome.status !== 'target_unavailable' && reportCreatedAt !== null) {
+            terminalCreatedAts.push(reportCreatedAt);
           }
         } catch (error) {
           console.error(`[REPORT-POLLER] Failed to process report ${report?.id || '<missing-id>'}:`, error);
@@ -244,6 +261,11 @@ export async function pollRelayForReports(env, options = {}) {
             reportId: report?.id || null,
             error: error?.message || String(error),
           });
+          if (reportCreatedAt !== null) {
+            retryableCreatedAts.push(reportCreatedAt);
+          } else {
+            hasUnboundedRetryableError = true;
+          }
         }
       }
     } catch (error) {
@@ -252,7 +274,22 @@ export async function pollRelayForReports(env, options = {}) {
         relay: relayUrl,
         error: error?.message || String(error),
       });
+      hasUnboundedRetryableError = true;
     }
+  }
+
+  const earliestRetryableCreatedAt = retryableCreatedAts.length > 0
+    ? Math.min(...retryableCreatedAts)
+    : null;
+  const safeTerminalCreatedAts = hasUnboundedRetryableError
+    ? []
+    : terminalCreatedAts.filter((createdAt) =>
+      earliestRetryableCreatedAt === null || createdAt < earliestRetryableCreatedAt
+    );
+
+  if (safeTerminalCreatedAts.length > 0) {
+    results.maxTerminalCreatedAt = Math.max(...safeTerminalCreatedAts);
+    results.safeCheckpoint = results.maxTerminalCreatedAt;
   }
 
   console.log(`[REPORT-POLLER] Poll complete: ${results.totalReports} reports, ${results.recorded} recorded, ${results.skipped} skipped`);

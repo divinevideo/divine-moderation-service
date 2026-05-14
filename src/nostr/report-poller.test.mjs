@@ -477,6 +477,8 @@ describe('report polling', () => {
         alreadyProcessed: 1,
         skipped: 1,
         targetUnavailable: 1,
+        safeCheckpoint: 1778692784,
+        maxTerminalCreatedAt: 1778692784,
       });
       expect(result.reports).toEqual([
         expect.objectContaining({ status: 'recorded' }),
@@ -490,6 +492,65 @@ describe('report polling', () => {
     } finally {
       consoleLog.mockRestore();
       consoleError.mockRestore();
+    }
+  });
+
+  it('uses the newest terminal report timestamp as the safe checkpoint when every report is terminal', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv(new Map([[processedReportKey('b'.repeat(64)), '{"status":"recorded"}']]));
+    const reports = [
+      {
+        id: REPORT_EVENT_ID,
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692782,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: 'b'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692783,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: '3'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692784,
+        tags: [['client', 'diVine']],
+        content: '',
+      },
+    ];
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 3,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async () => reports,
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(result).toMatchObject({
+        totalReports: 3,
+        recorded: 1,
+        alreadyProcessed: 1,
+        skipped: 1,
+        targetUnavailable: 0,
+        safeCheckpoint: 1778692784,
+        maxTerminalCreatedAt: 1778692784,
+      });
+      expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
     }
   });
 });

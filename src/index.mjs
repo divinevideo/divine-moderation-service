@@ -4780,15 +4780,30 @@ async function runMigration() {
             relays,
           });
 
-          await setLastReportPollTimestamp(env, Math.floor(Date.now() / 1000), {
+          const pollStats = {
             totalReports: results.totalReports,
             recorded: results.recorded,
             alreadyProcessed: results.alreadyProcessed,
             skipped: results.skipped,
             targetUnavailable: results.targetUnavailable,
             errors: results.errors.length,
+            safeCheckpoint: results.safeCheckpoint,
             trigger: 'cron',
-          });
+          };
+
+          if (results.safeCheckpoint) {
+            await setLastReportPollTimestamp(env, results.safeCheckpoint, pollStats);
+          } else {
+            console.log('[REPORT-POLLER] No safe checkpoint from this run; leaving report checkpoint unchanged');
+            try {
+              await env.MODERATION_KV.put('report-poller:last-run', JSON.stringify({
+                ...pollStats,
+                timestamp: new Date().toISOString(),
+              }));
+            } catch (kvError) {
+              console.error('[REPORT-POLLER] Failed to store last run stats:', kvError);
+            }
+          }
 
           console.log(`[REPORT-POLLER] Cron complete: ${results.totalReports} reports found, ${results.recorded} recorded, ${results.skipped} skipped, ${results.targetUnavailable} target unavailable, ${results.errors.length} errors`);
         } catch (error) {
