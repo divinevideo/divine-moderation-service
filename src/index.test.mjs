@@ -3491,7 +3491,7 @@ describe('Report polling cron integration', () => {
       RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'true',
       REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
-      REPORT_POLLING_LIMIT: '2',
+      REPORT_POLLING_LIMIT: '3',
       REPORT_POLLING_MAX_PAGES: '5',
       BLOSSOM_DB: createDbMock(),
       MODERATION_KV: {
@@ -3551,13 +3551,22 @@ describe('Report polling cron integration', () => {
         const filter = message[2];
         websocketRequests.push({ url: this.url, filter });
         const subscriptionId = message[1];
-        const reports = filter.until === 1778692782
+        const reports = filter.until === 1778692783
           ? [
             {
               id: 'c'.repeat(64),
               kind: 1984,
               pubkey: reporterPubkey,
-              created_at: 1778692782,
+              created_at: 1778692783,
+              tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
+              content: 'Reason: spam',
+              sig: '7'.repeat(128),
+            },
+            {
+              id: 'd'.repeat(64),
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692783,
               tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
               content: 'Reason: spam',
               sig: '7'.repeat(128),
@@ -3568,13 +3577,22 @@ describe('Report polling cron integration', () => {
               id: 'a'.repeat(64),
               kind: 1984,
               pubkey: reporterPubkey,
-              created_at: 1778692784,
+              created_at: 1778692785,
               tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
               content: 'Reason: spam',
               sig: '7'.repeat(128),
             },
             {
               id: 'b'.repeat(64),
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692783,
+              tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
+              content: 'Reason: spam',
+              sig: '7'.repeat(128),
+            },
+            {
+              id: 'c'.repeat(64),
               kind: 1984,
               pubkey: reporterPubkey,
               created_at: 1778692783,
@@ -3613,20 +3631,20 @@ describe('Report polling cron integration', () => {
     expect(websocketRequests).toEqual([
       {
         url: 'wss://reports.example.test',
-        filter: expect.objectContaining({ kinds: [1984], limit: 2 }),
+        filter: expect.objectContaining({ kinds: [1984], limit: 3 }),
       },
       {
         url: 'wss://reports.example.test',
-        filter: expect.objectContaining({ kinds: [1984], limit: 2, until: 1778692782 }),
+        filter: expect.objectContaining({ kinds: [1984], limit: 3, until: 1778692783 }),
       },
     ]);
     expect(checkpointWrites).toHaveLength(1);
     expect(checkpointWrites[0]).toMatchObject({
-      timestamp: 1778692784,
-      totalReports: 3,
-      recorded: 3,
+      timestamp: 1778692785,
+      totalReports: 4,
+      recorded: 4,
       saturated: false,
-      safeCheckpoint: 1778692784,
+      safeCheckpoint: 1778692785,
       trigger: 'cron',
     });
   });

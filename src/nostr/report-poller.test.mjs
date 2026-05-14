@@ -603,7 +603,7 @@ describe('report polling', () => {
     }
   });
 
-  it('drains saturated pages with until and exposes a checkpoint when the final page is not saturated', async () => {
+  it('drains saturated pages with inclusive until overlap and exposes a checkpoint when the final page is not saturated', async () => {
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
     const kv = createKv();
     const fetchCalls = [];
@@ -613,7 +613,7 @@ describe('report polling', () => {
           id: REPORT_EVENT_ID,
           kind: 1984,
           pubkey: REPORTER,
-          created_at: 1778692784,
+          created_at: 1778692785,
           tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
           content: '',
         },
@@ -625,13 +625,29 @@ describe('report polling', () => {
           tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
           content: '',
         },
+        {
+          id: '2'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692783,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
       ]],
-      [1778692782, [
+      [1778692783, [
+        {
+          id: '2'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692783,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
         {
           id: '3'.repeat(64),
           kind: 1984,
           pubkey: REPORTER,
-          created_at: 1778692782,
+          created_at: 1778692783,
           tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
           content: '',
         },
@@ -645,7 +661,7 @@ describe('report polling', () => {
         RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
       }, {
         since: 1778680000,
-        limit: 2,
+        limit: 3,
         maxPages: 5,
         relays: ['wss://relay.divine.video'],
         fetchReportsFromRelay: async (relayUrl, query) => {
@@ -657,15 +673,15 @@ describe('report polling', () => {
       });
 
       expect(fetchCalls).toEqual([
-        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2 } },
-        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2, until: 1778692782 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 3 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 3, until: 1778692783 } },
       ]);
       expect(result).toMatchObject({
-        totalReports: 3,
-        recorded: 3,
+        totalReports: 4,
+        recorded: 4,
         saturated: false,
-        safeCheckpoint: 1778692784,
-        maxTerminalCreatedAt: 1778692784,
+        safeCheckpoint: 1778692785,
+        maxTerminalCreatedAt: 1778692785,
       });
       expect(result.errors).toEqual([]);
     } finally {
@@ -696,12 +712,12 @@ describe('report polling', () => {
           content: '',
         },
       ]],
-      [1778692782, [
+      [1778692783, [
         {
           id: '3'.repeat(64),
           kind: 1984,
           pubkey: REPORTER,
-          created_at: 1778692782,
+          created_at: 1778692783,
           tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
           content: '',
         },
@@ -735,7 +751,7 @@ describe('report polling', () => {
       });
 
       expect(fetchCalls).toHaveLength(2);
-      expect(fetchCalls[1].query.until).toBe(1778692782);
+      expect(fetchCalls[1].query.until).toBe(1778692783);
       expect(result).toMatchObject({
         totalReports: 4,
         recorded: 4,
@@ -748,28 +764,48 @@ describe('report polling', () => {
     }
   });
 
-  it('treats a saturated same-timestamp page as unsafe and does not skip that timestamp boundary', async () => {
+  it('keeps saturation when an inclusive overlap page only returns duplicate report ids', async () => {
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
     const kv = createKv();
     const fetchCalls = [];
-    const reports = [
-      {
-        id: REPORT_EVENT_ID,
-        kind: 1984,
-        pubkey: REPORTER,
-        created_at: 1778692784,
-        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
-        content: '',
-      },
-      {
-        id: 'b'.repeat(64),
-        kind: 1984,
-        pubkey: REPORTER,
-        created_at: 1778692784,
-        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
-        content: '',
-      },
-    ];
+    const reportsByUntil = new Map([
+      [undefined, [
+        {
+          id: REPORT_EVENT_ID,
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ]],
+      [1778692784, [
+        {
+          id: REPORT_EVENT_ID,
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ]],
+    ]);
 
     try {
       const result = await pollRelayForReports({
@@ -783,7 +819,7 @@ describe('report polling', () => {
         relays: ['wss://relay.divine.video'],
         fetchReportsFromRelay: async (relayUrl, query) => {
           fetchCalls.push({ relayUrl, query });
-          return query.until === undefined ? reports : [];
+          return reportsByUntil.get(query.until);
         },
         fetchTargetEvent: async () => TARGET,
         recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
@@ -791,6 +827,7 @@ describe('report polling', () => {
 
       expect(fetchCalls).toEqual([
         { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2, until: 1778692784 } },
       ]);
       expect(result).toMatchObject({
         totalReports: 2,
@@ -805,35 +842,65 @@ describe('report polling', () => {
     }
   });
 
-  it('treats a saturated page with duplicate lower-boundary timestamps as unsafe', async () => {
+  it('keeps fetching same-timestamp full pages until overlap stops discovering new report ids', async () => {
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
     const kv = createKv();
     const fetchCalls = [];
-    const reports = [
-      {
-        id: REPORT_EVENT_ID,
-        kind: 1984,
-        pubkey: REPORTER,
-        created_at: 1778692785,
-        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
-        content: '',
-      },
-      {
-        id: 'b'.repeat(64),
-        kind: 1984,
-        pubkey: REPORTER,
-        created_at: 1778692784,
-        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
-        content: '',
-      },
-      {
-        id: '1'.repeat(64),
-        kind: 1984,
-        pubkey: REPORTER,
-        created_at: 1778692784,
-        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
-        content: '',
-      },
+    const overlappingPages = [
+      [
+        {
+          id: REPORT_EVENT_ID,
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ],
+      [
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: '1'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ],
+      [
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: '1'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ],
     ];
 
     try {
@@ -843,19 +910,21 @@ describe('report polling', () => {
         RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
       }, {
         since: 1778680000,
-        limit: 3,
+        limit: 2,
         maxPages: 5,
         relays: ['wss://relay.divine.video'],
         fetchReportsFromRelay: async (relayUrl, query) => {
           fetchCalls.push({ relayUrl, query });
-          return query.until === undefined ? reports : [];
+          return overlappingPages[fetchCalls.length - 1] ?? [];
         },
         fetchTargetEvent: async () => TARGET,
         recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
       });
 
       expect(fetchCalls).toEqual([
-        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 3 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2, until: 1778692784 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2, until: 1778692784 } },
       ]);
       expect(result).toMatchObject({
         totalReports: 3,

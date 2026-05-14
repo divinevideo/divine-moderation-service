@@ -232,6 +232,7 @@ export async function pollRelayForReports(env, options = {}) {
         const reports = await fetchReports(relayUrl, query, env);
         console.log(`[REPORT-POLLER] Fetched ${reports.length} reports from ${relayUrl} page ${page}`);
 
+        let pageNewReportIds = 0;
         for (const report of reports) {
           const reportId = typeof report?.id === 'string' ? report.id.toLowerCase() : null;
           if (reportId && seenReportIds.has(reportId)) {
@@ -239,6 +240,7 @@ export async function pollRelayForReports(env, options = {}) {
           }
           if (reportId) {
             seenReportIds.add(reportId);
+            pageNewReportIds++;
           }
 
           results.totalReports++;
@@ -291,6 +293,11 @@ export async function pollRelayForReports(env, options = {}) {
           break;
         }
 
+        if (pageNewReportIds === 0) {
+          results.saturated = true;
+          break;
+        }
+
         if (page >= pageLimit) {
           results.saturated = true;
           break;
@@ -303,14 +310,7 @@ export async function pollRelayForReports(env, options = {}) {
           results.saturated = true;
           break;
         }
-        const minCreatedAt = Math.min(...createdAts);
-        const maxCreatedAt = Math.max(...createdAts);
-        const minCreatedAtCount = createdAts.filter((createdAt) => createdAt === minCreatedAt).length;
-        if (minCreatedAt === maxCreatedAt || minCreatedAtCount > 1) {
-          results.saturated = true;
-          break;
-        }
-        until = minCreatedAt - 1;
+        until = Math.min(...createdAts);
       }
     } catch (error) {
       console.error(`[REPORT-POLLER] Failed to poll ${relayUrl}:`, error);
