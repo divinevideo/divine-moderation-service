@@ -3477,6 +3477,159 @@ describe('Report polling cron integration', () => {
       trigger: 'cron',
     });
   });
+
+  it('advances report checkpoint when bounded drain resolves saturation', async () => {
+    const targetEventId = '1'.repeat(64);
+    const reporterPubkey = '3'.repeat(64);
+    const uploaderPubkey = '4'.repeat(64);
+    const sha256 = '5'.repeat(64);
+    const kvStore = new Map();
+    const checkpointWrites = [];
+    const websocketRequests = [];
+
+    const env = createEnv({
+      RELAY_POLLING_ENABLED: 'false',
+      REPORT_POLLING_ENABLED: 'true',
+      REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
+      REPORT_POLLING_LIMIT: '2',
+      REPORT_POLLING_MAX_PAGES: '5',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get(key) {
+          return kvStore.get(key) ?? null;
+        },
+        async put(key, value, options) {
+          if (key === 'report-poller:last-poll') {
+            checkpointWrites.push(JSON.parse(value));
+          }
+          kvStore.set(key, value);
+        },
+        async delete(key) {
+          kvStore.delete(key);
+        },
+        async list() {
+          return { keys: [], list_complete: true, cursor: null };
+        },
+      },
+    });
+
+    const originalFetch = globalThis.fetch;
+    const OriginalWebSocket = globalThis.WebSocket;
+
+    globalThis.fetch = async (url) => {
+      if (url === `https://reports.example.test/api/event/${targetEventId}`) {
+        return new Response(JSON.stringify({
+          id: targetEventId,
+          kind: 34236,
+          pubkey: uploaderPubkey,
+          created_at: 1778692000,
+          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
+          content: '',
+          sig: '6'.repeat(128),
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    globalThis.WebSocket = class {
+      constructor(url) {
+        this.url = url;
+        this.listeners = {};
+        queueMicrotask(() => this.listeners.open?.({}));
+      }
+
+      addEventListener(type, listener) {
+        this.listeners[type] = listener;
+      }
+
+      send(payload) {
+        const message = JSON.parse(payload);
+        if (message[0] !== 'REQ') {
+          return;
+        }
+
+        const filter = message[2];
+        websocketRequests.push({ url: this.url, filter });
+        const subscriptionId = message[1];
+        const reports = filter.until === 1778692782
+          ? [
+            {
+              id: 'c'.repeat(64),
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692782,
+              tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
+              content: 'Reason: spam',
+              sig: '7'.repeat(128),
+            },
+          ]
+          : [
+            {
+              id: 'a'.repeat(64),
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692784,
+              tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
+              content: 'Reason: spam',
+              sig: '7'.repeat(128),
+            },
+            {
+              id: 'b'.repeat(64),
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692783,
+              tags: [['e', targetEventId, 'other'], ['client', 'diVine']],
+              content: 'Reason: spam',
+              sig: '7'.repeat(128),
+            },
+          ];
+
+        queueMicrotask(() => {
+          for (const report of reports) {
+            this.listeners.message?.({
+              data: JSON.stringify(['EVENT', subscriptionId, report]),
+            });
+          }
+          this.listeners.message?.({ data: JSON.stringify(['EOSE', subscriptionId]) });
+        });
+      }
+
+      close() {
+        this.listeners.close?.({});
+      }
+    };
+
+    try {
+      await worker.scheduled(
+        { cron: '*/5 * * * *', scheduledTime: Date.now() },
+        env,
+        { waitUntil: () => {} },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = OriginalWebSocket;
+    }
+
+    expect(websocketRequests).toEqual([
+      {
+        url: 'wss://reports.example.test',
+        filter: expect.objectContaining({ kinds: [1984], limit: 2 }),
+      },
+      {
+        url: 'wss://reports.example.test',
+        filter: expect.objectContaining({ kinds: [1984], limit: 2, until: 1778692782 }),
+      },
+    ]);
+    expect(checkpointWrites).toHaveLength(1);
+    expect(checkpointWrites[0]).toMatchObject({
+      timestamp: 1778692784,
+      totalReports: 3,
+      recorded: 3,
+      saturated: false,
+      safeCheckpoint: 1778692784,
+      trigger: 'cron',
+    });
+  });
 });
 
 describe('Transcript reprocess cron integration', () => {

@@ -602,4 +602,149 @@ describe('report polling', () => {
       consoleLog.mockRestore();
     }
   });
+
+  it('drains saturated pages with until and exposes a checkpoint when the final page is not saturated', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+    const fetchCalls = [];
+    const reportsByUntil = new Map([
+      [undefined, [
+        {
+          id: REPORT_EVENT_ID,
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692783,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ]],
+      [1778692782, [
+        {
+          id: '3'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692782,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ]],
+    ]);
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 2,
+        maxPages: 5,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async (relayUrl, query) => {
+          fetchCalls.push({ relayUrl, query });
+          return reportsByUntil.get(query.until);
+        },
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(fetchCalls).toEqual([
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2 } },
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2, until: 1778692782 } },
+      ]);
+      expect(result).toMatchObject({
+        totalReports: 3,
+        recorded: 3,
+        saturated: false,
+        safeCheckpoint: 1778692784,
+        maxTerminalCreatedAt: 1778692784,
+      });
+      expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
+
+  it('keeps saturation and suppresses checkpoint when max pages are all full', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+    const fetchCalls = [];
+    const reportsByUntil = new Map([
+      [undefined, [
+        {
+          id: REPORT_EVENT_ID,
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692784,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: 'b'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692783,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ]],
+      [1778692782, [
+        {
+          id: '3'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692782,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+        {
+          id: '4'.repeat(64),
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692781,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: '',
+        },
+      ]],
+    ]);
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 2,
+        maxPages: 2,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async (relayUrl, query) => {
+          fetchCalls.push({ relayUrl, query });
+          return reportsByUntil.get(query.until);
+        },
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(fetchCalls).toHaveLength(2);
+      expect(fetchCalls[1].query.until).toBe(1778692782);
+      expect(result).toMatchObject({
+        totalReports: 4,
+        recorded: 4,
+        saturated: true,
+        safeCheckpoint: null,
+      });
+      expect(result.maxTerminalCreatedAt).toBeNull();
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
 });

@@ -75,7 +75,7 @@ export function processedReportKey(reportEventId) {
   return `${PROCESSED_PREFIX}${reportEventId}`;
 }
 
-export async function fetchReportsFromRelay(relayUrl, { since, limit }, env = {}) {
+export async function fetchReportsFromRelay(relayUrl, { since, until, limit }, env = {}) {
   return new Promise((resolve, reject) => {
     const reports = [];
     let ws;
@@ -112,7 +112,10 @@ export async function fetchReportsFromRelay(relayUrl, { since, limit }, env = {}
 
       ws.addEventListener('open', () => {
         const filter = { kinds: [1984], since, limit };
-        console.log(`[REPORT-POLLER] Sending REQ to ${relayUrl}: kinds=[1984], since=${since}, limit=${limit}`);
+        if (Number.isInteger(until)) {
+          filter.until = until;
+        }
+        console.log(`[REPORT-POLLER] Sending REQ to ${relayUrl}: kinds=[1984], since=${since}, until=${filter.until ?? '<none>'}, limit=${limit}`);
         ws.send(JSON.stringify(['REQ', subscriptionId, filter]));
       });
 
@@ -189,6 +192,7 @@ export async function pollRelayForReports(env, options = {}) {
   const {
     since = Math.floor(Date.now() / 1000) - 3600,
     limit = 100,
+    maxPages = parseInt(env.REPORT_POLLING_MAX_PAGES || '5', 10),
     relays = ['wss://relay.divine.video'],
     fetchReportsFromRelay: injectedFetchReportsFromRelay,
     fetchTargetEvent: injectedFetchTargetEvent,
@@ -214,63 +218,92 @@ export async function pollRelayForReports(env, options = {}) {
   };
   const terminalCreatedAts = [];
   const retryableCreatedAts = [];
+  const seenReportIds = new Set();
   let hasUnboundedRetryableError = false;
+  const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? Math.floor(maxPages) : 5;
 
   console.log(`[REPORT-POLLER] Starting poll from ${relays.join(', ')} since ${new Date(since * 1000).toISOString()}`);
 
   for (const relayUrl of relays) {
     try {
-      const reports = await fetchReports(relayUrl, { since, limit }, env);
-      console.log(`[REPORT-POLLER] Fetched ${reports.length} reports from ${relayUrl}`);
-      if (reports.length >= limit) {
-        results.saturated = true;
-      }
+      let until = null;
+      for (let page = 1; page <= pageLimit; page++) {
+        const query = Number.isInteger(until) ? { since, limit, until } : { since, limit };
+        const reports = await fetchReports(relayUrl, query, env);
+        console.log(`[REPORT-POLLER] Fetched ${reports.length} reports from ${relayUrl} page ${page}`);
 
-      for (const report of reports) {
-        results.totalReports++;
-        const reportCreatedAt = Number.isInteger(report?.created_at) && report.created_at > 0
-          ? report.created_at
-          : null;
+        for (const report of reports) {
+          const reportId = typeof report?.id === 'string' ? report.id.toLowerCase() : null;
+          if (reportId && seenReportIds.has(reportId)) {
+            continue;
+          }
+          if (reportId) {
+            seenReportIds.add(reportId);
+          }
 
-        try {
-          const outcome = await processReportEvent(report, {
-            kv: env.MODERATION_KV,
-            requireDivineClient,
-            fetchTargetEvent,
-            recordReport,
-          });
+          results.totalReports++;
+          const reportCreatedAt = Number.isInteger(report?.created_at) && report.created_at > 0
+            ? report.created_at
+            : null;
 
-          results.reports.push(outcome);
-          if (outcome.status === 'recorded') {
-            results.recorded++;
-          } else if (outcome.status === 'already_processed') {
-            results.alreadyProcessed++;
-          } else if (outcome.status === 'target_unavailable') {
-            results.targetUnavailable++;
+          try {
+            const outcome = await processReportEvent(report, {
+              kv: env.MODERATION_KV,
+              requireDivineClient,
+              fetchTargetEvent,
+              recordReport,
+            });
+
+            results.reports.push(outcome);
+            if (outcome.status === 'recorded') {
+              results.recorded++;
+            } else if (outcome.status === 'already_processed') {
+              results.alreadyProcessed++;
+            } else if (outcome.status === 'target_unavailable') {
+              results.targetUnavailable++;
+              if (reportCreatedAt !== null) {
+                retryableCreatedAts.push(reportCreatedAt);
+              } else {
+                hasUnboundedRetryableError = true;
+              }
+            } else {
+              results.skipped++;
+            }
+
+            if (outcome.status !== 'target_unavailable' && reportCreatedAt !== null) {
+              terminalCreatedAts.push(reportCreatedAt);
+            }
+          } catch (error) {
+            console.error(`[REPORT-POLLER] Failed to process report ${report?.id || '<missing-id>'}:`, error);
+            results.errors.push({
+              reportId: report?.id || null,
+              error: error?.message || String(error),
+            });
             if (reportCreatedAt !== null) {
               retryableCreatedAts.push(reportCreatedAt);
             } else {
               hasUnboundedRetryableError = true;
             }
-          } else {
-            results.skipped++;
-          }
-
-          if (outcome.status !== 'target_unavailable' && reportCreatedAt !== null) {
-            terminalCreatedAts.push(reportCreatedAt);
-          }
-        } catch (error) {
-          console.error(`[REPORT-POLLER] Failed to process report ${report?.id || '<missing-id>'}:`, error);
-          results.errors.push({
-            reportId: report?.id || null,
-            error: error?.message || String(error),
-          });
-          if (reportCreatedAt !== null) {
-            retryableCreatedAts.push(reportCreatedAt);
-          } else {
-            hasUnboundedRetryableError = true;
           }
         }
+
+        if (reports.length < limit) {
+          break;
+        }
+
+        if (page >= pageLimit) {
+          results.saturated = true;
+          break;
+        }
+
+        const createdAts = reports
+          .map((report) => report?.created_at)
+          .filter((createdAt) => Number.isInteger(createdAt) && createdAt > 0);
+        if (createdAts.length === 0) {
+          results.saturated = true;
+          break;
+        }
+        until = Math.min(...createdAts) - 1;
       }
     } catch (error) {
       console.error(`[REPORT-POLLER] Failed to poll ${relayUrl}:`, error);

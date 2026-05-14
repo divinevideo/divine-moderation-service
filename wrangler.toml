@@ -122,6 +122,7 @@ REPORT_POLLING_ENABLED = "true"                   # Enable/disable inbound NIP-5
 REPORT_POLLING_RELAY_URL = "wss://relay.divine.video" # Relay to poll for kind 1984 reports
 REPORT_POLLING_LOOKBACK_HOURS = "24"              # How far back to look for reports on first run
 REPORT_POLLING_LIMIT = "100"                      # Max reports to fetch per poll
+REPORT_POLLING_MAX_PAGES = "5"                    # Max bounded pages to drain per report poll
 RELAY_REPORTS_REQUIRE_DIVINE_CLIENT = "true"      # Only ingest reports tagged as sent by diVine
 
 # Funnelcake admin URL — destination for notifyRelay() NIP-98 add/remove

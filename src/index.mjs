@@ -4777,6 +4777,7 @@ async function runMigration() {
           const results = await pollRelayForReports(env, {
             since,
             limit: parseInt(env.REPORT_POLLING_LIMIT || '100', 10),
+            maxPages: parseInt(env.REPORT_POLLING_MAX_PAGES || '5', 10),
             relays,
           });
 
