@@ -3044,6 +3044,42 @@ describe('Report polling cron integration', () => {
     });
   });
 
+  it('does not return report polling status for POST requests', async () => {
+    const env = createEnv({
+      ALLOW_DEV_ACCESS: 'true',
+      REPORT_POLLING_ENABLED: 'true',
+      MODERATION_KV: {
+        async get(key) {
+          if (key === 'report-poller:last-poll') {
+            return JSON.stringify({
+              timestamp: 1778692782,
+              lastPollAt: '2026-05-13T17:20:00.000Z',
+              totalReports: 3,
+              recorded: 2,
+              errors: 1,
+            });
+          }
+          return null;
+        },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; },
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/report-polling/status', {
+        method: 'POST',
+      }),
+      env,
+    );
+
+    expect(response.headers.get('Content-Type') || '').not.toContain('application/json');
+    const body = await response.text();
+    expect(body).not.toContain('"totalReports":3');
+    expect(body).not.toContain('"recorded":2');
+  });
+
   it('runs inbound report polling and records kind 1984 reports for review', async () => {
     const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);

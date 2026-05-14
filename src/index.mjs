@@ -2685,7 +2685,7 @@ export default {
     }
 
     // Get report polling status
-    if (url.pathname === '/admin/api/report-polling/status') {
+    if (url.pathname === '/admin/api/report-polling/status' && request.method === 'GET') {
       const authError = await requireAuth(request, env);
       if (authError) {
         console.log(`[${requestId}] Unauthorized access to report-polling/status`);
