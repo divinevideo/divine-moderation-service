@@ -3572,6 +3572,201 @@ describe('Report polling cron integration', () => {
     });
   });
 
+  it('continues report polling from a saturated resume boundary', async () => {
+    const previousCheckpoint = 1778600000;
+    const resumeUntil = 1778692781;
+    const kvStore = new Map([
+      ['report-poller:last-poll', JSON.stringify({ timestamp: previousCheckpoint, lastPollAt: '2026-05-12T00:00:00.000Z' })],
+      ['report-poller:last-run', JSON.stringify({ saturated: true, safeCheckpoint: null, resumeUntil })],
+    ]);
+    const websocketRequests = [];
+
+    const env = createEnv({
+      RELAY_POLLING_ENABLED: 'false',
+      REPORT_POLLING_ENABLED: 'true',
+      REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
+      REPORT_POLLING_LIMIT: '50',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get(key) {
+          return kvStore.get(key) ?? null;
+        },
+        async put(key, value) {
+          kvStore.set(key, value);
+        },
+        async delete(key) {
+          kvStore.delete(key);
+        },
+        async list() {
+          return { keys: [], list_complete: true, cursor: null };
+        },
+      },
+    });
+
+    const OriginalWebSocket = globalThis.WebSocket;
+    globalThis.WebSocket = class {
+      constructor() {
+        this.listeners = {};
+        queueMicrotask(() => this.listeners.open?.({}));
+      }
+
+      addEventListener(type, listener) {
+        this.listeners[type] = listener;
+      }
+
+      send(payload) {
+        const message = JSON.parse(payload);
+        if (message[0] !== 'REQ') {
+          return;
+        }
+        websocketRequests.push(message);
+        const subscriptionId = message[1];
+        queueMicrotask(() => {
+          this.listeners.message?.({ data: JSON.stringify(['EOSE', subscriptionId]) });
+        });
+      }
+
+      close() {
+        this.listeners.close?.({});
+      }
+    };
+
+    try {
+      await worker.scheduled(
+        { cron: '*/5 * * * *', scheduledTime: Date.now() },
+        env,
+        { waitUntil: () => {} },
+      );
+    } finally {
+      globalThis.WebSocket = OriginalWebSocket;
+    }
+
+    expect(websocketRequests).toHaveLength(1);
+    expect(websocketRequests[0][2]).toEqual({
+      kinds: [1984],
+      since: previousCheckpoint,
+      until: resumeUntil,
+      limit: 50,
+    });
+  });
+
+  it('clears stale saturated resume boundaries after a successful resume checkpoint', async () => {
+    const previousCheckpoint = 1778600000;
+    const resumeUntil = 1778692781;
+    const targetEventId = '1'.repeat(64);
+    const reportEventId = '2'.repeat(64);
+    const reporterPubkey = '3'.repeat(64);
+    const uploaderPubkey = '4'.repeat(64);
+    const sha256 = '5'.repeat(64);
+    const kvStore = new Map([
+      ['report-poller:last-poll', JSON.stringify({ timestamp: previousCheckpoint, lastPollAt: '2026-05-12T00:00:00.000Z' })],
+      ['report-poller:last-run', JSON.stringify({ saturated: true, safeCheckpoint: null, resumeUntil })],
+    ]);
+    const lastRunWrites = [];
+
+    const env = createEnv({
+      RELAY_POLLING_ENABLED: 'false',
+      REPORT_POLLING_ENABLED: 'true',
+      REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
+      REPORT_POLLING_LIMIT: '50',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get(key) {
+          return kvStore.get(key) ?? null;
+        },
+        async put(key, value) {
+          if (key === 'report-poller:last-run') {
+            lastRunWrites.push(JSON.parse(value));
+          }
+          kvStore.set(key, value);
+        },
+        async delete(key) {
+          kvStore.delete(key);
+        },
+        async list() {
+          return { keys: [], list_complete: true, cursor: null };
+        },
+      },
+    });
+
+    const originalFetch = globalThis.fetch;
+    const OriginalWebSocket = globalThis.WebSocket;
+
+    globalThis.fetch = async (url) => {
+      if (url === `https://reports.example.test/api/event/${targetEventId}`) {
+        return new Response(JSON.stringify({
+          id: targetEventId,
+          kind: 34236,
+          pubkey: uploaderPubkey,
+          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
+          content: '',
+          sig: '6'.repeat(128),
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    globalThis.WebSocket = class {
+      constructor() {
+        this.listeners = {};
+        queueMicrotask(() => this.listeners.open?.({}));
+      }
+
+      addEventListener(type, listener) {
+        this.listeners[type] = listener;
+      }
+
+      send(payload) {
+        const message = JSON.parse(payload);
+        if (message[0] !== 'REQ') {
+          return;
+        }
+        const subscriptionId = message[1];
+        queueMicrotask(() => {
+          this.listeners.message?.({
+            data: JSON.stringify(['EVENT', subscriptionId, {
+              id: reportEventId,
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692780,
+              tags: [['e', targetEventId, 'nudity'], ['client', 'diVine']],
+              content: '',
+              sig: '7'.repeat(128),
+            }]),
+          });
+          this.listeners.message?.({ data: JSON.stringify(['EOSE', subscriptionId]) });
+        });
+      }
+
+      close() {
+        this.listeners.close?.({});
+      }
+    };
+
+    try {
+      await worker.scheduled(
+        { cron: '*/5 * * * *', scheduledTime: Date.now() },
+        env,
+        { waitUntil: () => {} },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = OriginalWebSocket;
+    }
+
+    expect(JSON.parse(kvStore.get('report-poller:last-poll'))).toMatchObject({
+      timestamp: 1778692780,
+      saturated: false,
+      resumeUntil: null,
+    });
+    expect(lastRunWrites).toHaveLength(1);
+    expect(lastRunWrites[0]).toMatchObject({
+      safeCheckpoint: 1778692780,
+      saturated: false,
+      resumeUntil: null,
+    });
+  });
+
   it('advances report checkpoint when bounded drain resolves saturation', async () => {
     const targetEventId = '1'.repeat(64);
     const reporterPubkey = '3'.repeat(64);

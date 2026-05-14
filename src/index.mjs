@@ -13,7 +13,7 @@ import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
 import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
-import { getLastReportPollTimestamp, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
+import { getLastReportPollTimestamp, getReportLastRun, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
@@ -4803,8 +4803,17 @@ async function runMigration() {
               ? [env.RELAY_POLLING_RELAY_URL]
               : ['wss://relay.divine.video'];
 
+          const lastRun = await getReportLastRun(env);
+          const resumeUntil = Number.isInteger(lastRun?.resumeUntil) && lastRun.resumeUntil > since
+            ? lastRun.resumeUntil
+            : null;
+          if (resumeUntil) {
+            console.log(`[REPORT-POLLER] Resuming saturated report polling page until ${new Date(resumeUntil * 1000).toISOString()}`);
+          }
+
           const results = await pollRelayForReports(env, {
             since,
+            ...(resumeUntil ? { until: resumeUntil } : {}),
             limit: parseInt(env.REPORT_POLLING_LIMIT || '100', 10),
             maxPages: parseInt(env.REPORT_POLLING_MAX_PAGES || '5', 10),
             relays,
@@ -4819,21 +4828,25 @@ async function runMigration() {
             errors: results.errors.length,
             safeCheckpoint: results.safeCheckpoint,
             saturated: results.saturated,
+            resumeUntil: results.resumeUntil,
             trigger: 'cron',
           };
 
           if (results.safeCheckpoint) {
             await setLastReportPollTimestamp(env, results.safeCheckpoint, pollStats);
-          } else {
+          }
+
+          try {
+            await env.MODERATION_KV.put('report-poller:last-run', JSON.stringify({
+              ...pollStats,
+              timestamp: new Date().toISOString(),
+            }));
+          } catch (kvError) {
+            console.error('[REPORT-POLLER] Failed to store last run stats:', kvError);
+          }
+
+          if (!results.safeCheckpoint) {
             console.log('[REPORT-POLLER] No safe checkpoint from this run; leaving report checkpoint unchanged');
-            try {
-              await env.MODERATION_KV.put('report-poller:last-run', JSON.stringify({
-                ...pollStats,
-                timestamp: new Date().toISOString(),
-              }));
-            } catch (kvError) {
-              console.error('[REPORT-POLLER] Failed to store last run stats:', kvError);
-            }
           }
 
           console.log(`[REPORT-POLLER] Cron complete: ${results.totalReports} reports found, ${results.recorded} recorded, ${results.skipped} skipped, ${results.targetUnavailable} target unavailable, ${results.errors.length} errors`);

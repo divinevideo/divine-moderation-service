@@ -189,7 +189,7 @@ export async function setLastReportPollTimestamp(env, timestamp, stats = {}) {
   }
 }
 
-async function getReportLastRun(env) {
+export async function getReportLastRun(env) {
   try {
     const data = await env.MODERATION_KV.get(REPORT_LAST_RUN_KEY);
     return data ? JSON.parse(data) : null;
@@ -228,6 +228,7 @@ export async function getReportPollingStatus(env) {
 export async function pollRelayForReports(env, options = {}) {
   const {
     since = Math.floor(Date.now() / 1000) - 3600,
+    until: initialUntil = null,
     limit = 100,
     maxPages = parseInt(env.REPORT_POLLING_MAX_PAGES || '5', 10),
     relays = ['wss://relay.divine.video'],
@@ -252,22 +253,27 @@ export async function pollRelayForReports(env, options = {}) {
     maxTerminalCreatedAt: null,
     safeCheckpoint: null,
     saturated: false,
+    resumeUntil: null,
   };
   const terminalCreatedAts = [];
   const retryableCreatedAts = [];
   const seenReportIds = new Set();
   let hasUnboundedRetryableError = false;
   const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? Math.floor(maxPages) : 5;
+  const startUntil = Number.isInteger(initialUntil) && initialUntil > 0 ? initialUntil : null;
 
   console.log(`[REPORT-POLLER] Starting poll from ${relays.join(', ')} since ${new Date(since * 1000).toISOString()}`);
 
   for (const relayUrl of relays) {
     try {
-      let until = null;
+      let until = startUntil;
       for (let page = 1; page <= pageLimit; page++) {
         const query = Number.isInteger(until) ? { since, limit, until } : { since, limit };
         const reports = await fetchReports(relayUrl, query, env);
         console.log(`[REPORT-POLLER] Fetched ${reports.length} reports from ${relayUrl} page ${page}`);
+        const createdAts = reports
+          .map((report) => report?.created_at)
+          .filter((createdAt) => Number.isInteger(createdAt) && createdAt > 0);
 
         let pageNewReportIds = 0;
         for (const report of reports) {
@@ -347,17 +353,16 @@ export async function pollRelayForReports(env, options = {}) {
 
         if (pageNewReportIds === 0) {
           results.saturated = true;
+          results.resumeUntil = resumeUntilFromPage(until, createdAts, true);
           break;
         }
 
         if (page >= pageLimit) {
           results.saturated = true;
+          results.resumeUntil = resumeUntilFromPage(until, createdAts, false);
           break;
         }
 
-        const createdAts = reports
-          .map((report) => report?.created_at)
-          .filter((createdAt) => Number.isInteger(createdAt) && createdAt > 0);
         if (createdAts.length === 0) {
           results.saturated = true;
           break;
@@ -391,6 +396,19 @@ export async function pollRelayForReports(env, options = {}) {
   console.log(`[REPORT-POLLER] Poll complete: ${results.totalReports} reports, ${results.recorded} recorded, ${results.skipped} skipped`);
 
   return results;
+}
+
+function resumeUntilFromPage(currentUntil, createdAts, duplicateOnlyPage) {
+  if (createdAts.length === 0) {
+    return null;
+  }
+
+  const minCreatedAt = Math.min(...createdAts);
+  if (duplicateOnlyPage && Number.isInteger(currentUntil) && minCreatedAt >= currentUntil) {
+    return currentUntil;
+  }
+
+  return minCreatedAt;
 }
 
 async function markProcessed(kv, key, payload, expirationTtl) {

@@ -257,9 +257,10 @@ requires a `client` tag value of `divine`.
 
 Accepted reports are resolved through their target `e` tag. The poller fetches
 that target event, extracts the reported media SHA, and records the same
-`user_reports` and `moderation_results` rows used by authenticated
-`POST /api/v1/report` submissions. This keeps relay-originated report review on
-the same moderation path as API-originated report review.
+`user_reports` and `moderation_results` review rows used by authenticated
+`POST /api/v1/report` submissions. Relay-originated reports are review-only:
+they do not auto-escalate to `AGE_RESTRICTED` because relay client tags and
+reporter pubkeys are public, self-asserted signals.
 
 Operational KV keys:
 
@@ -269,9 +270,10 @@ Operational KV keys:
 - `report-poller:processed:<event_id>`: idempotence marker for a processed or terminally skipped report event
 
 Checkpointing is conservative. The Worker advances `report-poller:last-poll`
-only to safe terminal report timestamps. Retryable failures and saturated relay
-pages do not advance the checkpoint, so the next cron can retry without skipping
-unprocessed reports.
+only to safe terminal report timestamps. Retryable failures do not advance the
+checkpoint. Saturated relay pages record a `resumeUntil` boundary in
+`report-poller:last-run`, so the next cron can continue paging older reports
+without pretending the whole window is safely checkpointed.
 
 ## Cost Breakdown
 

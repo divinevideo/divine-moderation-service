@@ -900,6 +900,7 @@ describe('report polling', () => {
         recorded: 4,
         saturated: true,
         safeCheckpoint: null,
+        resumeUntil: 1778692781,
       });
       expect(result.maxTerminalCreatedAt).toBeNull();
     } finally {
@@ -977,6 +978,7 @@ describe('report polling', () => {
         recorded: 2,
         saturated: true,
         safeCheckpoint: null,
+        resumeUntil: 1778692784,
       });
       expect(result.maxTerminalCreatedAt).toBeNull();
       expect(result.errors).toEqual([]);
@@ -1074,9 +1076,59 @@ describe('report polling', () => {
         recorded: 3,
         saturated: true,
         safeCheckpoint: null,
+        resumeUntil: 1778692784,
       });
       expect(result.maxTerminalCreatedAt).toBeNull();
       expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
+
+  it('starts from a stored saturated resume boundary when provided', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+    const fetchCalls = [];
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        until: 1778692781,
+        limit: 2,
+        maxPages: 5,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async (relayUrl, query) => {
+          fetchCalls.push({ relayUrl, query });
+          return [
+            {
+              id: REPORT_EVENT_ID,
+              kind: 1984,
+              pubkey: REPORTER,
+              created_at: 1778692780,
+              tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+              content: '',
+            },
+          ];
+        },
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(fetchCalls[0]).toEqual({
+        relayUrl: 'wss://relay.divine.video',
+        query: { since: 1778680000, limit: 2, until: 1778692781 },
+      });
+      expect(result).toMatchObject({
+        totalReports: 1,
+        recorded: 1,
+        saturated: false,
+        safeCheckpoint: 1778692780,
+        resumeUntil: null,
+      });
     } finally {
       consoleLog.mockRestore();
     }

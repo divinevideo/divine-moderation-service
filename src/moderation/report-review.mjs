@@ -17,6 +17,7 @@ export async function recordReportForReview(db, {
   reportEventId = null,
   targetEventId = null,
   uploadedBy = null,
+  allowAutoAgeRestrict = source === 'user-report',
 } = {}) {
   const result = await addReport(db, {
     sha256,
@@ -27,7 +28,7 @@ export async function recordReportForReview(db, {
   });
 
   const isNsfw = isNsfwReportType(reportType);
-  const action = (isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
+  const action = (allowAutoAgeRestrict && isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
   const moderatedAt = reportedAt || new Date().toISOString();
   const categories = isNsfw ? ['adult'] : [];
   let moderationResultRecorded = false;

@@ -112,7 +112,24 @@ describe('recordReportForReview', () => {
     });
   });
 
-  it('writes AGE_RESTRICTED and adult category for the second distinct NSFW report', async () => {
+  it('writes AGE_RESTRICTED and adult category for the second distinct authenticated NSFW report', async () => {
+    const moderationWrites = [];
+    const db = createDbMock({ moderationWrites, reporterCount: 2 });
+
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'nudity',
+      source: 'user-report',
+    });
+
+    expect(result.action).toBe('AGE_RESTRICTED');
+    expect(moderationWrites).toHaveLength(1);
+    expect(moderationWrites[0].bindings[1]).toBe('AGE_RESTRICTED');
+    expect(JSON.parse(moderationWrites[0].bindings[4])).toEqual(['adult']);
+  });
+
+  it('keeps relay-origin NSFW reports in REVIEW even with multiple distinct reporters', async () => {
     const moderationWrites = [];
     const db = createDbMock({ moderationWrites, reporterCount: 2 });
 
@@ -123,9 +140,10 @@ describe('recordReportForReview', () => {
       source: 'relay-report',
     });
 
-    expect(result.action).toBe('AGE_RESTRICTED');
+    expect(result.action).toBe('REVIEW');
+    expect(result.distinctReporterCount).toBe(2);
     expect(moderationWrites).toHaveLength(1);
-    expect(moderationWrites[0].bindings[1]).toBe('AGE_RESTRICTED');
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
     expect(JSON.parse(moderationWrites[0].bindings[4])).toEqual(['adult']);
   });
 
