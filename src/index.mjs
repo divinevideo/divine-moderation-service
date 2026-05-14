@@ -18,13 +18,14 @@ import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
 import messagesHTML from './admin/messages.html';
-import { initReportsTable, addReport, isAiReportType, isNsfwReportType } from './reports.mjs';
+import { initReportsTable } from './reports.mjs';
 import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforcement, applyUploaderEnforcementToResult } from './uploader-enforcement.mjs';
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { extractTopics, topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
 import { classifyModerationResult, getKVThresholds, kvThresholdsToEnv, setKVThresholds, DEFAULT_THRESHOLDS } from './moderation/classifier.mjs';
 import { shouldForceAIDetection } from './moderation/ai-detection-policy.mjs';
-import { buildAIOutcomeEvent, buildAIPolicyDecisionEvent, buildAIReportEvent, getAIDetectionStats, initAIDetectionEventsTable, recordAIDetectionEvent } from './moderation/ai-detection-events.mjs';
+import { buildAIOutcomeEvent, buildAIPolicyDecisionEvent, getAIDetectionStats, initAIDetectionEventsTable, recordAIDetectionEvent } from './moderation/ai-detection-events.mjs';
+import { recordReportForReview } from './moderation/report-review.mjs';
 import { isValidSha256, isValidLookupIdentifier, isValidPubkey, parseMaybeJson, getEventTagValue, parseImetaParams, extractShaFromUrl, extractMediaShaFromEvent } from './validation.mjs';
 import { parseRetryAfterSeconds } from './http-utils.mjs';
 import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
@@ -3755,92 +3756,21 @@ async function runMigration() {
         }
         const sha256 = rawSha;
 
-        const result = await addReport(env.BLOSSOM_DB, { sha256, reporter_pubkey, report_type, reason });
+        const result = await recordReportForReview(env.BLOSSOM_DB, {
+          sha256,
+          reporterPubkey: reporter_pubkey,
+          reportType: report_type,
+          reason,
+          source: 'user-report',
+        });
 
-        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... distinctReporters=${result.distinctReporterCount}`);
+        console.log(`[API] Recorded ${result.action} from user report for ${sha256} (type=${report_type}, distinctReporters=${result.distinctReporterCount})`);
 
-        // Write a moderation_results row directly so the team's FLAGGED dashboard
-        // (action IN REVIEW/AGE_RESTRICTED/PERMANENT_BAN AND reviewed_by IS NULL)
-        // surfaces the reported item.
-        //
-        // Policy:
-        //   - Non-NSFW report (single tier): action = REVIEW
-        //   - NSFW report: action = REVIEW on first reporter; auto AGE_RESTRICTED
-        //     once 2+ DISTINCT reporter_pubkeys have flagged the same sha256.
-        //     The 2-distinct-reporter floor defends against single-token griefing
-        //     where one API caller could otherwise auto age-restrict any sha256
-        //     by varying the reporter_pubkey field.
-        //
-        // ON CONFLICT short-circuits if a moderator already reviewed the row
-        // (reviewed_by IS NOT NULL) so human decisions are never overwritten.
-        const isNsfw = isNsfwReportType(report_type);
-        const reportAction = (isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
-        const nowIso = new Date().toISOString();
-        const reportCategories = isNsfw ? ['adult'] : [];
-        try {
-          await env.BLOSSOM_DB.prepare(`
-            INSERT INTO moderation_results (
-              sha256, action, provider, scores, categories, raw_response, moderated_at, reviewed_by, reviewed_at, review_notes, uploaded_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(sha256) DO UPDATE SET
-              action = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.action
-                WHEN moderation_results.action = 'PERMANENT_BAN' THEN moderation_results.action
-                WHEN excluded.action = 'AGE_RESTRICTED' AND moderation_results.action IN ('SAFE', 'REVIEW') THEN excluded.action
-                WHEN excluded.action = 'REVIEW' AND moderation_results.action = 'SAFE' THEN excluded.action
-                ELSE moderation_results.action
-              END,
-              provider = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.provider
-                ELSE excluded.provider
-              END,
-              categories = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.categories
-                ELSE excluded.categories
-              END,
-              moderated_at = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.moderated_at
-                ELSE excluded.moderated_at
-              END
-          `).bind(
-            sha256,
-            reportAction,
-            'user-report',
-            JSON.stringify({}),
-            JSON.stringify(reportCategories),
-            JSON.stringify({
-              source: 'user-report',
-              reportType: report_type,
-              reportedBy: reporter_pubkey,
-              distinctReporterCount: result.distinctReporterCount,
-              reason: reason ?? null,
-            }),
-            nowIso,
-            null,
-            null,
-            null,
-            null,
-          ).run();
-          console.log(`[API] Recorded ${reportAction} from user report for ${sha256} (type=${report_type}, nsfw=${isNsfw}, distinctReporters=${result.distinctReporterCount})`);
-        } catch (writeErr) {
-          console.error(`[API] Failed to write moderation row for reported ${sha256}:`, writeErr.message);
-        }
-
-        // Preserve existing AI-detection telemetry: AI-typed reports still record
-        // an ai_detection_events row so dashboards keep their report counts.
-        if (isAiReportType(report_type)) {
-          try {
-            await recordAIDetectionEvent(env.BLOSSOM_DB, buildAIReportEvent({
-              sha256,
-              reportType: report_type,
-              createdAt: nowIso,
-            }));
-          } catch (eventErr) {
-            console.error(`[API] Failed to record AI report event for ${sha256}:`, eventErr.message);
-          }
-        }
-
-        return new Response(JSON.stringify({ success: true, ...result }), {
+        return new Response(JSON.stringify({
+          success: true,
+          escalate: result.escalate,
+          distinctReporterCount: result.distinctReporterCount,
+        }), {
           headers: { 'Content-Type': 'application/json' }
         });
       } catch (error) {
