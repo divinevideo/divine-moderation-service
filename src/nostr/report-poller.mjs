@@ -14,6 +14,7 @@ const TERMINAL_SKIP_TTL_SECONDS = 60 * 60 * 24 * 90;
 const RECORDED_TTL_SECONDS = 60 * 60 * 24 * 180;
 
 export const REPORT_CHECKPOINT_KEY = 'report-poller:last-poll';
+export const REPORT_LAST_RUN_KEY = 'report-poller:last-run';
 
 export function extractReportTargetEventId(reportEvent) {
   for (const tag of reportEvent?.tags || []) {
@@ -186,6 +187,42 @@ export async function setLastReportPollTimestamp(env, timestamp, stats = {}) {
   } catch (error) {
     console.error('[REPORT-POLLER] Failed to store last poll timestamp:', error);
   }
+}
+
+async function getReportLastRun(env) {
+  try {
+    const data = await env.MODERATION_KV.get(REPORT_LAST_RUN_KEY);
+    return data ? JSON.parse(data) : null;
+  } catch (error) {
+    console.error('[REPORT-POLLER] Failed to get last report poll run:', error);
+    return null;
+  }
+}
+
+export async function getReportPollingStatus(env) {
+  const enabled = env.REPORT_POLLING_ENABLED !== 'false';
+  const lastRun = await getReportLastRun(env);
+
+  try {
+    const data = await env.MODERATION_KV.get(REPORT_CHECKPOINT_KEY);
+    if (data) {
+      return {
+        enabled,
+        ...JSON.parse(data),
+        ...(lastRun ? { lastRun } : {}),
+      };
+    }
+  } catch (error) {
+    console.error('[REPORT-POLLER] Failed to get report polling status:', error);
+  }
+
+  return {
+    enabled,
+    timestamp: null,
+    lastPollAt: null,
+    message: 'No report polls completed yet',
+    ...(lastRun ? { lastRun } : {}),
+  };
 }
 
 export async function pollRelayForReports(env, options = {}) {

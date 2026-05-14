@@ -2993,6 +2993,57 @@ describe('RD auto-escalation cron integration', () => {
 });
 
 describe('Report polling cron integration', () => {
+  it('allows admins to read report polling status', async () => {
+    const env = createEnv({
+      ALLOW_DEV_ACCESS: 'true',
+      REPORT_POLLING_ENABLED: 'true',
+      MODERATION_KV: {
+        async get(key) {
+          if (key === 'report-poller:last-poll') {
+            return JSON.stringify({
+              timestamp: 1778692782,
+              lastPollAt: '2026-05-13T17:20:00.000Z',
+              totalReports: 3,
+              recorded: 2,
+              errors: 1,
+            });
+          }
+          if (key === 'report-poller:last-run') {
+            return JSON.stringify({
+              lastRunAt: '2026-05-13T17:25:00.000Z',
+              saturated: true,
+              safeCheckpoint: null,
+            });
+          }
+          return null;
+        },
+        async put() {},
+        async delete() {},
+        async list() { return { keys: [], list_complete: true, cursor: null }; },
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/report-polling/status'),
+      env,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      enabled: true,
+      timestamp: 1778692782,
+      lastPollAt: '2026-05-13T17:20:00.000Z',
+      totalReports: 3,
+      recorded: 2,
+      errors: 1,
+      lastRun: {
+        lastRunAt: '2026-05-13T17:25:00.000Z',
+        saturated: true,
+        safeCheckpoint: null,
+      },
+    });
+  });
+
   it('runs inbound report polling and records kind 1984 reports for review', async () => {
     const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);

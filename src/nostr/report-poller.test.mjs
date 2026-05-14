@@ -9,6 +9,7 @@ import {
   extractReportTargetEventId,
   extractReportType,
   fetchReportsFromRelay,
+  getReportPollingStatus,
   getLastReportPollTimestamp,
   isDivineClientReport,
   pollRelayForReports,
@@ -428,6 +429,56 @@ describe('report polling checkpoint', () => {
       skipped: 1,
     });
     expect(JSON.parse(kv.store.get('relay-poller:last-poll'))).toEqual({ timestamp: 123 });
+  });
+});
+
+describe('ReportPollingStatus', () => {
+  it('returns checkpoint status with last-run details when present', async () => {
+    const kv = createKv(new Map([
+      ['report-poller:last-poll', JSON.stringify({
+        timestamp: 1778692782,
+        lastPollAt: '2026-05-13T17:20:00.000Z',
+        totalReports: 3,
+        recorded: 2,
+        errors: 1,
+      })],
+      ['report-poller:last-run', JSON.stringify({
+        lastRunAt: '2026-05-13T17:25:00.000Z',
+        saturated: true,
+        safeCheckpoint: null,
+      })],
+    ]));
+
+    await expect(getReportPollingStatus({
+      REPORT_POLLING_ENABLED: 'true',
+      MODERATION_KV: kv,
+    })).resolves.toMatchObject({
+      enabled: true,
+      timestamp: 1778692782,
+      lastPollAt: '2026-05-13T17:20:00.000Z',
+      totalReports: 3,
+      recorded: 2,
+      errors: 1,
+      lastRun: {
+        lastRunAt: '2026-05-13T17:25:00.000Z',
+        saturated: true,
+        safeCheckpoint: null,
+      },
+    });
+  });
+
+  it('returns an empty status when no report polls completed yet', async () => {
+    const kv = createKv();
+
+    await expect(getReportPollingStatus({
+      REPORT_POLLING_ENABLED: 'false',
+      MODERATION_KV: kv,
+    })).resolves.toEqual({
+      enabled: false,
+      timestamp: null,
+      lastPollAt: null,
+      message: 'No report polls completed yet',
+    });
   });
 });
 

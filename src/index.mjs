@@ -13,7 +13,7 @@ import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
 import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
-import { getLastReportPollTimestamp, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
+import { getLastReportPollTimestamp, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
@@ -2678,6 +2678,22 @@ export default {
 
       console.log(`[${requestId}] Fetching relay polling status`);
       const status = await getPollingStatus(env);
+
+      return new Response(JSON.stringify(status), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get report polling status
+    if (url.pathname === '/admin/api/report-polling/status') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to report-polling/status`);
+        return authError;
+      }
+
+      console.log(`[${requestId}] Fetching report polling status`);
+      const status = await getReportPollingStatus(env);
 
       return new Response(JSON.stringify(status), {
         headers: { 'Content-Type': 'application/json' }
