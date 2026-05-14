@@ -185,6 +185,40 @@ describe('processReportEvent', () => {
     });
   });
 
+  it('does not mark a report processed when review row recording fails inside the helper', async () => {
+    const kv = createKv();
+
+    const result = await processReportEvent({
+      id: REPORT_EVENT_ID,
+      kind: 1984,
+      pubkey: REPORTER,
+      created_at: 1778692782,
+      tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+      content: 'Needs review',
+    }, {
+      kv,
+      requireDivineClient: true,
+      fetchTargetEvent: async () => TARGET,
+      recordReport: async () => ({
+        success: true,
+        action: 'REVIEW',
+        distinctReporterCount: 1,
+        moderationResultRecorded: false,
+        moderationResultError: 'D1 write failed',
+      }),
+    });
+
+    expect(result).toMatchObject({
+      status: 'review_record_failed',
+      sha256: SHA,
+      reportType: 'nudity',
+      targetEventId: TARGET_EVENT_ID,
+      error: 'D1 write failed',
+    });
+    expect(kv.store.has(processedReportKey(REPORT_EVENT_ID))).toBe(false);
+    expect(kv.puts).toHaveLength(0);
+  });
+
   it('skips an already processed report without recording again', async () => {
     const kv = createKv(new Map([[processedReportKey(REPORT_EVENT_ID), '{"status":"recorded"}']]));
     const calls = { fetchTargetEvent: 0, recordReport: 0 };
@@ -549,6 +583,60 @@ describe('report polling', () => {
         maxTerminalCreatedAt: 1778692784,
       });
       expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
+
+  it('does not expose a safe checkpoint when review row recording fails inside the helper', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 10,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async () => [{
+          id: REPORT_EVENT_ID,
+          kind: 1984,
+          pubkey: REPORTER,
+          created_at: 1778692782,
+          tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+          content: 'Needs review',
+        }],
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({
+          success: true,
+          action: 'REVIEW',
+          distinctReporterCount: 1,
+          moderationResultRecorded: false,
+          moderationResultError: 'D1 write failed',
+        }),
+      });
+
+      expect(result).toMatchObject({
+        totalReports: 1,
+        recorded: 0,
+        safeCheckpoint: null,
+        maxTerminalCreatedAt: null,
+      });
+      expect(result.reports).toEqual([
+        expect.objectContaining({
+          status: 'review_record_failed',
+          sha256: SHA,
+          reportType: 'nudity',
+          error: 'D1 write failed',
+        }),
+      ]);
+      expect(result.errors).toEqual([
+        { reportId: REPORT_EVENT_ID, error: 'D1 write failed', status: 'review_record_failed' },
+      ]);
+      expect(kv.store.has(processedReportKey(REPORT_EVENT_ID))).toBe(false);
     } finally {
       consoleLog.mockRestore();
     }

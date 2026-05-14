@@ -268,11 +268,26 @@ export async function pollRelayForReports(env, options = {}) {
               } else {
                 hasUnboundedRetryableError = true;
               }
+            } else if (outcome.status === 'review_record_failed') {
+              results.errors.push({
+                reportId: report?.id || null,
+                error: outcome.error || 'moderation result write failed',
+                status: outcome.status,
+              });
+              if (reportCreatedAt !== null) {
+                retryableCreatedAts.push(reportCreatedAt);
+              } else {
+                hasUnboundedRetryableError = true;
+              }
             } else {
               results.skipped++;
             }
 
-            if (outcome.status !== 'target_unavailable' && reportCreatedAt !== null) {
+            if (
+              outcome.status !== 'target_unavailable'
+              && outcome.status !== 'review_record_failed'
+              && reportCreatedAt !== null
+            ) {
               terminalCreatedAts.push(reportCreatedAt);
             }
           } catch (error) {
@@ -425,6 +440,16 @@ export async function processReportEvent(reportEvent, {
     targetEventId,
     uploadedBy: targetEvent.pubkey || null,
   });
+
+  if (recordResult?.moderationResultRecorded === false) {
+    return {
+      status: 'review_record_failed',
+      sha256,
+      reportType,
+      targetEventId,
+      error: recordResult.moderationResultError || 'moderation result write failed',
+    };
+  }
 
   await markProcessed(kv, processedKey, {
     status: 'recorded',
