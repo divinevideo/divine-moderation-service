@@ -104,6 +104,7 @@ function createEnv(overrides = {}) {
     MODERATION_QUEUE: {
       async send() {}
     },
+    REPORT_POLLING_ENABLED: 'false',
     CDN_DOMAIN: 'media.divine.video',
     ...overrides
   };
@@ -2676,6 +2677,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_WEBHOOK_SECRET: 'test-secret',
       BLOSSOM_DB: {
@@ -2785,6 +2787,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_WEBHOOK_SECRET: 'test-secret',
       BLOSSOM_DB: {
@@ -2859,6 +2862,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_DB: {
         prepare() {
@@ -2932,6 +2936,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_DB: {
         prepare() {
           return {
@@ -2987,12 +2992,155 @@ describe('RD auto-escalation cron integration', () => {
   });
 });
 
+describe('Report polling cron integration', () => {
+  it('runs inbound report polling and records kind 1984 reports for review', async () => {
+    const targetEventId = '1'.repeat(64);
+    const reportEventId = '2'.repeat(64);
+    const reporterPubkey = '3'.repeat(64);
+    const uploaderPubkey = '4'.repeat(64);
+    const sha256 = '5'.repeat(64);
+    const moderationWrites = [];
+    const kvStore = new Map();
+    const websocketRequests = [];
+
+    const env = createEnv({
+      RELAY_POLLING_ENABLED: 'false',
+      REPORT_POLLING_ENABLED: 'true',
+      REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
+      REPORT_POLLING_LOOKBACK_HOURS: '24',
+      REPORT_POLLING_LIMIT: '100',
+      RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      BLOSSOM_DB: createDbMock({ moderationWrites }),
+      MODERATION_KV: {
+        async get(key) {
+          return kvStore.get(key) ?? null;
+        },
+        async put(key, value, options) {
+          kvStore.set(key, JSON.stringify({ value, options }));
+        },
+        async delete(key) {
+          kvStore.delete(key);
+        },
+        async list() {
+          return { keys: [], list_complete: true, cursor: null };
+        },
+      },
+    });
+
+    const originalFetch = globalThis.fetch;
+    const OriginalWebSocket = globalThis.WebSocket;
+
+    globalThis.fetch = async (url) => {
+      if (url === `https://reports.example.test/api/event/${targetEventId}`) {
+        return new Response(JSON.stringify({
+          id: targetEventId,
+          kind: 34236,
+          pubkey: uploaderPubkey,
+          created_at: 1778692000,
+          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
+          content: '',
+          sig: '6'.repeat(128),
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    globalThis.WebSocket = class {
+      constructor(url) {
+        this.url = url;
+        this.listeners = {};
+        setTimeout(() => this.listeners.open?.({}), 0);
+      }
+
+      addEventListener(type, listener) {
+        this.listeners[type] = listener;
+      }
+
+      send(payload) {
+        const message = JSON.parse(payload);
+        if (message[0] !== 'REQ') {
+          return;
+        }
+
+        websocketRequests.push({ url: this.url, message });
+        const subscriptionId = message[1];
+        setTimeout(() => {
+          this.listeners.message?.({
+            data: JSON.stringify(['EVENT', subscriptionId, {
+              id: reportEventId,
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: 1778692782,
+              tags: [
+                ['e', targetEventId, 'other'],
+                ['client', 'diVine'],
+                ['l', 'NS-aiGenerated', 'social.nos.ontology'],
+              ],
+              content: 'Reason: aiGenerated',
+              sig: '7'.repeat(128),
+            }]),
+          });
+          this.listeners.message?.({ data: JSON.stringify(['EOSE', subscriptionId]) });
+        }, 0);
+      }
+
+      close() {
+        this.listeners.close?.({});
+      }
+    };
+
+    try {
+      await worker.scheduled(
+        { cron: '*/5 * * * *', scheduledTime: Date.now() },
+        env,
+        { waitUntil: () => {} },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = OriginalWebSocket;
+    }
+
+    expect(websocketRequests).toHaveLength(1);
+    expect(websocketRequests[0].url).toBe('wss://reports.example.test');
+    expect(websocketRequests[0].message[2]).toMatchObject({
+      kinds: [1984],
+      limit: 100,
+    });
+
+    expect(moderationWrites).toHaveLength(1);
+    expect(moderationWrites[0].bindings[0]).toBe(sha256);
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
+    expect(moderationWrites[0].bindings[2]).toBe('user-report');
+    expect(moderationWrites[0].bindings[10]).toBe(uploaderPubkey);
+    expect(JSON.parse(moderationWrites[0].bindings[5])).toMatchObject({
+      source: 'relay-report',
+      reportType: 'ai_generated',
+      reportEventId,
+      targetEventId,
+    });
+
+    expect(kvStore.has('report-poller:last-poll')).toBe(true);
+    const checkpoint = JSON.parse(JSON.parse(kvStore.get('report-poller:last-poll')).value);
+    expect(checkpoint).toMatchObject({
+      totalReports: 1,
+      recorded: 1,
+      alreadyProcessed: 0,
+      skipped: 0,
+      targetUnavailable: 0,
+      errors: 0,
+      trigger: 'cron',
+    });
+    expect(kvStore.has(`report-poller:processed:${reportEventId}`)).toBe(true);
+  });
+});
+
 describe('Transcript reprocess cron integration', () => {
   function createTranscriptReprocessEnv({ moderationRow, kvStore, blossomPayloads, envOverrides = {} }) {
     return {
       CDN_DOMAIN: 'media.divine.video',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       TRANSCRIPT_REPROCESS_MAX_AGE_DAYS: '7',
+      REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_DB: {
         prepare(sql) {
           let bindings = [];

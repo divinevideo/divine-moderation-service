@@ -13,6 +13,7 @@ import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
 import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
+import { getLastReportPollTimestamp, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
@@ -4749,6 +4750,58 @@ async function runMigration() {
             }));
           } catch (kvError) {
             console.error('[RELAY-POLLER] Failed to store error:', kvError);
+          }
+        }
+      }
+
+      if (env.REPORT_POLLING_ENABLED === 'false') {
+        console.log('[REPORT-POLLER] Report polling is disabled, skipping');
+      } else {
+        try {
+          let since = await getLastReportPollTimestamp(env);
+
+          if (!since) {
+            const lookbackHours = parseInt(env.REPORT_POLLING_LOOKBACK_HOURS || '24', 10);
+            since = Math.floor(Date.now() / 1000) - (lookbackHours * 3600);
+            console.log(`[REPORT-POLLER] First report poll run, looking back ${lookbackHours} hours`);
+          } else {
+            console.log(`[REPORT-POLLER] Continuing report polling from ${new Date(since * 1000).toISOString()}`);
+          }
+
+          const relays = env.REPORT_POLLING_RELAY_URL
+            ? [env.REPORT_POLLING_RELAY_URL]
+            : env.RELAY_POLLING_RELAY_URL
+              ? [env.RELAY_POLLING_RELAY_URL]
+              : ['wss://relay.divine.video'];
+
+          const results = await pollRelayForReports(env, {
+            since,
+            limit: parseInt(env.REPORT_POLLING_LIMIT || '100', 10),
+            relays,
+          });
+
+          await setLastReportPollTimestamp(env, Math.floor(Date.now() / 1000), {
+            totalReports: results.totalReports,
+            recorded: results.recorded,
+            alreadyProcessed: results.alreadyProcessed,
+            skipped: results.skipped,
+            targetUnavailable: results.targetUnavailable,
+            errors: results.errors.length,
+            trigger: 'cron',
+          });
+
+          console.log(`[REPORT-POLLER] Cron complete: ${results.totalReports} reports found, ${results.recorded} recorded, ${results.skipped} skipped, ${results.targetUnavailable} target unavailable, ${results.errors.length} errors`);
+        } catch (error) {
+          console.error('[REPORT-POLLER] Cron poll failed:', error);
+
+          try {
+            await env.MODERATION_KV.put('report-poller:last-error', JSON.stringify({
+              error: error.message,
+              stack: error.stack,
+              timestamp: new Date().toISOString(),
+            }));
+          } catch (kvError) {
+            console.error('[REPORT-POLLER] Failed to store error:', kvError);
           }
         }
       }
