@@ -8,6 +8,8 @@ import { extractMediaShaFromEvent, getEventTagValue } from '../validation.mjs';
 
 const VIDEO_KINDS = new Set([34235, 34236]);
 const PROCESSED_PREFIX = 'report-poller:processed:';
+const TERMINAL_SKIP_TTL_SECONDS = 60 * 60 * 24 * 90;
+const RECORDED_TTL_SECONDS = 60 * 60 * 24 * 180;
 
 export const REPORT_CHECKPOINT_KEY = 'report-poller:last-poll';
 
@@ -69,4 +71,92 @@ export function shouldAcceptReportTarget(targetEvent) {
 
 export function processedReportKey(reportEventId) {
   return `${PROCESSED_PREFIX}${reportEventId}`;
+}
+
+async function markProcessed(kv, key, payload, expirationTtl) {
+  await kv.put(key, JSON.stringify({
+    ...payload,
+    processedAt: new Date().toISOString(),
+  }), { expirationTtl });
+}
+
+export async function processReportEvent(reportEvent, {
+  kv,
+  requireDivineClient = true,
+  fetchTargetEvent,
+  recordReport,
+} = {}) {
+  if (!reportEvent?.id || !/^[0-9a-f]{64}$/i.test(reportEvent.id)) {
+    return { status: 'skipped_invalid_report_id' };
+  }
+
+  const reportEventId = reportEvent.id.toLowerCase();
+  const processedKey = processedReportKey(reportEventId);
+  const alreadyProcessed = await kv.get(processedKey);
+  if (alreadyProcessed) {
+    return { status: 'already_processed' };
+  }
+
+  if (requireDivineClient && !isDivineClientReport(reportEvent)) {
+    await markProcessed(kv, processedKey, {
+      status: 'skipped_non_divine_client',
+    }, TERMINAL_SKIP_TTL_SECONDS);
+    return { status: 'skipped_non_divine_client' };
+  }
+
+  const targetEventId = extractReportTargetEventId(reportEvent);
+  if (!targetEventId) {
+    await markProcessed(kv, processedKey, {
+      status: 'skipped_missing_target',
+    }, TERMINAL_SKIP_TTL_SECONDS);
+    return { status: 'skipped_missing_target' };
+  }
+
+  const targetEvent = await fetchTargetEvent(targetEventId);
+  if (!targetEvent) {
+    return { status: 'target_unavailable', targetEventId };
+  }
+
+  if (!shouldAcceptReportTarget(targetEvent)) {
+    await markProcessed(kv, processedKey, {
+      status: 'skipped_non_video_target',
+      targetEventId,
+    }, TERMINAL_SKIP_TTL_SECONDS);
+    return { status: 'skipped_non_video_target', targetEventId };
+  }
+
+  const sha256 = extractMediaShaFromEvent(targetEvent);
+  const reportType = extractReportType(reportEvent);
+  const reportedAt = typeof reportEvent.created_at === 'number' && Number.isFinite(reportEvent.created_at)
+    ? new Date(reportEvent.created_at * 1000).toISOString()
+    : new Date().toISOString();
+
+  const recordResult = await recordReport({
+    sha256,
+    reporterPubkey: reportEvent.pubkey,
+    reportType,
+    reason: reportEvent.content || null,
+    source: 'relay-report',
+    reportedAt,
+    reportEventId,
+    targetEventId,
+    uploadedBy: targetEvent.pubkey || null,
+  });
+
+  await markProcessed(kv, processedKey, {
+    status: 'recorded',
+    sha256,
+    reportType,
+    targetEventId,
+    action: recordResult.action,
+  }, RECORDED_TTL_SECONDS);
+
+  return {
+    status: 'recorded',
+    sha256,
+    reportType,
+    targetEventId,
+    action: recordResult.action,
+    distinctReporterCount: recordResult.distinctReporterCount,
+  };
 }
