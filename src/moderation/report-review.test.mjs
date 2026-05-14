@@ -10,7 +10,14 @@ import { recordReportForReview } from './report-review.mjs';
 const SHA = 'a'.repeat(64);
 const REPORTER = 'b'.repeat(64);
 
-function createDbMock({ reporterCount = 1, moderationWrites = [], userReportWrites = [], aiDetectionEvents = [] } = {}) {
+function createDbMock({
+  reporterCount = 1,
+  moderationWrites = [],
+  userReportWrites = [],
+  aiDetectionEvents = [],
+  failModerationWrite = false,
+  failAiTelemetryWrite = false,
+} = {}) {
   return {
     prepare(sql) {
       let bindings = [];
@@ -24,9 +31,15 @@ function createDbMock({ reporterCount = 1, moderationWrites = [], userReportWrit
             userReportWrites.push({ sql, bindings: [...bindings] });
           }
           if (/INSERT INTO moderation_results/i.test(sql)) {
+            if (failModerationWrite) {
+              throw new Error('moderation write failed');
+            }
             moderationWrites.push({ sql, bindings: [...bindings] });
           }
           if (/INSERT OR IGNORE INTO ai_detection_events/i.test(sql)) {
+            if (failAiTelemetryWrite) {
+              throw new Error('ai telemetry write failed');
+            }
             aiDetectionEvents.push({
               event_key: bindings[0],
               sha256: bindings[1],
@@ -138,5 +151,43 @@ describe('recordReportForReview', () => {
       ai_detection_forced: 1,
       report_type: 'ai_generated',
     });
+  });
+
+  it('returns success with non-fatal moderation write failure details after addReport succeeds', async () => {
+    const userReportWrites = [];
+    const db = createDbMock({ userReportWrites, failModerationWrite: true });
+
+    await expect(recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'violence',
+      source: 'user-report',
+    })).resolves.toMatchObject({
+      success: true,
+      action: 'REVIEW',
+      distinctReporterCount: 1,
+      moderationResultRecorded: false,
+      moderationResultError: 'moderation write failed',
+    });
+    expect(userReportWrites).toHaveLength(1);
+  });
+
+  it('returns success and aiTelemetryRecorded false when AI telemetry write fails', async () => {
+    const aiDetectionEvents = [];
+    const db = createDbMock({ aiDetectionEvents, failAiTelemetryWrite: true });
+
+    await expect(recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'ai_generated',
+      source: 'user-report',
+    })).resolves.toMatchObject({
+      success: true,
+      action: 'REVIEW',
+      distinctReporterCount: 1,
+      aiTelemetryRecorded: false,
+      aiTelemetryError: 'ai telemetry write failed',
+    });
+    expect(aiDetectionEvents).toHaveLength(0);
   });
 });
