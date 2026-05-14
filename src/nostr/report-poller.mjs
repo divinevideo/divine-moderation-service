@@ -5,6 +5,8 @@
 // ABOUTME: Converts kind 1984 relay reports into moderation review records
 
 import { extractMediaShaFromEvent, getEventTagValue } from '../validation.mjs';
+import { recordReportForReview } from '../moderation/report-review.mjs';
+import { fetchNostrEventById } from './relay-client.mjs';
 
 const VIDEO_KINDS = new Set([34235, 34236]);
 const PROCESSED_PREFIX = 'report-poller:processed:';
@@ -71,6 +73,183 @@ export function shouldAcceptReportTarget(targetEvent) {
 
 export function processedReportKey(reportEventId) {
   return `${PROCESSED_PREFIX}${reportEventId}`;
+}
+
+export async function fetchReportsFromRelay(relayUrl, { since, limit }, env = {}) {
+  return new Promise((resolve, reject) => {
+    const reports = [];
+    let ws;
+    let settled = false;
+    const timeout = setTimeout(() => {
+      try {
+        if (ws) ws.close();
+      } catch {}
+      finish(reports);
+    }, 30000);
+
+    function finish(resultOrError) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+
+      if (resultOrError instanceof Error) {
+        reject(resultOrError);
+        return;
+      }
+
+      resolve(resultOrError);
+    }
+
+    try {
+      if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+        console.log(`[REPORT-POLLER] Connecting to ${relayUrl} with CF Access credentials`);
+      }
+
+      ws = new WebSocket(relayUrl);
+      const subscriptionId = `report-poll-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      ws.addEventListener('open', () => {
+        const filter = { kinds: [1984], since, limit };
+        console.log(`[REPORT-POLLER] Sending REQ to ${relayUrl}: kinds=[1984], since=${since}, limit=${limit}`);
+        ws.send(JSON.stringify(['REQ', subscriptionId, filter]));
+      });
+
+      ws.addEventListener('message', (msg) => {
+        try {
+          const data = JSON.parse(msg.data);
+
+          if (data[0] === 'EVENT' && data[1] === subscriptionId) {
+            reports.push(data[2]);
+          }
+
+          if (data[0] === 'EOSE' && data[1] === subscriptionId) {
+            try {
+              ws.send(JSON.stringify(['CLOSE', subscriptionId]));
+              ws.close();
+            } catch {}
+            finish(reports);
+          }
+
+          if (data[0] === 'NOTICE') {
+            console.log(`[REPORT-POLLER] Relay notice: ${data[1]}`);
+          }
+        } catch (error) {
+          console.error('[REPORT-POLLER] Failed to parse relay message:', error);
+        }
+      });
+
+      ws.addEventListener('error', (error) => {
+        finish(new Error(`WebSocket error: ${error.message || 'Unknown error'}`));
+      });
+
+      ws.addEventListener('close', () => {
+        finish(reports);
+      });
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error('WebSocket setup failed'));
+    }
+  });
+}
+
+export async function getLastReportPollTimestamp(env) {
+  try {
+    const data = await env.MODERATION_KV.get(REPORT_CHECKPOINT_KEY);
+    if (data) {
+      return JSON.parse(data).timestamp;
+    }
+  } catch (error) {
+    console.error('[REPORT-POLLER] Failed to get last poll timestamp:', error);
+  }
+  return null;
+}
+
+export async function setLastReportPollTimestamp(env, timestamp, stats = {}) {
+  try {
+    await env.MODERATION_KV.put(REPORT_CHECKPOINT_KEY, JSON.stringify({
+      timestamp,
+      lastPollAt: new Date().toISOString(),
+      ...stats,
+    }));
+  } catch (error) {
+    console.error('[REPORT-POLLER] Failed to store last poll timestamp:', error);
+  }
+}
+
+export async function pollRelayForReports(env, options = {}) {
+  const {
+    since = Math.floor(Date.now() / 1000) - 3600,
+    limit = 100,
+    relays = ['wss://relay.divine.video'],
+    fetchReportsFromRelay: injectedFetchReportsFromRelay,
+    fetchTargetEvent: injectedFetchTargetEvent,
+    recordReport: injectedRecordReport,
+  } = options;
+
+  const fetchReports = injectedFetchReportsFromRelay || fetchReportsFromRelay;
+  const fetchTargetEvent = injectedFetchTargetEvent || ((eventId) => fetchNostrEventById(eventId, relays, env));
+  const recordReport = injectedRecordReport || ((payload) => recordReportForReview(env.BLOSSOM_DB, payload));
+  const requireDivineClient = env.RELAY_REPORTS_REQUIRE_DIVINE_CLIENT !== 'false';
+
+  const results = {
+    totalReports: 0,
+    recorded: 0,
+    alreadyProcessed: 0,
+    skipped: 0,
+    targetUnavailable: 0,
+    errors: [],
+    reports: [],
+  };
+
+  console.log(`[REPORT-POLLER] Starting poll from ${relays.join(', ')} since ${new Date(since * 1000).toISOString()}`);
+
+  for (const relayUrl of relays) {
+    try {
+      const reports = await fetchReports(relayUrl, { since, limit }, env);
+      console.log(`[REPORT-POLLER] Fetched ${reports.length} reports from ${relayUrl}`);
+
+      for (const report of reports) {
+        results.totalReports++;
+
+        try {
+          const outcome = await processReportEvent(report, {
+            kv: env.MODERATION_KV,
+            requireDivineClient,
+            fetchTargetEvent,
+            recordReport,
+          });
+
+          results.reports.push(outcome);
+          if (outcome.status === 'recorded') {
+            results.recorded++;
+          } else if (outcome.status === 'already_processed') {
+            results.alreadyProcessed++;
+          } else if (outcome.status === 'target_unavailable') {
+            results.targetUnavailable++;
+          } else {
+            results.skipped++;
+          }
+        } catch (error) {
+          console.error(`[REPORT-POLLER] Failed to process report ${report?.id || '<missing-id>'}:`, error);
+          results.errors.push({
+            reportId: report?.id || null,
+            error: error?.message || String(error),
+          });
+        }
+      }
+    } catch (error) {
+      console.error(`[REPORT-POLLER] Failed to poll ${relayUrl}:`, error);
+      results.errors.push({
+        relay: relayUrl,
+        error: error?.message || String(error),
+      });
+    }
+  }
+
+  console.log(`[REPORT-POLLER] Poll complete: ${results.totalReports} reports, ${results.recorded} recorded, ${results.skipped} skipped`);
+
+  return results;
 }
 
 async function markProcessed(kv, key, payload, expirationTtl) {

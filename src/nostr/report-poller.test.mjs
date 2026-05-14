@@ -4,13 +4,16 @@
 // ABOUTME: Tests inbound NIP-56 report parsing and processing
 // ABOUTME: Covers kind 1984 target resolution, report type mapping, and idempotence
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   extractReportTargetEventId,
   extractReportType,
+  getLastReportPollTimestamp,
   isDivineClientReport,
+  pollRelayForReports,
   processReportEvent,
   processedReportKey,
+  setLastReportPollTimestamp,
   shouldAcceptReportTarget,
 } from './report-poller.mjs';
 
@@ -256,5 +259,123 @@ describe('processReportEvent', () => {
     expect(recorded).toHaveLength(0);
     expect(kv.store.has(processedReportKey(REPORT_EVENT_ID))).toBe(false);
     expect(kv.puts).toHaveLength(0);
+  });
+});
+
+describe('report polling checkpoint', () => {
+  it('stores and reads a separate report poll checkpoint', async () => {
+    const kv = createKv(new Map([['relay-poller:last-poll', JSON.stringify({ timestamp: 123 })]]));
+
+    await setLastReportPollTimestamp({ MODERATION_KV: kv }, 1778692782, {
+      totalReports: 3,
+      recorded: 2,
+      skipped: 1,
+    });
+
+    await expect(getLastReportPollTimestamp({ MODERATION_KV: kv })).resolves.toBe(1778692782);
+    expect(JSON.parse(kv.store.get('report-poller:last-poll'))).toMatchObject({
+      timestamp: 1778692782,
+      totalReports: 3,
+      recorded: 2,
+      skipped: 1,
+    });
+    expect(JSON.parse(kv.store.get('relay-poller:last-poll'))).toEqual({ timestamp: 123 });
+  });
+});
+
+describe('report polling', () => {
+  it('processes fetched reports and returns counters', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const kv = createKv(new Map([[processedReportKey('b'.repeat(64)), '{"status":"recorded"}']]));
+    const db = {};
+    const targetUnavailableId = '1'.repeat(64);
+    const reports = [
+      {
+        id: REPORT_EVENT_ID,
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692782,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: 'b'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692783,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: '3'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692784,
+        tags: [['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: '4'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692785,
+        tags: [['e', targetUnavailableId, 'spam'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: '5'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692786,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+    ];
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: db,
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 50,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async (relayUrl, query, env) => {
+          expect(relayUrl).toBe('wss://relay.divine.video');
+          expect(query).toEqual({ since: 1778680000, limit: 50 });
+          expect(env.BLOSSOM_DB).toBe(db);
+          return reports;
+        },
+        fetchTargetEvent: async (eventId) => (eventId === targetUnavailableId ? null : TARGET),
+        recordReport: async (payload) => {
+          if (payload.reportEventId === '5'.repeat(64)) {
+            throw new Error('record failed');
+          }
+          return { success: true, action: 'REVIEW', distinctReporterCount: 1 };
+        },
+      });
+
+      expect(result).toMatchObject({
+        totalReports: 5,
+        recorded: 1,
+        alreadyProcessed: 1,
+        skipped: 1,
+        targetUnavailable: 1,
+      });
+      expect(result.reports).toEqual([
+        expect.objectContaining({ status: 'recorded' }),
+        { status: 'already_processed' },
+        { status: 'skipped_missing_target' },
+        { status: 'target_unavailable', targetEventId: targetUnavailableId },
+      ]);
+      expect(result.errors).toEqual([
+        { reportId: '5'.repeat(64), error: 'record failed' },
+      ]);
+    } finally {
+      consoleLog.mockRestore();
+      consoleError.mockRestore();
+    }
   });
 });
