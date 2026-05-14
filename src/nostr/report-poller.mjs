@@ -132,6 +132,14 @@ export async function fetchReportsFromRelay(relayUrl, { since, limit }, env = {}
             finish(reports);
           }
 
+          if (data[0] === 'CLOSED' && data[1] === subscriptionId) {
+            const reason = typeof data[2] === 'string' && data[2] ? data[2] : 'unknown reason';
+            try {
+              ws.close();
+            } catch {}
+            finish(new Error(`Relay closed subscription ${subscriptionId}: ${reason}`));
+          }
+
           if (data[0] === 'NOTICE') {
             console.log(`[REPORT-POLLER] Relay notice: ${data[1]}`);
           }
@@ -274,6 +282,21 @@ export async function processReportEvent(reportEvent, {
   const alreadyProcessed = await kv.get(processedKey);
   if (alreadyProcessed) {
     return { status: 'already_processed' };
+  }
+
+  if (reportEvent.kind !== 1984) {
+    await markProcessed(kv, processedKey, {
+      status: 'skipped_non_report_kind',
+      kind: reportEvent.kind ?? null,
+    }, TERMINAL_SKIP_TTL_SECONDS);
+    return { status: 'skipped_non_report_kind' };
+  }
+
+  if (!reportEvent.pubkey || !/^[0-9a-f]{64}$/i.test(reportEvent.pubkey)) {
+    await markProcessed(kv, processedKey, {
+      status: 'skipped_invalid_reporter_pubkey',
+    }, TERMINAL_SKIP_TTL_SECONDS);
+    return { status: 'skipped_invalid_reporter_pubkey' };
   }
 
   if (requireDivineClient && !isDivineClientReport(reportEvent)) {

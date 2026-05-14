@@ -4,10 +4,11 @@
 // ABOUTME: Tests inbound NIP-56 report parsing and processing
 // ABOUTME: Covers kind 1984 target resolution, report type mapping, and idempotence
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   extractReportTargetEventId,
   extractReportType,
+  fetchReportsFromRelay,
   getLastReportPollTimestamp,
   isDivineClientReport,
   pollRelayForReports,
@@ -28,6 +29,11 @@ const TARGET = {
   pubkey: UPLOADER,
   tags: [['d', SHA], ['imeta', `x ${SHA}`, 'm video/mp4']],
 };
+const OriginalWebSocket = globalThis.WebSocket;
+
+afterEach(() => {
+  globalThis.WebSocket = OriginalWebSocket;
+});
 
 function createKv(existing = new Map()) {
   const store = new Map(existing);
@@ -236,6 +242,73 @@ describe('processReportEvent', () => {
     });
   });
 
+  it('terminally skips non-kind-1984 events without recording', async () => {
+    const kv = createKv();
+    const calls = { fetchTargetEvent: 0, recordReport: 0 };
+
+    const result = await processReportEvent({
+      id: REPORT_EVENT_ID,
+      kind: 1,
+      pubkey: REPORTER,
+      tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+      content: '',
+    }, {
+      kv,
+      requireDivineClient: true,
+      fetchTargetEvent: async () => {
+        calls.fetchTargetEvent++;
+        return TARGET;
+      },
+      recordReport: async () => {
+        calls.recordReport++;
+        return { action: 'REVIEW', distinctReporterCount: 1 };
+      },
+    });
+
+    expect(result.status).toBe('skipped_non_report_kind');
+    expect(calls).toEqual({ fetchTargetEvent: 0, recordReport: 0 });
+    expect(kv.puts).toHaveLength(1);
+    expect(kv.puts[0].key).toBe(processedReportKey(REPORT_EVENT_ID));
+    expect(kv.puts[0].options).toEqual({ expirationTtl: 60 * 60 * 24 * 90 });
+    expect(JSON.parse(kv.store.get(processedReportKey(REPORT_EVENT_ID)))).toMatchObject({
+      status: 'skipped_non_report_kind',
+      kind: 1,
+    });
+  });
+
+  it('terminally skips reports with malformed reporter pubkeys without recording', async () => {
+    const kv = createKv();
+    const calls = { fetchTargetEvent: 0, recordReport: 0 };
+
+    const result = await processReportEvent({
+      id: REPORT_EVENT_ID,
+      kind: 1984,
+      pubkey: '../not-hex',
+      tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+      content: '',
+    }, {
+      kv,
+      requireDivineClient: true,
+      fetchTargetEvent: async () => {
+        calls.fetchTargetEvent++;
+        return TARGET;
+      },
+      recordReport: async () => {
+        calls.recordReport++;
+        return { action: 'REVIEW', distinctReporterCount: 1 };
+      },
+    });
+
+    expect(result.status).toBe('skipped_invalid_reporter_pubkey');
+    expect(calls).toEqual({ fetchTargetEvent: 0, recordReport: 0 });
+    expect(kv.puts).toHaveLength(1);
+    expect(kv.puts[0].key).toBe(processedReportKey(REPORT_EVENT_ID));
+    expect(kv.puts[0].options).toEqual({ expirationTtl: 60 * 60 * 24 * 90 });
+    expect(JSON.parse(kv.store.get(processedReportKey(REPORT_EVENT_ID)))).toMatchObject({
+      status: 'skipped_invalid_reporter_pubkey',
+    });
+  });
+
   it('does not mark a report processed when the target event cannot be fetched', async () => {
     const kv = createKv();
     const recorded = [];
@@ -259,6 +332,47 @@ describe('processReportEvent', () => {
     expect(recorded).toHaveLength(0);
     expect(kv.store.has(processedReportKey(REPORT_EVENT_ID))).toBe(false);
     expect(kv.puts).toHaveLength(0);
+  });
+});
+
+describe('fetchReportsFromRelay', () => {
+  it('rejects when the relay closes the active subscription', async () => {
+    const sent = [];
+
+    globalThis.WebSocket = class {
+      constructor() {
+        this.listeners = new Map();
+        queueMicrotask(() => this.emit('open', {}));
+      }
+
+      addEventListener(type, listener) {
+        this.listeners.set(type, listener);
+      }
+
+      send(message) {
+        sent.push(JSON.parse(message));
+        const [, subscriptionId] = JSON.parse(message);
+        this.emit('message', {
+          data: JSON.stringify(['CLOSED', subscriptionId, 'blocked: auth-required']),
+        });
+      }
+
+      close() {}
+
+      emit(type, event) {
+        this.listeners.get(type)?.(event);
+      }
+    };
+
+    await expect(fetchReportsFromRelay('wss://relay.example', {
+      since: 1778680000,
+      limit: 50,
+    })).rejects.toThrow('blocked: auth-required');
+    expect(sent[0]).toEqual([
+      'REQ',
+      expect.any(String),
+      { kinds: [1984], since: 1778680000, limit: 50 },
+    ]);
   });
 });
 
