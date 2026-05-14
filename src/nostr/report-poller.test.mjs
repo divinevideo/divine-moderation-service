@@ -532,7 +532,7 @@ describe('report polling', () => {
         RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
       }, {
         since: 1778680000,
-        limit: 3,
+        limit: 4,
         relays: ['wss://relay.divine.video'],
         fetchReportsFromRelay: async () => reports,
         fetchTargetEvent: async () => TARGET,
@@ -548,6 +548,55 @@ describe('report polling', () => {
         safeCheckpoint: 1778692784,
         maxTerminalCreatedAt: 1778692784,
       });
+      expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
+
+  it('does not expose a safe checkpoint when a relay returns a saturated page', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+    const reports = [
+      {
+        id: REPORT_EVENT_ID,
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692782,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: 'b'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692783,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+    ];
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 2,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async () => reports,
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(result).toMatchObject({
+        totalReports: 2,
+        recorded: 2,
+        saturated: true,
+        safeCheckpoint: null,
+      });
+      expect(result.maxTerminalCreatedAt).toBeNull();
       expect(result.errors).toEqual([]);
     } finally {
       consoleLog.mockRestore();

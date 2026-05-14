@@ -4788,6 +4788,7 @@ async function runMigration() {
             targetUnavailable: results.targetUnavailable,
             errors: results.errors.length,
             safeCheckpoint: results.safeCheckpoint,
+            saturated: results.saturated,
             trigger: 'cron',
           };
 

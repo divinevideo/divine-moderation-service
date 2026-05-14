@@ -3351,6 +3351,132 @@ describe('Report polling cron integration', () => {
     });
     expect(checkpointWrites[0].timestamp).not.toBe(nowSeconds);
   });
+
+  it('does not advance report checkpoint when the report page is saturated', async () => {
+    const targetEventId = '1'.repeat(64);
+    const reportEventId = '2'.repeat(64);
+    const reporterPubkey = '3'.repeat(64);
+    const uploaderPubkey = '4'.repeat(64);
+    const sha256 = '5'.repeat(64);
+    const reportCreatedAt = 1778692782;
+    const previousCheckpoint = 1778600000;
+    const kvStore = new Map([[
+      'report-poller:last-poll',
+      JSON.stringify({ timestamp: previousCheckpoint, lastPollAt: '2026-05-12T00:00:00.000Z' }),
+    ]]);
+    const checkpointWrites = [];
+    const lastRunWrites = [];
+
+    const env = createEnv({
+      RELAY_POLLING_ENABLED: 'false',
+      REPORT_POLLING_ENABLED: 'true',
+      REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
+      REPORT_POLLING_LIMIT: '1',
+      BLOSSOM_DB: createDbMock(),
+      MODERATION_KV: {
+        async get(key) {
+          return kvStore.get(key) ?? null;
+        },
+        async put(key, value, options) {
+          if (key === 'report-poller:last-poll') {
+            checkpointWrites.push(JSON.parse(value));
+          }
+          if (key === 'report-poller:last-run') {
+            lastRunWrites.push(JSON.parse(value));
+          }
+          kvStore.set(key, value);
+        },
+        async delete(key) {
+          kvStore.delete(key);
+        },
+        async list() {
+          return { keys: [], list_complete: true, cursor: null };
+        },
+      },
+    });
+
+    const originalFetch = globalThis.fetch;
+    const OriginalWebSocket = globalThis.WebSocket;
+
+    globalThis.fetch = async (url) => {
+      if (url === `https://reports.example.test/api/event/${targetEventId}`) {
+        return new Response(JSON.stringify({
+          id: targetEventId,
+          kind: 34236,
+          pubkey: uploaderPubkey,
+          created_at: 1778692000,
+          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
+          content: '',
+          sig: '6'.repeat(128),
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    globalThis.WebSocket = class {
+      constructor(url) {
+        this.url = url;
+        this.listeners = {};
+        queueMicrotask(() => this.listeners.open?.({}));
+      }
+
+      addEventListener(type, listener) {
+        this.listeners[type] = listener;
+      }
+
+      send(payload) {
+        const message = JSON.parse(payload);
+        if (message[0] !== 'REQ') {
+          return;
+        }
+        const subscriptionId = message[1];
+        queueMicrotask(() => {
+          this.listeners.message?.({
+            data: JSON.stringify(['EVENT', subscriptionId, {
+              id: reportEventId,
+              kind: 1984,
+              pubkey: reporterPubkey,
+              created_at: reportCreatedAt,
+              tags: [
+                ['e', targetEventId, 'other'],
+                ['client', 'diVine'],
+                ['l', 'NS-aiGenerated', 'social.nos.ontology'],
+              ],
+              content: 'Reason: aiGenerated',
+              sig: '7'.repeat(128),
+            }]),
+          });
+          this.listeners.message?.({ data: JSON.stringify(['EOSE', subscriptionId]) });
+        });
+      }
+
+      close() {
+        this.listeners.close?.({});
+      }
+    };
+
+    try {
+      await worker.scheduled(
+        { cron: '*/5 * * * *', scheduledTime: Date.now() },
+        env,
+        { waitUntil: () => {} },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = OriginalWebSocket;
+    }
+
+    expect(checkpointWrites).toHaveLength(0);
+    expect(JSON.parse(kvStore.get('report-poller:last-poll')).timestamp).toBe(previousCheckpoint);
+    expect(lastRunWrites).toHaveLength(1);
+    expect(lastRunWrites[0]).toMatchObject({
+      totalReports: 1,
+      recorded: 1,
+      saturated: true,
+      safeCheckpoint: null,
+      trigger: 'cron',
+    });
+  });
 });
 
 describe('Transcript reprocess cron integration', () => {

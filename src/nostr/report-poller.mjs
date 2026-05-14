@@ -210,6 +210,7 @@ export async function pollRelayForReports(env, options = {}) {
     reports: [],
     maxTerminalCreatedAt: null,
     safeCheckpoint: null,
+    saturated: false,
   };
   const terminalCreatedAts = [];
   const retryableCreatedAts = [];
@@ -221,6 +222,9 @@ export async function pollRelayForReports(env, options = {}) {
     try {
       const reports = await fetchReports(relayUrl, { since, limit }, env);
       console.log(`[REPORT-POLLER] Fetched ${reports.length} reports from ${relayUrl}`);
+      if (reports.length >= limit) {
+        results.saturated = true;
+      }
 
       for (const report of reports) {
         results.totalReports++;
@@ -281,7 +285,7 @@ export async function pollRelayForReports(env, options = {}) {
   const earliestRetryableCreatedAt = retryableCreatedAts.length > 0
     ? Math.min(...retryableCreatedAts)
     : null;
-  const safeTerminalCreatedAts = hasUnboundedRetryableError
+  const safeTerminalCreatedAts = hasUnboundedRetryableError || results.saturated
     ? []
     : terminalCreatedAts.filter((createdAt) =>
       earliestRetryableCreatedAt === null || createdAt < earliestRetryableCreatedAt
