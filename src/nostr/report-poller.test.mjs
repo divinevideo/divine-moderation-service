@@ -747,4 +747,126 @@ describe('report polling', () => {
       consoleLog.mockRestore();
     }
   });
+
+  it('treats a saturated same-timestamp page as unsafe and does not skip that timestamp boundary', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+    const fetchCalls = [];
+    const reports = [
+      {
+        id: REPORT_EVENT_ID,
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692784,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: 'b'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692784,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+    ];
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 2,
+        maxPages: 5,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async (relayUrl, query) => {
+          fetchCalls.push({ relayUrl, query });
+          return query.until === undefined ? reports : [];
+        },
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(fetchCalls).toEqual([
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 2 } },
+      ]);
+      expect(result).toMatchObject({
+        totalReports: 2,
+        recorded: 2,
+        saturated: true,
+        safeCheckpoint: null,
+      });
+      expect(result.maxTerminalCreatedAt).toBeNull();
+      expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
+
+  it('treats a saturated page with duplicate lower-boundary timestamps as unsafe', async () => {
+    const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const kv = createKv();
+    const fetchCalls = [];
+    const reports = [
+      {
+        id: REPORT_EVENT_ID,
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692785,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: 'b'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692784,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+      {
+        id: '1'.repeat(64),
+        kind: 1984,
+        pubkey: REPORTER,
+        created_at: 1778692784,
+        tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
+        content: '',
+      },
+    ];
+
+    try {
+      const result = await pollRelayForReports({
+        BLOSSOM_DB: {},
+        MODERATION_KV: kv,
+        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      }, {
+        since: 1778680000,
+        limit: 3,
+        maxPages: 5,
+        relays: ['wss://relay.divine.video'],
+        fetchReportsFromRelay: async (relayUrl, query) => {
+          fetchCalls.push({ relayUrl, query });
+          return query.until === undefined ? reports : [];
+        },
+        fetchTargetEvent: async () => TARGET,
+        recordReport: async () => ({ success: true, action: 'REVIEW', distinctReporterCount: 1 }),
+      });
+
+      expect(fetchCalls).toEqual([
+        { relayUrl: 'wss://relay.divine.video', query: { since: 1778680000, limit: 3 } },
+      ]);
+      expect(result).toMatchObject({
+        totalReports: 3,
+        recorded: 3,
+        saturated: true,
+        safeCheckpoint: null,
+      });
+      expect(result.maxTerminalCreatedAt).toBeNull();
+      expect(result.errors).toEqual([]);
+    } finally {
+      consoleLog.mockRestore();
+    }
+  });
 });

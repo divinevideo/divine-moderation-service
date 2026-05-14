@@ -303,7 +303,14 @@ export async function pollRelayForReports(env, options = {}) {
           results.saturated = true;
           break;
         }
-        until = Math.min(...createdAts) - 1;
+        const minCreatedAt = Math.min(...createdAts);
+        const maxCreatedAt = Math.max(...createdAts);
+        const minCreatedAtCount = createdAts.filter((createdAt) => createdAt === minCreatedAt).length;
+        if (minCreatedAt === maxCreatedAt || minCreatedAtCount > 1) {
+          results.saturated = true;
+          break;
+        }
+        until = minCreatedAt - 1;
       }
     } catch (error) {
       console.error(`[REPORT-POLLER] Failed to poll ${relayUrl}:`, error);
