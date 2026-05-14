@@ -113,6 +113,54 @@ describe('reports', () => {
       const count = await getReportCount(db, SHA256);
       expect(count).toBe(2);
     });
+
+    it('stores an explicit created_at timestamp when provided', async () => {
+      const sha256 = 'a'.repeat(64);
+      const reporter = 'b'.repeat(64);
+      const createdAt = '2026-05-13T17:19:42.000Z';
+
+      await addReport(env.BLOSSOM_DB, {
+        sha256,
+        reporter_pubkey: reporter,
+        report_type: 'ai_generated',
+        reason: 'reported from kind 1984',
+        created_at: createdAt,
+      });
+
+      const row = await env.BLOSSOM_DB.prepare(`
+        SELECT sha256, reporter_pubkey, report_type, reason, created_at
+        FROM user_reports
+        WHERE sha256 = ? AND reporter_pubkey = ?
+      `).bind(sha256, reporter).first();
+
+      expect(row).toMatchObject({
+        sha256,
+        reporter_pubkey: reporter,
+        report_type: 'ai_generated',
+        reason: 'reported from kind 1984',
+        created_at: createdAt,
+      });
+    });
+
+    it('keeps CURRENT_TIMESTAMP behavior when created_at is omitted', async () => {
+      const sha256 = 'c'.repeat(64);
+      const reporter = 'd'.repeat(64);
+
+      await addReport(env.BLOSSOM_DB, {
+        sha256,
+        reporter_pubkey: reporter,
+        report_type: 'nudity',
+      });
+
+      const row = await env.BLOSSOM_DB.prepare(`
+        SELECT created_at
+        FROM user_reports
+        WHERE sha256 = ? AND reporter_pubkey = ?
+      `).bind(sha256, reporter).first();
+
+      expect(typeof row.created_at).toBe('string');
+      expect(row.created_at.length).toBeGreaterThan(0);
+    });
   });
 
   describe('escalation thresholds', () => {

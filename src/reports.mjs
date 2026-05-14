@@ -28,14 +28,14 @@ export async function initReportsTable(db) {
  * 2 unique reporters before auto AGE_RESTRICTED to defend against single-token
  * griefing).
  * @param {D1Database} db
- * @param {{sha256: string, reporter_pubkey: string, report_type: string, reason?: string}} report
+ * @param {{sha256: string, reporter_pubkey: string, report_type: string, reason?: string, created_at?: string}} report
  * @returns {Promise<{escalate: 'AGE_RESTRICTED'|'REVIEW'|null, distinctReporterCount: number}>}
  */
-export async function addReport(db, { sha256, reporter_pubkey, report_type, reason }) {
+export async function addReport(db, { sha256, reporter_pubkey, report_type, reason, created_at }) {
   await db.prepare(`
-    INSERT OR IGNORE INTO user_reports (sha256, reporter_pubkey, report_type, reason)
-    VALUES (?, ?, ?, ?)
-  `).bind(sha256, reporter_pubkey, report_type, reason ?? null).run();
+    INSERT OR IGNORE INTO user_reports (sha256, reporter_pubkey, report_type, reason, created_at)
+    VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+  `).bind(sha256, reporter_pubkey, report_type, reason ?? null, created_at ?? null).run();
 
   const row = await db.prepare(`
     SELECT COUNT(DISTINCT reporter_pubkey) AS cnt
