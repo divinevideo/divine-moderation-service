@@ -73,6 +73,7 @@ export function buildAdminVideoFromRow(row, { cdnDomain }) {
     eventId,
     divineUrl: eventId ? `https://divine.video/video/${encodeURIComponent(eventId)}` : null,
     cdnUrl: `https://${cdnDomain}/${row.sha256}`,
+    thumbnailUrl: row.thumbnail_url || null,
     nostrContext: hasContext ? {
       title: row.title || null,
       author: row.author || null,

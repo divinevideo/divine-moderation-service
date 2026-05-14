@@ -21,6 +21,7 @@ const FULL_ROW = {
   author: 'Alice',
   content_url: 'https://example.com/v.mp4',
   published_at: '1717200000',
+  thumbnail_url: 'https://example.com/thumb.jpg',
 };
 
 describe('ADMIN_VIDEO_COLUMNS', () => {
@@ -43,6 +44,7 @@ describe('buildAdminVideoFromRow', () => {
       eventId: FULL_ROW.event_id,
       divineUrl: `https://divine.video/video/${FULL_ROW.event_id}`,
       cdnUrl: `https://media.divine.video/${FULL_ROW.sha256}`,
+      thumbnailUrl: 'https://example.com/thumb.jpg',
       uploaded_by: FULL_ROW.uploaded_by,
       moderated_at: '2026-05-05T00:00:00Z',
       reviewed_by: null,

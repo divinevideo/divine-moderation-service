@@ -1494,18 +1494,18 @@ export default {
       const params = [];
 
       if (actionFilter === 'FLAGGED') {
-        conditions.push("action IN ('REVIEW', 'AGE_RESTRICTED', 'PERMANENT_BAN') AND reviewed_by IS NULL");
+        conditions.push("m.action IN ('REVIEW', 'AGE_RESTRICTED', 'PERMANENT_BAN') AND m.reviewed_by IS NULL");
       } else if (actionFilter === 'QUARANTINE') {
-        conditions.push("action IN ('AGE_RESTRICTED', 'PERMANENT_BAN') AND reviewed_by IS NULL");
+        conditions.push("m.action IN ('AGE_RESTRICTED', 'PERMANENT_BAN') AND m.reviewed_by IS NULL");
       } else if (actionFilter !== 'all') {
-        conditions.push('action = ?');
+        conditions.push('m.action = ?');
         params.push(actionFilter.toUpperCase());
       }
 
       // Date filter — exclude old test content from review queues
       const sinceParam = url.searchParams.get('since');
       if (sinceParam) {
-        conditions.push('moderated_at >= ?');
+        conditions.push('m.moderated_at >= ?');
         params.push(sinceParam);
       }
 
@@ -1517,12 +1517,27 @@ export default {
 
       // Query D1 with pagination. The wide SELECT pulls every column the
       // dashboard needs so we can render directly from the row — no
-      // per-card funnelcake fetch.
+      // per-card funnelcake fetch. The latest Bunny webhook row provides
+      // thumbnail_url for pre-play video posters without touching public
+      // playback or moderation data.
       const query = `
-        SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}
-        FROM moderation_results
+        WITH latest_bunny AS (
+          SELECT sha256, thumbnail_url
+          FROM (
+            SELECT
+              sha256,
+              thumbnail_url,
+              ROW_NUMBER() OVER (PARTITION BY sha256 ORDER BY received_at DESC) AS rn
+            FROM bunny_webhook_events
+            WHERE sha256 IS NOT NULL
+          )
+          WHERE rn = 1
+        )
+        SELECT ${ADMIN_VIDEO_COLUMNS.map((column) => `m.${column}`).join(', ')}, latest_bunny.thumbnail_url
+        FROM moderation_results m
+        LEFT JOIN latest_bunny ON latest_bunny.sha256 = m.sha256
         ${whereClause}
-        ORDER BY moderated_at ${orderDirection}
+        ORDER BY m.moderated_at ${orderDirection}
         LIMIT ? OFFSET ?
       `;
       params.push(limit + 1, offset); // Fetch one extra to check if more exist

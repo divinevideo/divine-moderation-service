@@ -3968,6 +3968,7 @@
       const actionClass = action.toLowerCase();
 
       const playableVideoUrl = getPreferredPlaybackUrl(video);
+      const cardThumbUrl = escapeHtml(video.thumbnailUrl || `https://media.divine.video/${sha256}.jpg`);
 
       // Get all scores, sort by value (highest first), and filter out zero scores
       const scoreEntries = Object.entries(scores || {})
@@ -4063,7 +4064,7 @@
       return `
         <div class="video-card ${actionClass}" data-sha256="${sha256}">
           <div class="video-thumbnail">
-            <img class="video-card-thumb" src="https://media.divine.video/${sha256}.jpg" loading="lazy" alt="" onclick="openVideoModal('${sha256}')" onerror="handleVideoThumbError(this, '${sha256}')">
+            <img class="video-card-thumb" src="${cardThumbUrl}" loading="lazy" alt="" onclick="openVideoModal('${sha256}')" onerror="handleVideoThumbError(this, '${sha256}')">
             <div class="video-overlay">
               <span class="badge ${actionClass}">${action}</span>
               ${manualOverride ? '<span class="badge override-badge">MANUAL</span>' : ''}

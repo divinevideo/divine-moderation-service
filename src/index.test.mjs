@@ -68,7 +68,7 @@ function createDbMock({
           return null;
         },
         async all() {
-          if (sql.includes('FROM moderation_results') && sql.includes('ORDER BY moderated_at')) {
+          if (sql.includes('FROM moderation_results') && /ORDER BY\s+(?:m\.)?moderated_at/i.test(sql)) {
             return { results: moderationListRows };
           }
           if (sql.includes('FROM ai_detection_events') && sql.includes("event_type = 'policy_decision'")) {
@@ -842,7 +842,8 @@ describe('Admin video lookup', () => {
         title: 'REST title',
         author: 'REST author',
         content_url: 'https://media.divine.video/rest-content.mp4',
-        published_at: '1389756506'
+        published_at: '1389756506',
+        thumbnail_url: 'https://media.divine.video/thumb.jpg'
       };
 
       const response = await worker.fetch(
@@ -862,6 +863,7 @@ describe('Admin video lookup', () => {
         videos: [{
           sha256: SHA256,
           uploaded_by: 'b'.repeat(64),
+          thumbnailUrl: 'https://media.divine.video/thumb.jpg',
           eventId: 'd'.repeat(64),
           divineUrl: `https://divine.video/video/${'d'.repeat(64)}`,
           nostrContext: {

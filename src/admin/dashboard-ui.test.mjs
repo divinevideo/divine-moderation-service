@@ -29,4 +29,10 @@ describe('dashboard provenance UI hooks', () => {
     expect(dashboardHTML).toContain('AI Detection');
     expect(dashboardHTML).toContain('Estimated spend avoided');
   });
+
+  it('renders poster thumbnails before video playback starts', () => {
+    expect(dashboardHTML).toContain('const cardThumbUrl = escapeHtml(video.thumbnailUrl || `https://media.divine.video/${sha256}.jpg`);');
+    expect(dashboardHTML).toContain('src="${cardThumbUrl}"');
+    expect(dashboardHTML).toContain('openVideoModal');
+  });
 });
