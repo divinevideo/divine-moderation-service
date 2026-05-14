@@ -2685,11 +2685,24 @@ export default {
     }
 
     // Get report polling status
-    if (url.pathname === '/admin/api/report-polling/status' && request.method === 'GET') {
+    if (url.pathname === '/admin/api/report-polling/status') {
       const authError = await requireAuth(request, env);
       if (authError) {
         console.log(`[${requestId}] Unauthorized access to report-polling/status`);
         return authError;
+      }
+
+      if (request.method !== 'GET') {
+        return new Response(JSON.stringify({
+          error: 'Method not allowed',
+          allowedMethods: ['GET'],
+        }), {
+          status: 405,
+          headers: {
+            'Content-Type': 'application/json',
+            'Allow': 'GET',
+          },
+        });
       }
 
       console.log(`[${requestId}] Fetching report polling status`);

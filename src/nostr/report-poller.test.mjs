@@ -443,7 +443,9 @@ describe('ReportPollingStatus', () => {
         errors: 1,
       })],
       ['report-poller:last-run', JSON.stringify({
-        lastRunAt: '2026-05-13T17:25:00.000Z',
+        timestamp: '2026-05-13T17:25:00.000Z',
+        totalReports: 3,
+        recorded: 2,
         saturated: true,
         safeCheckpoint: null,
       })],
@@ -460,7 +462,9 @@ describe('ReportPollingStatus', () => {
       recorded: 2,
       errors: 1,
       lastRun: {
-        lastRunAt: '2026-05-13T17:25:00.000Z',
+        timestamp: '2026-05-13T17:25:00.000Z',
+        totalReports: 3,
+        recorded: 2,
         saturated: true,
         safeCheckpoint: null,
       },

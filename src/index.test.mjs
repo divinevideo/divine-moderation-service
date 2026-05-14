@@ -3010,7 +3010,9 @@ describe('Report polling cron integration', () => {
           }
           if (key === 'report-poller:last-run') {
             return JSON.stringify({
-              lastRunAt: '2026-05-13T17:25:00.000Z',
+              timestamp: '2026-05-13T17:25:00.000Z',
+              totalReports: 3,
+              recorded: 2,
               saturated: true,
               safeCheckpoint: null,
             });
@@ -3037,14 +3039,16 @@ describe('Report polling cron integration', () => {
       recorded: 2,
       errors: 1,
       lastRun: {
-        lastRunAt: '2026-05-13T17:25:00.000Z',
+        timestamp: '2026-05-13T17:25:00.000Z',
+        totalReports: 3,
+        recorded: 2,
         saturated: true,
         safeCheckpoint: null,
       },
     });
   });
 
-  it('does not return report polling status for POST requests', async () => {
+  it('returns method not allowed for POST report polling status requests', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
       REPORT_POLLING_ENABLED: 'true',
@@ -3074,10 +3078,13 @@ describe('Report polling cron integration', () => {
       env,
     );
 
-    expect(response.headers.get('Content-Type') || '').not.toContain('application/json');
-    const body = await response.text();
-    expect(body).not.toContain('"totalReports":3');
-    expect(body).not.toContain('"recorded":2');
+    expect(response.status).toBe(405);
+    expect(response.headers.get('Allow')).toBe('GET');
+    expect(response.headers.get('Content-Type') || '').toContain('application/json');
+    await expect(response.json()).resolves.toEqual({
+      error: 'Method not allowed',
+      allowedMethods: ['GET'],
+    });
   });
 
   it('runs inbound report polling and records kind 1984 reports for review', async () => {
