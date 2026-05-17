@@ -1428,6 +1428,7 @@
     function createVideoCard(video) {
       const { sha256, scores, detailedCategories, isUntriaged, classifierSummary } = video;
       const videoUrl = '/admin/video/' + sha256 + '.mp4';
+      const posterUrl = escapeHtml(video.thumbnailUrl || '');
       const provenanceHTML = renderProvenanceSummary(video.provenance, video.c2pa);
 
       const scoreEntries = Object.entries(scores || {})
@@ -1488,7 +1489,7 @@
             <div class="review-primary-layout">
               <div class="review-media-column">
                 <div class="video-wrapper">
-                  <video src="${videoUrl}" controls loop preload="auto"></video>
+                  <video src="${videoUrl}" controls loop preload="auto" poster="${posterUrl}"></video>
                 </div>
               </div>
 

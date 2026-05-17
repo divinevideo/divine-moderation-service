@@ -21,4 +21,9 @@ describe('swipe review provenance UI hooks', () => {
     expect(swipeReviewHTML).toContain('Invalid Proof');
     expect(swipeReviewHTML).toContain('c2pa-badge');
   });
+
+  it('renders poster thumbnails before video playback starts', () => {
+    expect(swipeReviewHTML).toContain('const posterUrl = escapeHtml(video.thumbnailUrl || \'\');');
+    expect(swipeReviewHTML).toContain('poster="${posterUrl}"');
+  });
 });
