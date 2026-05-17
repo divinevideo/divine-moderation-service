@@ -12,7 +12,7 @@ Content moderation service for Divine 6-second videos using Sightengine API and 
   - **QUARANTINE**: High risk content, blocked immediately
 - **AI-Generated Content Detection**: Identifies AI-generated videos to maintain authentic content policy
 - **Late Transcript Reprocessing**: Tracks `202 Pending` transcript runs and reprocesses them on cron when transcripts are ready
-- **Nostr Integration**: Publishes NIP-56 (kind 1984) events for human moderation
+- **Nostr Integration**: Publishes and ingests NIP-56 (kind 1984) report events for human moderation
 - **Cost Optimized**: ~$0.003 per 6-second video
 - **Full Test Coverage**: 40 tests covering all components
 
@@ -28,7 +28,7 @@ Moderation Worker
   ├─> Detection (NSFW, Violence, AI-Generated)
   ├─> Classification (SAFE/REVIEW/QUARANTINE)
   ├─> KV Storage (results + quarantine flags)
-  └─> Nostr Events (relay3.openvine.co for human review)
+  └─> Nostr Events (human review reports)
 ```
 
 ## Quick Start
@@ -247,7 +247,33 @@ Published as NIP-56 (kind 1984) reporting events:
 }
 ```
 
-**Note**: Nostr kind 1984 events are currently blocked by relay3.openvine.co. Core moderation continues to function; human review notifications temporarily unavailable until relay configuration is updated.
+### Inbound relay reports
+
+The Worker also ingests public NIP-56 reports from Nostr. On the five-minute cron,
+the report poller reads kind `1984` events from `REPORT_POLLING_RELAY_URL`
+(`wss://relay.divine.video` in production). By default, accepted inbound reports
+must come from the diVine client: `RELAY_REPORTS_REQUIRE_DIVINE_CLIENT=true`
+requires a `client` tag value of `divine`.
+
+Accepted reports are resolved through their target `e` tag. The poller fetches
+that target event, extracts the reported media SHA, and records the same
+`user_reports` and `moderation_results` review rows used by authenticated
+`POST /api/v1/report` submissions. Relay-originated reports are review-only:
+they do not auto-escalate to `AGE_RESTRICTED` because relay client tags and
+reporter pubkeys are public, self-asserted signals.
+
+Operational KV keys:
+
+- `report-poller:last-poll`: checkpoint timestamp for the next bounded relay query
+- `report-poller:last-run`: summary of the most recent report polling cron run
+- `report-poller:last-error`: most recent report polling cron error
+- `report-poller:processed:<event_id>`: idempotence marker for a processed or terminally skipped report event
+
+Checkpointing is conservative. The Worker advances `report-poller:last-poll`
+only to safe terminal report timestamps. Retryable failures do not advance the
+checkpoint. Saturated relay pages record a `resumeUntil` boundary in
+`report-poller:last-run`, so the next cron can continue paging older reports
+without pretending the whole window is safely checkpointed.
 
 ## Cost Breakdown
 

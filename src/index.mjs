@@ -13,18 +13,20 @@ import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
 import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
+import { getLastReportPollTimestamp, getReportLastRun, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
 import messagesHTML from './admin/messages.html';
-import { initReportsTable, addReport, isAiReportType, isNsfwReportType } from './reports.mjs';
+import { initReportsTable } from './reports.mjs';
 import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforcement, applyUploaderEnforcementToResult } from './uploader-enforcement.mjs';
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { extractTopics, topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
 import { classifyModerationResult, getKVThresholds, kvThresholdsToEnv, setKVThresholds, DEFAULT_THRESHOLDS } from './moderation/classifier.mjs';
 import { shouldForceAIDetection } from './moderation/ai-detection-policy.mjs';
-import { buildAIOutcomeEvent, buildAIPolicyDecisionEvent, buildAIReportEvent, getAIDetectionStats, initAIDetectionEventsTable, recordAIDetectionEvent } from './moderation/ai-detection-events.mjs';
+import { buildAIOutcomeEvent, buildAIPolicyDecisionEvent, getAIDetectionStats, initAIDetectionEventsTable, recordAIDetectionEvent } from './moderation/ai-detection-events.mjs';
+import { recordReportForReview } from './moderation/report-review.mjs';
 import { isValidSha256, isValidLookupIdentifier, isValidPubkey, parseMaybeJson, getEventTagValue, parseImetaParams, extractShaFromUrl, extractMediaShaFromEvent } from './validation.mjs';
 import { parseRetryAfterSeconds } from './http-utils.mjs';
 import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
@@ -2697,6 +2699,35 @@ export default {
       });
     }
 
+    // Get report polling status
+    if (url.pathname === '/admin/api/report-polling/status') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to report-polling/status`);
+        return authError;
+      }
+
+      if (request.method !== 'GET') {
+        return new Response(JSON.stringify({
+          error: 'Method not allowed',
+          allowedMethods: ['GET'],
+        }), {
+          status: 405,
+          headers: {
+            'Content-Type': 'application/json',
+            'Allow': 'GET',
+          },
+        });
+      }
+
+      console.log(`[${requestId}] Fetching report polling status`);
+      const status = await getReportPollingStatus(env);
+
+      return new Response(JSON.stringify(status), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     // Manually trigger relay polling
     if (url.pathname === '/admin/api/relay-polling/trigger' && request.method === 'POST') {
       const authError = await requireAuth(request, env);
@@ -3770,92 +3801,21 @@ async function runMigration() {
         }
         const sha256 = rawSha;
 
-        const result = await addReport(env.BLOSSOM_DB, { sha256, reporter_pubkey, report_type, reason });
+        const result = await recordReportForReview(env.BLOSSOM_DB, {
+          sha256,
+          reporterPubkey: reporter_pubkey,
+          reportType: report_type,
+          reason,
+          source: 'user-report',
+        });
 
-        console.log(`[API] Report added: ${sha256} by ${reporter_pubkey.substring(0, 16)}... distinctReporters=${result.distinctReporterCount}`);
+        console.log(`[API] Recorded ${result.action} from user report for ${sha256} (type=${report_type}, distinctReporters=${result.distinctReporterCount})`);
 
-        // Write a moderation_results row directly so the team's FLAGGED dashboard
-        // (action IN REVIEW/AGE_RESTRICTED/PERMANENT_BAN AND reviewed_by IS NULL)
-        // surfaces the reported item.
-        //
-        // Policy:
-        //   - Non-NSFW report (single tier): action = REVIEW
-        //   - NSFW report: action = REVIEW on first reporter; auto AGE_RESTRICTED
-        //     once 2+ DISTINCT reporter_pubkeys have flagged the same sha256.
-        //     The 2-distinct-reporter floor defends against single-token griefing
-        //     where one API caller could otherwise auto age-restrict any sha256
-        //     by varying the reporter_pubkey field.
-        //
-        // ON CONFLICT short-circuits if a moderator already reviewed the row
-        // (reviewed_by IS NOT NULL) so human decisions are never overwritten.
-        const isNsfw = isNsfwReportType(report_type);
-        const reportAction = (isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
-        const nowIso = new Date().toISOString();
-        const reportCategories = isNsfw ? ['adult'] : [];
-        try {
-          await env.BLOSSOM_DB.prepare(`
-            INSERT INTO moderation_results (
-              sha256, action, provider, scores, categories, raw_response, moderated_at, reviewed_by, reviewed_at, review_notes, uploaded_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(sha256) DO UPDATE SET
-              action = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.action
-                WHEN moderation_results.action = 'PERMANENT_BAN' THEN moderation_results.action
-                WHEN excluded.action = 'AGE_RESTRICTED' AND moderation_results.action IN ('SAFE', 'REVIEW') THEN excluded.action
-                WHEN excluded.action = 'REVIEW' AND moderation_results.action = 'SAFE' THEN excluded.action
-                ELSE moderation_results.action
-              END,
-              provider = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.provider
-                ELSE excluded.provider
-              END,
-              categories = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.categories
-                ELSE excluded.categories
-              END,
-              moderated_at = CASE
-                WHEN moderation_results.reviewed_by IS NOT NULL THEN moderation_results.moderated_at
-                ELSE excluded.moderated_at
-              END
-          `).bind(
-            sha256,
-            reportAction,
-            'user-report',
-            JSON.stringify({}),
-            JSON.stringify(reportCategories),
-            JSON.stringify({
-              source: 'user-report',
-              reportType: report_type,
-              reportedBy: reporter_pubkey,
-              distinctReporterCount: result.distinctReporterCount,
-              reason: reason ?? null,
-            }),
-            nowIso,
-            null,
-            null,
-            null,
-            null,
-          ).run();
-          console.log(`[API] Recorded ${reportAction} from user report for ${sha256} (type=${report_type}, nsfw=${isNsfw}, distinctReporters=${result.distinctReporterCount})`);
-        } catch (writeErr) {
-          console.error(`[API] Failed to write moderation row for reported ${sha256}:`, writeErr.message);
-        }
-
-        // Preserve existing AI-detection telemetry: AI-typed reports still record
-        // an ai_detection_events row so dashboards keep their report counts.
-        if (isAiReportType(report_type)) {
-          try {
-            await recordAIDetectionEvent(env.BLOSSOM_DB, buildAIReportEvent({
-              sha256,
-              reportType: report_type,
-              createdAt: nowIso,
-            }));
-          } catch (eventErr) {
-            console.error(`[API] Failed to record AI report event for ${sha256}:`, eventErr.message);
-          }
-        }
-
-        return new Response(JSON.stringify({ success: true, ...result }), {
+        return new Response(JSON.stringify({
+          success: true,
+          escalate: result.escalate,
+          distinctReporterCount: result.distinctReporterCount,
+        }), {
           headers: { 'Content-Type': 'application/json' }
         });
       } catch (error) {
@@ -4834,6 +4794,88 @@ async function runMigration() {
             }));
           } catch (kvError) {
             console.error('[RELAY-POLLER] Failed to store error:', kvError);
+          }
+        }
+      }
+
+      if (env.REPORT_POLLING_ENABLED === 'false') {
+        console.log('[REPORT-POLLER] Report polling is disabled, skipping');
+      } else {
+        try {
+          let since = await getLastReportPollTimestamp(env);
+
+          if (!since) {
+            const lookbackHours = parseInt(env.REPORT_POLLING_LOOKBACK_HOURS || '24', 10);
+            since = Math.floor(Date.now() / 1000) - (lookbackHours * 3600);
+            console.log(`[REPORT-POLLER] First report poll run, looking back ${lookbackHours} hours`);
+          } else {
+            console.log(`[REPORT-POLLER] Continuing report polling from ${new Date(since * 1000).toISOString()}`);
+          }
+
+          const relays = env.REPORT_POLLING_RELAY_URL
+            ? [env.REPORT_POLLING_RELAY_URL]
+            : env.RELAY_POLLING_RELAY_URL
+              ? [env.RELAY_POLLING_RELAY_URL]
+              : ['wss://relay.divine.video'];
+
+          const lastRun = await getReportLastRun(env);
+          const resumeUntil = Number.isInteger(lastRun?.resumeUntil) && lastRun.resumeUntil > since
+            ? lastRun.resumeUntil
+            : null;
+          if (resumeUntil) {
+            console.log(`[REPORT-POLLER] Resuming saturated report polling page until ${new Date(resumeUntil * 1000).toISOString()}`);
+          }
+
+          const results = await pollRelayForReports(env, {
+            since,
+            ...(resumeUntil ? { until: resumeUntil } : {}),
+            limit: parseInt(env.REPORT_POLLING_LIMIT || '100', 10),
+            maxPages: parseInt(env.REPORT_POLLING_MAX_PAGES || '5', 10),
+            relays,
+          });
+
+          const pollStats = {
+            totalReports: results.totalReports,
+            recorded: results.recorded,
+            alreadyProcessed: results.alreadyProcessed,
+            skipped: results.skipped,
+            targetUnavailable: results.targetUnavailable,
+            errors: results.errors.length,
+            safeCheckpoint: results.safeCheckpoint,
+            saturated: results.saturated,
+            resumeUntil: results.resumeUntil,
+            trigger: 'cron',
+          };
+
+          if (results.safeCheckpoint) {
+            await setLastReportPollTimestamp(env, results.safeCheckpoint, pollStats);
+          }
+
+          try {
+            await env.MODERATION_KV.put('report-poller:last-run', JSON.stringify({
+              ...pollStats,
+              timestamp: new Date().toISOString(),
+            }));
+          } catch (kvError) {
+            console.error('[REPORT-POLLER] Failed to store last run stats:', kvError);
+          }
+
+          if (!results.safeCheckpoint) {
+            console.log('[REPORT-POLLER] No safe checkpoint from this run; leaving report checkpoint unchanged');
+          }
+
+          console.log(`[REPORT-POLLER] Cron complete: ${results.totalReports} reports found, ${results.recorded} recorded, ${results.skipped} skipped, ${results.targetUnavailable} target unavailable, ${results.errors.length} errors`);
+        } catch (error) {
+          console.error('[REPORT-POLLER] Cron poll failed:', error);
+
+          try {
+            await env.MODERATION_KV.put('report-poller:last-error', JSON.stringify({
+              error: error.message,
+              stack: error.stack,
+              timestamp: new Date().toISOString(),
+            }));
+          } catch (kvError) {
+            console.error('[REPORT-POLLER] Failed to store error:', kvError);
           }
         }
       }
