@@ -3925,7 +3925,7 @@ async function runMigration() {
         }
 
         // Validate action
-        const validActions = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN'];
+        const validActions = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN', 'DELETE'];
         if (!validActions.includes(action.toUpperCase())) {
           return new Response(JSON.stringify({
             error: `Invalid action. Must be one of: ${validActions.join(', ')}`
