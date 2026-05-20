@@ -1365,6 +1365,48 @@ async function handleLegacyStatus(sha256, env) {
   });
 }
 
+async function handlePublicCheckResult(url, env) {
+  const sha256 = url.pathname.split('/')[2];
+  const d1Result = await env.BLOSSOM_DB.prepare(`
+    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
+    FROM moderation_results
+    WHERE sha256 = ?
+  `).bind(sha256).first();
+
+  if (!d1Result) {
+    return corsResponse(new Response(JSON.stringify({
+      sha256,
+      status: 'unknown',
+      moderated: false,
+      blocked: false,
+      age_restricted: false
+    }, null, 2), {
+      headers: { 'Content-Type': 'application/json' }
+    }));
+  }
+
+  const action = d1Result.action;
+  return corsResponse(new Response(JSON.stringify({
+    sha256,
+    status: action.toLowerCase(),
+    moderated: true,
+    blocked: action === 'PERMANENT_BAN',
+    quarantined: action === 'QUARANTINE',
+    age_restricted: action === 'AGE_RESTRICTED',
+    needs_review: action === 'REVIEW' || action === 'QUARANTINE' || action === 'PERMANENT_BAN',
+    action,
+    provider: d1Result.provider,
+    scores: d1Result.scores ? JSON.parse(d1Result.scores) : null,
+    categories: d1Result.categories ? JSON.parse(d1Result.categories) : null,
+    videoseal: parseMaybeJson(d1Result.videoseal, null),
+    moderated_at: d1Result.moderated_at,
+    reviewed_by: d1Result.reviewed_by,
+    reviewed_at: d1Result.reviewed_at
+  }, null, 2), {
+    headers: { 'Content-Type': 'application/json' }
+  }));
+}
+
 export default {
   /**
    * HTTP handler for testing and admin dashboard
@@ -1404,6 +1446,13 @@ export default {
     if (!isLocalRequest && hostname === API_HOSTNAME && !isApiSurfacePath(url.pathname)) {
       const expectedHost = url.pathname.startsWith('/admin') ? ADMIN_HOSTNAME : API_HOSTNAME;
       return hostMismatchResponse(requestId, hostname, url.pathname, expectedHost);
+    }
+
+    if (url.pathname.startsWith('/check-result/')) {
+      if (request.method === 'OPTIONS') {
+        return corsResponse(new Response(null, { status: 204 }));
+      }
+      return handlePublicCheckResult(url, env);
     }
 
     await initUploaderEnforcementTable(env.BLOSSOM_DB);
@@ -4001,52 +4050,6 @@ async function runMigration() {
           headers: { 'Content-Type': 'application/json' }
         });
       }
-    }
-
-    // Check moderation result
-    if (url.pathname.startsWith('/check-result/')) {
-      const sha256 = url.pathname.split('/')[2];
-
-      // Query D1 for moderation result
-      const d1Result = await env.BLOSSOM_DB.prepare(`
-        SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
-        FROM moderation_results
-        WHERE sha256 = ?
-      `).bind(sha256).first();
-
-      if (!d1Result) {
-        return corsResponse(new Response(JSON.stringify({
-          sha256,
-          status: 'unknown',
-          moderated: false,
-          blocked: false,
-          age_restricted: false
-        }, null, 2), {
-          headers: { 'Content-Type': 'application/json' }
-        }));
-      }
-
-      // Simplified response for external tools
-      const action = d1Result.action;
-      return corsResponse(new Response(JSON.stringify({
-        sha256,
-        status: action.toLowerCase(),
-        moderated: true,
-        blocked: action === 'PERMANENT_BAN',
-        quarantined: action === 'QUARANTINE',
-        age_restricted: action === 'AGE_RESTRICTED',
-        needs_review: action === 'REVIEW' || action === 'QUARANTINE' || action === 'PERMANENT_BAN',
-        action,
-        provider: d1Result.provider,
-        scores: d1Result.scores ? JSON.parse(d1Result.scores) : null,
-        categories: d1Result.categories ? JSON.parse(d1Result.categories) : null,
-        videoseal: parseMaybeJson(d1Result.videoseal, null),
-        moderated_at: d1Result.moderated_at,
-        reviewed_by: d1Result.reviewed_by,
-        reviewed_at: d1Result.reviewed_at
-      }, null, 2), {
-        headers: { 'Content-Type': 'application/json' }
-      }));
     }
 
     // API: Canonical moderation vocabulary (public, no auth required)

@@ -20,9 +20,11 @@ function createDbMock({
   aiDetectionRecentRows = [],
   moderationWrites = [],
   reporterCount = 1,
+  onPrepare = null,
 } = {}) {
   return {
     prepare(sql) {
+      onPrepare?.(sql);
       let bindings = [];
 
       return {
@@ -148,6 +150,58 @@ describe('HTTP hostname routing', () => {
       action: 'SAFE',
       status: 'safe'
     });
+  });
+
+  it('serves public moderation status without schema initialization', async () => {
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'SAFE',
+          provider: 'hiveai',
+          scores: JSON.stringify({ nudity: 0.01 }),
+          categories: JSON.stringify(['safe']),
+          moderated_at: '2026-03-07T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null
+        }]]),
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-result/${SHA256}`),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(preparedSql.some((sql) => /CREATE\s+(?:TABLE|INDEX)/i.test(sql))).toBe(false);
+    expect(preparedSql).toHaveLength(1);
+  });
+
+  it('serves public moderation preflight without database access', async () => {
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-result/${SHA256}`, {
+        method: 'OPTIONS'
+      }),
+      env
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(preparedSql).toHaveLength(0);
   });
 
   it('rejects admin routes on moderation-api host', async () => {
