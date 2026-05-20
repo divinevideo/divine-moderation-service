@@ -2733,6 +2733,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_WEBHOOK_SECRET: 'test-secret',
@@ -2843,6 +2844,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_WEBHOOK_SECRET: 'test-secret',
@@ -2918,6 +2920,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_DB: {
@@ -2992,6 +2995,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_DB: {
         prepare() {
@@ -4001,6 +4005,7 @@ describe('Transcript reprocess cron integration', () => {
       CDN_DOMAIN: 'media.divine.video',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       TRANSCRIPT_REPROCESS_MAX_AGE_DAYS: '7',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_DB: {
         prepare(sql) {
