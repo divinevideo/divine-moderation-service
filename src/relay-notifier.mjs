@@ -49,7 +49,7 @@ function buildNip98Token(privateKeyHex, method, url, bodyBytes) {
  *
  * @param {string} sha256Hex Video sha256 (carried for logging only)
  * @param {string|null} eventId Relay event id (kind 34236). Required.
- * @param {string} action SAFE | REVIEW | QUARANTINE | AGE_RESTRICTED | PERMANENT_BAN
+ * @param {string} action SAFE | REVIEW | QUARANTINE | AGE_RESTRICTED | PERMANENT_BAN | DELETE
  * @param {Object} env Worker env. Reads FUNNELCAKE_ADMIN_URL, NOSTR_PRIVATE_KEY.
  * @param {typeof fetch} [fetcher] Injected fetch for testing.
  * @returns {Promise<{success: boolean, skipped?: boolean, reason?: string, error?: string}>}
@@ -66,6 +66,11 @@ export async function notifyRelay(sha256Hex, eventId, action, env, fetcher = fet
   if (action === 'REVIEW') {
     // REVIEW is internal — content stays publicly accessible until a moderator decides.
     return { success: true, skipped: true, reason: 'REVIEW is internal-only' };
+  }
+  if (action === 'DELETE') {
+    // Creator kind-5 deletes already handled relay-side removal before this
+    // moderation API path mirrors the terminal blob state into Blossom.
+    return { success: true, skipped: true, reason: 'DELETE assumes relay-side removal already happened' };
   }
   if (!eventId) {
     return { success: true, skipped: true, reason: 'no event_id on moderation result' };
