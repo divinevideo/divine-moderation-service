@@ -1880,6 +1880,85 @@ describe('notifyBlossom integration via admin moderate endpoint', () => {
     }
   });
 
+  it('accepts DELETE for /api/v1/moderate and skips relay-side enforcement', async () => {
+    const sha256 = 'd'.repeat(64);
+    const kvStore = new Map();
+    const moderationWrites = [];
+    let relayFetchCalled = false;
+    const env = {
+      ALLOW_DEV_ACCESS: 'true',
+      SERVICE_API_TOKEN: 'test-service-token',
+      BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
+      BLOSSOM_WEBHOOK_SECRET: 'test-webhook-secret',
+      FUNNELCAKE_ADMIN_URL: 'https://mock-relay.test',
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[sha256, {
+          sha256,
+          action: 'REVIEW',
+          provider: 'hiveai',
+          scores: JSON.stringify({}),
+          categories: JSON.stringify([]),
+          moderated_at: '2026-03-12T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null,
+          event_id: 'e'.repeat(64)
+        }]]),
+        moderationWrites
+      }),
+      MODERATION_KV: {
+        store: kvStore,
+        async get(key) { return kvStore.get(key) ?? null; },
+        async put(key, value) { kvStore.set(key, value); },
+        async delete(key) { kvStore.delete(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      },
+      MODERATION_QUEUE: { async send() {} },
+    };
+
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      if (url === 'https://mock-blossom.test/admin/moderate') {
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      if (typeof url === 'string' && url.startsWith('https://mock-relay.test/')) {
+        relayFetchCalled = true;
+        throw new Error('relay should not be called for DELETE');
+      }
+      return origFetch(url, init);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request('https://moderation-api.divine.video/api/v1/moderate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer test-service-token',
+          },
+          body: JSON.stringify({
+            sha256,
+            action: 'DELETE',
+            reason: 'creator deleted via kind-5',
+            source: 'relay-manager',
+          }),
+        }),
+        env
+      );
+
+      expect(response.status).toBe(200);
+      const data = await response.json();
+      expect(data.success).toBe(true);
+      expect(data.action).toBe('DELETE');
+      expect(data.blossom_notified).toBe(true);
+      expect(data.relay_notified).toBe(false);
+      expect(relayFetchCalled).toBe(false);
+      expect(moderationWrites).toHaveLength(1);
+      expect(moderationWrites[0].bindings[1]).toBe('DELETE');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   it('returns 502 when Blossom webhook fails for /admin/api/moderate', async () => {
     const sha256 = 'b'.repeat(64);
     const kvStore = new Map();

@@ -173,7 +173,8 @@ describe('GET /admin/api/uploader/:pubkey', () => {
       REVIEW: 1,
       QUARANTINE: 0,
       AGE_RESTRICTED: 0,
-      PERMANENT_BAN: 1
+      PERMANENT_BAN: 1,
+      DELETE: 0
     });
     expect(body.recentFlagged).toHaveLength(2);
     expect(body.recentFlagged[0].action).toBe('PERMANENT_BAN');
@@ -205,7 +206,8 @@ describe('GET /admin/api/uploader/:pubkey', () => {
       REVIEW: 0,
       QUARANTINE: 0,
       AGE_RESTRICTED: 0,
-      PERMANENT_BAN: 0
+      PERMANENT_BAN: 0,
+      DELETE: 0
     });
     expect(body.recentFlagged).toEqual([]);
     expect(body.dmCount).toBe(0);
@@ -229,7 +231,8 @@ describe('GET /admin/api/uploader/:pubkey', () => {
           { sha256: sha(2), uploaded_by: PUBKEY, action: 'REVIEW', moderated_at: '2026-01-02T00:00:00.000Z' },
           { sha256: sha(3), uploaded_by: PUBKEY, action: 'QUARANTINE', moderated_at: '2026-01-03T00:00:00.000Z' },
           { sha256: sha(4), uploaded_by: PUBKEY, action: 'AGE_RESTRICTED', moderated_at: '2026-01-04T00:00:00.000Z' },
-          { sha256: sha(5), uploaded_by: PUBKEY, action: 'PERMANENT_BAN', moderated_at: '2026-01-05T00:00:00.000Z' }
+          { sha256: sha(5), uploaded_by: PUBKEY, action: 'PERMANENT_BAN', moderated_at: '2026-01-05T00:00:00.000Z' },
+          { sha256: sha(6), uploaded_by: PUBKEY, action: 'DELETE', moderated_at: '2026-01-06T00:00:00.000Z' }
         ]
       })
     });
@@ -247,8 +250,9 @@ describe('GET /admin/api/uploader/:pubkey', () => {
       REVIEW: 1,
       QUARANTINE: 1,
       AGE_RESTRICTED: 1,
-      PERMANENT_BAN: 1
+      PERMANENT_BAN: 1,
+      DELETE: 1
     });
-    expect(body.totals.videos).toBe(5);
+    expect(body.totals.videos).toBe(6);
   });
 });

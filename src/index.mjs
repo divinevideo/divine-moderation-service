@@ -80,7 +80,9 @@ const API_HOSTNAME = 'moderation-api.divine.video';
 // via env.RELAY_ADMIN_URL if needed for staging or rollback.
 const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
-const VALID_MODERATION_ACTIONS = new Set(['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN']);
+const MODERATION_ACTIONS = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN', 'DELETE'];
+const ADMIN_MODERATION_ACTIONS = MODERATION_ACTIONS.filter((action) => action !== 'DELETE');
+const VALID_MODERATION_ACTIONS = new Set(MODERATION_ACTIONS);
 
 // ETags for admin HTML pages — computed once at module load, change only on deploy.
 // Allows browsers to cache the HTML but revalidate on every request (304 if unchanged).
@@ -944,7 +946,7 @@ async function enrichAdminLookupVideo(video, env) {
   return enriched;
 }
 
-const UPLOADER_HISTORY_ACTIONS = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN'];
+const UPLOADER_HISTORY_ACTIONS = MODERATION_ACTIONS;
 
 function extractReasonFromRow(row) {
   if (row.review_notes) return row.review_notes;
@@ -1994,8 +1996,8 @@ export default {
       const { action, reason, scores, videoUrl, uploadedBy } = await request.json();
 
       // Validate action
-      if (!['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN'].includes(action)) {
-        return new Response(JSON.stringify({ error: 'Invalid action. Must be SAFE, REVIEW, QUARANTINE, AGE_RESTRICTED, or PERMANENT_BAN' }), {
+      if (!ADMIN_MODERATION_ACTIONS.includes(action)) {
+        return new Response(JSON.stringify({ error: `Invalid action. Must be ${ADMIN_MODERATION_ACTIONS.join(', ')}` }), {
           status: 400,
           headers: { 'Content-Type': 'application/json' }
         });
@@ -3925,10 +3927,9 @@ async function runMigration() {
         }
 
         // Validate action
-        const validActions = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN'];
-        if (!validActions.includes(action.toUpperCase())) {
+        if (!VALID_MODERATION_ACTIONS.has(action.toUpperCase())) {
           return new Response(JSON.stringify({
-            error: `Invalid action. Must be one of: ${validActions.join(', ')}`
+            error: `Invalid action. Must be one of: ${MODERATION_ACTIONS.join(', ')}`
           }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' }
