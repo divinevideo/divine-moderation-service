@@ -138,7 +138,7 @@ BACKFILL_ENABLED = "false"
 BACKFILL_ROWS_PER_TICK = "200"
 
 # Creator-delete pipeline feature flag (default off; flip to "true" via `wrangler secret put` or [vars] once ready)
-CREATOR_DELETE_PIPELINE_ENABLED = "false"
+CREATOR_DELETE_PIPELINE_ENABLED = "true"
 # Relay used to fetch creator kind 5 delete events and target video events.
 CREATOR_DELETE_RELAY_URL = "wss://relay.divine.video"
 
