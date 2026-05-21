@@ -525,6 +525,8 @@ describe('fetchNostrEventsBySha256Batch', () => {
 });
 
 describe('fetchNostrEventById', () => {
+  const VALID_ID = 'a'.repeat(64);
+
   it('returns null for non-hex event IDs without fetching', async () => {
     const originalFetch = globalThis.fetch;
     let called = false;
@@ -536,6 +538,83 @@ describe('fetchNostrEventById', () => {
     try {
       await expect(fetchNostrEventById('../not-hex')).resolves.toBeNull();
       expect(called).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and all relays return 5xx', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 503 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and all relays throw network errors', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('connection refused'); };
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and relay returns 429', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 429 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('returns null when throwOnTransient and relay returns 404', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 404 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).resolves.toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('returns null when one relay 503 + one relay 404 with throwOnTransient', async () => {
+    const originalFetch = globalThis.fetch;
+    let callCount = 0;
+    globalThis.fetch = async () => {
+      callCount++;
+      if (callCount === 1) return new Response('', { status: 503 });
+      return new Response('', { status: 404 });
+    };
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test', 'wss://r2.test'], {}, { throwOnTransient: true })
+      ).resolves.toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('returns null on all-503 without throwOnTransient (backward compat)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 503 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'])
+      ).resolves.toBeNull();
     } finally {
       globalThis.fetch = originalFetch;
     }

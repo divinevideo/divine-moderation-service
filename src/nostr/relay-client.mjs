@@ -453,15 +453,19 @@ export async function fetchKind5EventsSince(sinceSeconds, relayUrl = 'wss://rela
   return queryRelay(relayUrl, { kinds: [5], since: sinceSeconds }, env, { collectAll: true });
 }
 
-export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine.video'], env = {}) {
+export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine.video'], env = {}, options = {}) {
   // Reject non-hex IDs to prevent path-traversal via attacker-controlled kind 5 e-tags
   if (!eventId || !/^[a-f0-9]{64}$/i.test(eventId)) return null;
+
+  let anyDefinitiveResponse = false;
+  let relaysAttempted = 0;
 
   for (const relayUrl of relays) {
     // Use Funnelcake's REST API (GET /api/event/{id}) instead of WebSocket REQ.
     // Faster (no upgrade handshake), works in local dev (Miniflare), and the
     // endpoint returns a raw Nostr event: { id, pubkey, created_at, kind, tags, content, sig }.
     const apiBaseUrl = relayUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\/$/, '');
+    relaysAttempted++;
     try {
       const headers = { 'Accept': 'application/json' };
       if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
@@ -469,12 +473,21 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
         headers['CF-Access-Client-Secret'] = env.CF_ACCESS_CLIENT_SECRET;
       }
       const response = await fetch(`${apiBaseUrl}/api/event/${eventId}`, { headers });
-      if (!response.ok) continue;
+      if (!response.ok) {
+        const isTransient = response.status >= 500 || response.status === 429;
+        if (!isTransient) anyDefinitiveResponse = true;
+        continue;
+      }
+      anyDefinitiveResponse = true;
       const event = await response.json();
       if (event?.id && event?.pubkey) return event;
     } catch {
       continue;
     }
+  }
+
+  if (options.throwOnTransient && relaysAttempted > 0 && !anyDefinitiveResponse) {
+    throw new Error(`All ${relaysAttempted} relay(s) returned transient errors for event ${eventId}`);
   }
   return null;
 }

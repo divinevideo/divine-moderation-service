@@ -102,7 +102,36 @@ export async function processKind5(kind5, { db, fetchTargetEvent, callBlossomDel
 
     const priorRetryCount = (claim.existing && claim.existing.retry_count) || 0;
 
-    const target = await fetchTargetEvent(target_event_id);
+    let target;
+    try {
+      target = await fetchTargetEvent(target_event_id);
+    } catch (fetchErr) {
+      const retryCountAfter = priorRetryCount + 1;
+      const status = retryCountAfter >= MAX_RETRY_COUNT
+        ? 'failed:permanent:max_retries_exceeded'
+        : 'failed:transient:target_fetch';
+      const lastError = fetchErr.message || 'Transient relay error fetching target event';
+      await updateToFailed(db, {
+        kind5_id: kind5.id,
+        target_event_id,
+        status,
+        last_error: lastError,
+        increment_retry: true
+      });
+      console.log(JSON.stringify({
+        event: 'creator_delete.failed',
+        kind5_id: kind5.id,
+        target_event_id,
+        creator_pubkey: kind5.pubkey,
+        status,
+        last_error: lastError,
+        retry_count_after: retryCountAfter,
+        trigger: triggerLabel
+      }));
+      resultTargets.push({ target_event_id, status, last_error: lastError });
+      continue;
+    }
+
     if (!target) {
       await updateToFailed(db, {
         kind5_id: kind5.id,
@@ -121,6 +150,27 @@ export async function processKind5(kind5, { db, fetchTargetEvent, callBlossomDel
         trigger: triggerLabel
       }));
       resultTargets.push({ target_event_id, status: 'failed:permanent:target_unresolved' });
+      continue;
+    }
+
+    if (target.pubkey !== kind5.pubkey) {
+      await updateToFailed(db, {
+        kind5_id: kind5.id,
+        target_event_id,
+        status: 'failed:permanent:author_mismatch',
+        last_error: `Kind 5 author ${kind5.pubkey} does not match target author ${target.pubkey}`
+      });
+      console.log(JSON.stringify({
+        event: 'creator_delete.failed',
+        kind5_id: kind5.id,
+        target_event_id,
+        creator_pubkey: kind5.pubkey,
+        target_pubkey: target.pubkey,
+        status: 'failed:permanent:author_mismatch',
+        retry_count_after: priorRetryCount,
+        trigger: triggerLabel
+      }));
+      resultTargets.push({ target_event_id, status: 'failed:permanent:author_mismatch' });
       continue;
     }
 
