@@ -3575,7 +3575,7 @@ async function runMigration() {
           fetchKind5WithRetry: (id) => fetchKind5WithRetry(id, {
             fetchEventById: (eid) => fetchNostrEventById(eid, [relayUrl], env)
           }),
-          fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env),
+          fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env, { throwOnTransient: true }),
           callBlossomDelete
         });
       }
@@ -4716,7 +4716,7 @@ async function runMigration() {
             kv: env.MODERATION_KV,
             queryKind5Since: async (sinceSeconds) =>
               fetchKind5EventsSince(sinceSeconds, relayUrl, env),
-            fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env),
+            fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env, { throwOnTransient: true }),
             callBlossomDelete: (sha256) => notifyBlossom(sha256, 'DELETE', env)
           });
           console.log(`[CREATOR-DELETE-CRON] Processed ${result.processed}, errors: ${result.errors.length}`);

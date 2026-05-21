@@ -6,6 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { processKind5, MAX_TARGETS_PER_KIND5 } from './process.mjs';
+import { MAX_RETRY_COUNT } from './d1.mjs';
 import { makeFakeD1 } from './test-helpers.mjs';
 
 describe('processKind5', () => {
@@ -134,5 +135,50 @@ describe('processKind5', () => {
 
     expect(result.targets).toHaveLength(MAX_TARGETS_PER_KIND5);
     expect(callBlossomDelete).toHaveBeenCalledTimes(MAX_TARGETS_PER_KIND5);
+  });
+
+  it('author_mismatch when kind5 pubkey differs from target pubkey', async () => {
+    const kind5 = { id: 'k1', pubkey: 'pub1', tags: [['e', 't1']] };
+    fetchTargetEvent.mockResolvedValueOnce({
+      id: 't1',
+      pubkey: 'different_pub',
+      tags: [['imeta', `x ${SHA_C}`]]
+    });
+    const result = await processKind5(kind5, { db, fetchTargetEvent, callBlossomDelete });
+    expect(result.targets[0].status).toBe('failed:permanent:author_mismatch');
+    expect(callBlossomDelete).not.toHaveBeenCalled();
+  });
+
+  it('transient fetch error records failed:transient:target_fetch', async () => {
+    const kind5 = { id: 'k1', pubkey: 'pub1', tags: [['e', 't1']] };
+    fetchTargetEvent.mockRejectedValueOnce(new Error('All 1 relay(s) returned transient errors'));
+    const result = await processKind5(kind5, { db, fetchTargetEvent, callBlossomDelete });
+    expect(result.targets[0].status).toBe('failed:transient:target_fetch');
+    expect(callBlossomDelete).not.toHaveBeenCalled();
+  });
+
+  it('transient fetch promotes to permanent after max retries', async () => {
+    const kind5 = { id: 'k1', pubkey: 'pub1', tags: [['e', 't1']] };
+    db.rows.set('k1:t1', {
+      kind5_id: 'k1', target_event_id: 't1', creator_pubkey: 'pub1',
+      status: 'failed:transient:target_fetch',
+      accepted_at: new Date(Date.now() - 300_000).toISOString(),
+      blob_sha256: null, retry_count: MAX_RETRY_COUNT - 1,
+      last_error: 'prior transient', completed_at: null
+    });
+    fetchTargetEvent.mockRejectedValueOnce(new Error('All relays transient'));
+    const result = await processKind5(kind5, { db, fetchTargetEvent, callBlossomDelete });
+    expect(result.targets[0].status).toBe('failed:permanent:max_retries_exceeded');
+  });
+
+  it('multi-target: transient fetch on first, success on second', async () => {
+    const kind5 = { id: 'k1', pubkey: 'pub1', tags: [['e', 't1'], ['e', 't2']] };
+    fetchTargetEvent
+      .mockRejectedValueOnce(new Error('relay transient'))
+      .mockResolvedValueOnce({ id: 't2', pubkey: 'pub1', tags: [['imeta', `x ${SHA_C}`]] });
+    callBlossomDelete.mockResolvedValueOnce({ success: true, status: 200 });
+    const result = await processKind5(kind5, { db, fetchTargetEvent, callBlossomDelete });
+    expect(result.targets[0].status).toBe('failed:transient:target_fetch');
+    expect(result.targets[1].status).toBe('success');
   });
 });
