@@ -7139,3 +7139,31 @@ describe('GET /admin/api/recipient/resolve', () => {
     expect(res.status).toBe(400);
   });
 });
+
+describe('GET /admin/api/dm-templates', () => {
+  it('returns the creator-facing templates with rendered bodies', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/dm-templates'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    const templates = await res.json();
+    expect(templates.map(t => t.key)).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED']);
+    templates.forEach(t => {
+      expect(typeof t.label).toBe('string');
+      expect(typeof t.body).toBe('string');
+      expect(t.body.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('threads video context into the body when sha256 is given', async () => {
+    const sha = '22'.repeat(32);
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/dm-templates?sha256=' + sha),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    const templates = await res.json();
+    const ban = templates.find(t => t.key === 'PERMANENT_BAN');
+    expect(ban.body).toContain('divine.video/video/' + sha);
+  });
+});

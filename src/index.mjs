@@ -3530,6 +3530,24 @@ async function runMigration() {
       return new Response(JSON.stringify({ error: 'invalid input' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
 
+    // Admin API: List creator-facing DM templates (rendered, optionally with video context).
+    if (url.pathname === '/admin/api/dm-templates' && request.method === 'GET') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      const sha256 = url.searchParams.get('sha256') || null;
+      const title = url.searchParams.get('title') || null;
+      const publishedAt = url.searchParams.get('publishedAt') || null;
+      const category = url.searchParams.get('category') || null;
+      const { COMPOSE_TEMPLATES, renderComposeTemplate } = await import('./nostr/dm-sender.mjs');
+      const templates = COMPOSE_TEMPLATES.map(t => ({
+        key: t.key,
+        label: t.label,
+        body: renderComposeTemplate(t.key, { category, sha256, title, publishedAt }),
+      }));
+      return new Response(JSON.stringify(templates), { headers: { 'Content-Type': 'application/json' } });
+    }
+
     // Admin API: Resolve Nostr profiles for pubkeys
     if (url.pathname === '/admin/api/profiles' && request.method === 'GET') {
       const authError = await requireAuth(request, env);
