@@ -7140,6 +7140,18 @@ describe('GET /admin/api/recipient/resolve', () => {
   });
 });
 
+describe('GET /admin/api/messages/{pubkey} for an unknown pubkey', () => {
+  it('returns 200 with an empty messages array (not 404)', async () => {
+    const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ messages: [] });
+  });
+});
+
 describe('GET /admin/api/dm-templates', () => {
   it('returns the creator-facing templates with rendered bodies', async () => {
     const res = await worker.fetch(

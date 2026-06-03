@@ -3473,7 +3473,9 @@ async function runMigration() {
       const { getConversationByPubkey } = await import('./nostr/dm-store.mjs');
       const messages = await getConversationByPubkey(env.BLOSSOM_DB, pubkey);
       if (!messages) {
-        return new Response(JSON.stringify({ error: 'No conversation found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        // Never-messaged recipient: return an empty thread (200) so the compose UI
+        // can render for new conversations instead of showing a load error.
+        return new Response(JSON.stringify({ messages: [] }), { headers: { 'Content-Type': 'application/json' } });
       }
       return new Response(JSON.stringify(messages), { headers: { 'Content-Type': 'application/json' } });
     }
