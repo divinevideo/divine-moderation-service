@@ -16,6 +16,8 @@ import {
   sendModerationDM,
   selectTemplate,
   notifyReporters,
+  COMPOSE_TEMPLATES,
+  renderComposeTemplate,
 } from './dm-sender.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
@@ -563,5 +565,35 @@ describe('DM Sender - notifyReporters', () => {
   it('should skip notification for REVIEW (intermediate state)', async () => {
     const result = await notifyReporters('abc123', 'REVIEW', { NOSTR_PRIVATE_KEY: testHex }, '[TEST]');
     expect(result).toEqual({ notified: 0, failed: 0 });
+  });
+});
+
+describe('COMPOSE_TEMPLATES / renderComposeTemplate', () => {
+  it('exposes the four creator-facing templates and excludes report-outcome', () => {
+    const keys = COMPOSE_TEMPLATES.map(t => t.key);
+    expect(keys).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED']);
+    expect(keys).not.toContain('REPORT_OUTCOME_ACTION');
+    COMPOSE_TEMPLATES.forEach(t => expect(typeof t.label).toBe('string'));
+  });
+
+  it('renders without a video (null-safe) using the generic subject', () => {
+    const body = renderComposeTemplate('PERMANENT_BAN');
+    expect(body).toContain('Your content');
+    expect(body).not.toContain('divine.video/video/'); // no content link when sha256 is null
+  });
+
+  it('renders ACCOUNT_SUSPENDED with no args', () => {
+    const body = renderComposeTemplate('ACCOUNT_SUSPENDED');
+    expect(body).toContain('account has been suspended');
+  });
+
+  it('category specialization matches selectTemplate output', () => {
+    const sha = '11'.repeat(32);
+    expect(renderComposeTemplate('PERMANENT_BAN', { category: 'nudity', sha256: sha }))
+      .toBe(selectTemplate('PERMANENT_BAN', null, 'nudity', sha));
+  });
+
+  it('returns null for an unknown key', () => {
+    expect(renderComposeTemplate('NOPE')).toBeNull();
   });
 });

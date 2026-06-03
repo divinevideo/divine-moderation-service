@@ -205,6 +205,29 @@ export function getReportOutcomeMessage(action, sha256 = null, title = null, pub
   return TEMPLATES.REPORT_OUTCOME_NO_ACTION(sha256, title, publishedAt, reportedAt);
 }
 
+// --- Manual compose templates ---
+// Creator-facing templates a moderator may pre-fill when composing by hand.
+// Excludes REPORT_OUTCOME_* (reporter-facing auto-sends with a different signature).
+// Single source of truth: these reuse TEMPLATES/selectTemplate verbatim.
+export const COMPOSE_TEMPLATES = [
+  { key: 'PERMANENT_BAN', label: 'Content removed' },
+  { key: 'AGE_RESTRICTED', label: 'Content age-restricted' },
+  { key: 'QUARANTINE', label: 'Content under review' },
+  { key: 'ACCOUNT_SUSPENDED', label: 'Account suspended' },
+];
+
+/**
+ * Render a compose template to editable text. Null-safe for compose with no video.
+ * @param {string} key - one of COMPOSE_TEMPLATES[].key
+ * @param {{category?: string|null, sha256?: string|null, title?: string|null, publishedAt?: string|null}} [opts]
+ * @returns {string|null} rendered body, or null for an unknown key
+ */
+export function renderComposeTemplate(key, opts = {}) {
+  const { category = null, sha256 = null, title = null, publishedAt = null } = opts;
+  if (!TEMPLATES[key]) return null;
+  return selectTemplate(key, null, category, sha256, title, publishedAt);
+}
+
 // --- Key Management ---
 
 /**
