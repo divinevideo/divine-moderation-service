@@ -7079,3 +7079,63 @@ describe('age restricted preview reports real blossom drift', () => {
     }
   });
 });
+
+describe('GET /admin/api/recipient/resolve', () => {
+  const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+  const NPUB = 'npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz4s0z660k';
+
+  it('resolves a bare hex pubkey', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=' + HEX),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ pubkey: HEX, source: 'hex' });
+  });
+
+  it('decodes an npub', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=' + NPUB),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ pubkey: HEX, source: 'npub' });
+  });
+
+  it('400s an invalid npub', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=npub1notreal'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('verifies a nip-05 via well-known', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: { alice: HEX } }) }));
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=alice@divine.video'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ pubkey: HEX, source: 'nip05', address: 'alice@divine.video' });
+    vi.unstubAllGlobals();
+  });
+
+  it('404s an unknown nip-05', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: {} }) }));
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=ghost@divine.video'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(404);
+    vi.unstubAllGlobals();
+  });
+
+  it('400s empty input', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(400);
+  });
+});
