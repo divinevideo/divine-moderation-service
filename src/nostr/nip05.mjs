@@ -8,6 +8,8 @@ const NIP05_CACHE_TTL = 3600; // 1 hour
 const FETCH_TIMEOUT_MS = 5000;
 
 const LOCAL_PART_RE = /^[a-z0-9._-]+$/i;
+// Deliberately strict allowlist on an egress path: requires an alpha TLD of 2+
+// chars, so trailing dots and punycode (xn--) TLDs are rejected by design.
 const DOMAIN_RE = /^[a-z0-9.-]+\.[a-z]{2,}$/i;
 const HEX64_RE = /^[0-9a-f]{64}$/i;
 
@@ -55,10 +57,17 @@ export async function resolveNip05(address, env) {
     const url = `https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(name)}`;
     const res = await fetch(url, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      // NIP-05: "Fetchers MUST ignore any HTTP redirects." Also an SSRF guard —
+      // a moderator-supplied domain could 302 to an internal host, defeating
+      // "resolve at the authoritative source". 'manual' yields an opaque-redirect
+      // response whose res.ok is false, so the if (res.ok) branch returns null.
+      redirect: 'manual',
       headers: { Accept: 'application/json' },
     });
     if (res.ok) {
       const json = await res.json();
+      // NIP-05 local part is case-sensitive; only the domain is lowercased.
+      // Do not lowercase `name` here or resolution breaks for mixed-case names.
       const found = json?.names?.[name];
       if (typeof found === 'string' && HEX64_RE.test(found)) {
         pubkey = found.toLowerCase();

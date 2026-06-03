@@ -56,6 +56,12 @@ describe('resolveNip05', () => {
     expect(result).toBeNull();
   });
 
+  it('returns null when the well-known response is a redirect (not followed)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 0, type: 'opaqueredirect', json: async () => ({}) }));
+    const result = await resolveNip05('alice@divine.video', { MODERATION_KV: createMockKV() });
+    expect(result).toBeNull();
+  });
+
   it('returns null for malformed address and never fetches', async () => {
     const spy = vi.fn();
     vi.stubGlobal('fetch', spy);
