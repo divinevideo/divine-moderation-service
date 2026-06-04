@@ -128,6 +128,24 @@ describe('DM Sender - Message Templates', () => {
     expect(message).not.toContain('Your content');
   });
 
+  it('should produce account banned message without content reference', () => {
+    const message = getMessageForAction('ACCOUNT_BANNED');
+    expect(message).toContain('Your account has been banned');
+    expect(message).toContain('This is a permanent action');
+    expect(message).toContain('reply to this message to appeal');
+    expect(message).not.toContain('divine.video/video/');
+    expect(message).not.toContain('Your content');
+  });
+
+  it('should produce account restored message without appeal or content reference', () => {
+    const message = getMessageForAction('ACCOUNT_RESTORED');
+    expect(message).toContain('Your account has been restored');
+    expect(message).toContain('use Divine again');
+    expect(message).not.toContain('reply to this message to appeal');
+    expect(message).not.toContain('divine.video/video/');
+    expect(message).not.toContain('Your content');
+  });
+
   it('should produce correct report outcome message for no action', () => {
     const message = getReportOutcomeMessage('SAFE', 'ghi789');
 
@@ -416,6 +434,11 @@ describe('DM Sender - selectTemplate (Category-Specific)', () => {
     expect(msg).toBeNull();
   });
 
+  it('should return null for non-string action', () => {
+    const msg = selectTemplate(null, null, '{"self_harm": 0.9}', 'abc123');
+    expect(msg).toBeNull();
+  });
+
   it('should handle plain string category', () => {
     const msg = selectTemplate('AGE_RESTRICTED', null, 'offensive', 'abc123');
 
@@ -482,6 +505,43 @@ describe('DM Sender - selectTemplate (Category-Specific)', () => {
 
     expect(msg).toContain('Your content was removed');
     expect(msg).not.toContain('(posted');
+  });
+
+  // selectTemplate is the path /api/v1/notify actually uses, so cover the new
+  // account-level actions through it (not just getMessageForAction).
+  it('should resolve ACCOUNT_BANNED through the live dispatch path', () => {
+    const msg = selectTemplate('ACCOUNT_BANNED', null, null, null);
+
+    expect(msg).toContain('Your account has been banned');
+    expect(msg).toContain('permanent action');
+    expect(msg).toContain('reply to this message to appeal');
+    expect(msg).not.toContain('divine.video/video/');
+  });
+
+  it('should resolve ACCOUNT_RESTORED through the live dispatch path', () => {
+    const msg = selectTemplate('ACCOUNT_RESTORED', null, null, null);
+
+    expect(msg).toContain('Your account has been restored');
+    expect(msg).not.toContain('appeal');
+    expect(msg).not.toContain('divine.video/video/');
+  });
+
+  it('should never splice category extra (e.g. crisis lines) into account-level messages', () => {
+    // Even if a caller passes a self_harm category, an account notice must not
+    // get the crisis-line `extra` injected.
+    const msg = selectTemplate('ACCOUNT_BANNED', null, '{"self_harm": 0.9}', null);
+
+    expect(msg).toContain('Your account has been banned');
+    expect(msg).not.toContain('crisis');
+    expect(msg).not.toContain('988');
+  });
+
+  it('applies the guard to ACCOUNT_SUSPENDED too (unchanged message, no crisis injection)', () => {
+    const msg = selectTemplate('ACCOUNT_SUSPENDED', null, '{"self_harm": 0.9}', null);
+
+    expect(msg).toContain('Your account has been suspended');
+    expect(msg).not.toContain('crisis');
+    expect(msg).not.toContain('988');
   });
 });
 

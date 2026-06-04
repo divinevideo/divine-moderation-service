@@ -3857,7 +3857,7 @@ async function runMigration() {
           });
         }
 
-        const validNotifyActions = ['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'];
+        const validNotifyActions = ['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED', 'REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'];
         if (!validNotifyActions.includes(action)) {
           return new Response(JSON.stringify({
             error: `Invalid action. Must be one of: ${validNotifyActions.join(', ')}`

@@ -55,8 +55,10 @@ jobs:
       - name: Run tests
         run: |
           set -o pipefail
+          set +e
           npm test 2>&1 | tee /tmp/vitest.log
           status=${PIPESTATUS[0]}
+          set -e
 
           if [ "$status" -eq 0 ]; then
             exit 0

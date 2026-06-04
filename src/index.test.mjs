@@ -5563,6 +5563,47 @@ describe('POST /api/v1/notify', () => {
     expect(body.reason).toContain('not configured');
   });
 
+  it('accepts ACCOUNT_BANNED action', async () => {
+    const env = createEnv({
+      ALLOW_DEV_ACCESS: 'true',
+      NOSTR_PRIVATE_KEY: undefined
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'ACCOUNT_BANNED' })
+      }),
+      env
+    );
+
+    // Not configured -> 200 success path, proving the action passed the allowlist.
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+  });
+
+  it('accepts ACCOUNT_RESTORED action', async () => {
+    const env = createEnv({
+      ALLOW_DEV_ACCESS: 'true',
+      NOSTR_PRIVATE_KEY: undefined
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'ACCOUNT_RESTORED' })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+  });
+
   it('sends DM for valid request with NOSTR_PRIVATE_KEY configured', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
