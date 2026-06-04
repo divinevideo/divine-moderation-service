@@ -122,7 +122,7 @@ const CATEGORY_TEMPLATES = {
 /**
  * Select a category-specific template for a moderation action.
  * Falls back to generic reason if no category match.
- * @param {string} action - PERMANENT_BAN, AGE_RESTRICTED, or QUARANTINE
+ * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*). ACCOUNT_* actions short-circuit category logic.
  * @param {string|null} reason - Ignored when category matches. When used as fallback,
  *   must be a sentence completion after "was found to" (e.g., "violate content policies").
  *   Caller-provided freeform reasons are overridden by per-action defaults when no category matches.
@@ -173,7 +173,7 @@ export function selectTemplate(action, reason, categories, sha256, title = null,
 
 /**
  * Get message text for a given moderation action.
- * @param {string} action - PERMANENT_BAN, AGE_RESTRICTED, or QUARANTINE
+ * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*)
  * @param {string} reason
  * @returns {string|null} Message text or null if action has no template
  */

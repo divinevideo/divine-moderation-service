@@ -530,6 +530,14 @@ describe('DM Sender - selectTemplate (Category-Specific)', () => {
     expect(msg).not.toContain('crisis');
     expect(msg).not.toContain('988');
   });
+
+  it('applies the guard to ACCOUNT_SUSPENDED too (unchanged message, no crisis injection)', () => {
+    const msg = selectTemplate('ACCOUNT_SUSPENDED', null, '{"self_harm": 0.9}', null);
+
+    expect(msg).toContain('Your account has been suspended');
+    expect(msg).not.toContain('crisis');
+    expect(msg).not.toContain('988');
+  });
 });
 
 describe('DM Sender - notifyReporters', () => {
