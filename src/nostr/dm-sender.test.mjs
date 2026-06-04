@@ -20,6 +20,7 @@ import {
   renderComposeTemplate,
   publishToRelays,
 } from './dm-sender.mjs';
+import { createMockKV } from '../test/helpers.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
 const testSecretKey = generateSecretKey();
@@ -636,3 +637,28 @@ describe('publishToRelays — Workers WebSocket construction', () => {
     expect(ctorArgs[0][0]).toBe('wss://relay.example.com');
   });
 });
+
+describe('discoverUserRelays — Workers WebSocket construction', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('constructs the relay-list WebSocket with the URL only', async () => {
+    const ctorArgs = [];
+    class FakeWS {
+      constructor(...args) {
+        ctorArgs.push(args);
+        this._cbs = {};
+        setTimeout(() => this._cbs.error && this._cbs.error(new Error('x')), 0);
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send() {}
+      close() {}
+    }
+    vi.stubGlobal('WebSocket', FakeWS);
+
+    await discoverUserRelays('a'.repeat(64), { MODERATION_KV: createMockKV() });
+
+    expect(ctorArgs.length).toBeGreaterThan(0);
+    ctorArgs.forEach((args) => expect(args).toHaveLength(1));
+  });
+});
+
