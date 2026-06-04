@@ -139,7 +139,7 @@ describe('DM Sender - Message Templates', () => {
 
   it('should produce account restored message without appeal or content reference', () => {
     const message = getMessageForAction('ACCOUNT_RESTORED');
-    expect(message).toContain('your account has been restored');
+    expect(message).toContain('Your account has been restored');
     expect(message).toContain('use Divine again');
     expect(message).not.toContain('reply to this message to appeal');
     expect(message).not.toContain('divine.video/video/');

@@ -71,7 +71,7 @@ const TEMPLATES = {
   // Account-level restoration: no content link, no appeal prompt.
   // Sent when a previously suspended/banned account is reinstated.
   ACCOUNT_RESTORED: () =>
-    `Good news: your account has been restored and you can use Divine again.\n\n${FOOTER}`,
+    `Your account has been restored and you can use Divine again.\n\n${FOOTER}`,
 
   REPORT_OUTCOME_ACTION: (outcome, sha256, title, publishedAt, reportedAt) =>
     `Thanks for your report. We've reviewed ${contentSubject(title, 'the reported content')}${postedDate(publishedAt)} and it has been ${outcome}.${reportedAt ? ` You reported this content on ${formatDate(reportedAt)}.` : ''}\n${contentLink(sha256)}\nIf you have questions, you can reply to this message.\n\n${FOOTER}`,
