@@ -681,9 +681,16 @@
 
     // --- Select conversation & load thread ---
 
-    async function selectConversation(pubkey) {
+    async function selectConversation(pubkey, opts = {}) {
       selectedPubkey = pubkey;
       renderConversations();
+
+      // Dismiss the New Message recipient bar unless we just resolved from it
+      // (resolveRecipient keeps it to show the verified confirmation).
+      if (!opts.keepRecipientBar) {
+        document.getElementById('new-recipient-bar').style.display = 'none';
+        document.getElementById('recipient-status').textContent = '';
+      }
 
       document.getElementById('thread-placeholder').style.display = 'none';
       const content = document.getElementById('thread-content');
@@ -858,10 +865,10 @@
           : '✓ ' + truncatePubkey(data.pubkey);
         status.style.color = '#6c6';
         status.innerHTML = label;
-        document.getElementById('new-recipient-bar').style.display = 'none';
-        status.textContent = '';
+        // Keep the bar + verified confirmation visible as a "to:" indicator;
+        // selectConversation dismisses it when the moderator navigates elsewhere.
         await fetchProfiles([data.pubkey]);
-        await selectConversation(data.pubkey);
+        await selectConversation(data.pubkey, { keepRecipientBar: true });
       } catch (err) {
         status.style.color = '#e66';
         status.textContent = 'Resolution failed. Try again.';
