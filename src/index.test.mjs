@@ -7121,6 +7121,22 @@ describe('GET /admin/api/recipient/resolve', () => {
     vi.unstubAllGlobals();
   });
 
+  it('resolves a divine handle (@user.divine.video) to the subdomain identity with a friendly display', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: { _: HEX } }) }));
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=' + encodeURIComponent('@mjb.divine.video')),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      pubkey: HEX,
+      source: 'nip05',
+      address: '_@mjb.divine.video',
+      display: '@mjb.divine.video',
+    });
+    vi.unstubAllGlobals();
+  });
+
   it('404s an unknown nip-05', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: {} }) }));
     const res = await worker.fetch(
