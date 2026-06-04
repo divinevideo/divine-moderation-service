@@ -444,6 +444,7 @@
     <h1>Messages</h1>
     <div class="header-actions">
       <a href="/admin/dashboard">Back to Dashboard</a>
+      <button class="btn-primary" onclick="openNewMessage()">New Message</button>
       <button class="btn-primary" onclick="refreshAll()">Refresh</button>
     </div>
   </div>
@@ -467,7 +468,13 @@
     <!-- Right Panel -->
     <div class="thread-panel" id="thread-panel">
       <div class="empty-state" id="thread-placeholder">
-        Select a conversation to view messages
+        Select a conversation, or start a New Message
+      </div>
+      <div id="new-recipient-bar" style="display:none; padding:12px; border-bottom:1px solid #333;">
+        <input type="text" id="recipient-input" placeholder="@username.divine.video, npub, hex pubkey, or user@domain"
+          style="width:60%;" onkeydown="if(event.key==='Enter'){event.preventDefault();resolveRecipient();}">
+        <button class="btn-primary" onclick="resolveRecipient()">Start</button>
+        <span id="recipient-status" style="margin-left:10px; font-size:13px;"></span>
       </div>
       <div id="thread-content" style="display: none; flex-direction: column; height: 100%;">
         <div class="thread-header">
@@ -486,8 +493,12 @@
             <button class="send-btn" id="send-btn" onclick="sendMessage()">Send</button>
           </div>
           <div class="compose-extras">
+            <label>Template:</label>
+            <select id="template-select" onchange="applyTemplate(this.value)">
+              <option value="">— none —</option>
+            </select>
             <label>Link video:</label>
-            <input type="text" id="compose-sha256" placeholder="sha256 (optional)">
+            <input type="text" id="compose-sha256" placeholder="sha256 (optional)" onchange="loadTemplates()">
           </div>
         </div>
       </div>
@@ -670,9 +681,16 @@
 
     // --- Select conversation & load thread ---
 
-    async function selectConversation(pubkey) {
+    async function selectConversation(pubkey, opts = {}) {
       selectedPubkey = pubkey;
       renderConversations();
+
+      // Dismiss the New Message recipient bar unless we just resolved from it
+      // (resolveRecipient keeps it to show the verified confirmation).
+      if (!opts.keepRecipientBar) {
+        document.getElementById('new-recipient-bar').style.display = 'none';
+        document.getElementById('recipient-status').textContent = '';
+      }
 
       document.getElementById('thread-placeholder').style.display = 'none';
       const content = document.getElementById('thread-content');
@@ -727,7 +745,7 @@
       if (!messages.length) {
         const el = document.createElement('div');
         el.className = 'empty-state';
-        el.textContent = 'No messages in this conversation';
+        el.textContent = 'No messages yet — start the conversation';
         container.appendChild(el);
         return;
       }
@@ -782,7 +800,10 @@
           body: JSON.stringify(body)
         });
 
-        if (!res.ok) throw new Error('Failed to send message');
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error || 'Failed to send message');
+        }
 
         input.value = '';
         sha256Input.value = '';
@@ -811,6 +832,85 @@
       }
     }
 
+    // --- New Message compose ---
+
+    function openNewMessage() {
+      document.getElementById('thread-placeholder').style.display = 'none';
+      const bar = document.getElementById('new-recipient-bar');
+      bar.style.display = 'block';
+      document.getElementById('recipient-status').textContent = '';
+      const input = document.getElementById('recipient-input');
+      input.value = '';
+      input.focus();
+    }
+
+    async function resolveRecipient() {
+      const input = document.getElementById('recipient-input').value.trim();
+      const status = document.getElementById('recipient-status');
+      if (!input) return;
+      status.style.color = '#888';
+      status.textContent = 'Resolving…';
+      try {
+        const res = await fetch('/admin/api/recipient/resolve?input=' + encodeURIComponent(input));
+        if (!res.ok) {
+          status.style.color = '#e66';
+          status.textContent = res.status === 404
+            ? "Couldn't verify that nip-05. If you have their npub or pubkey, paste it instead."
+            : 'Invalid recipient. Paste an npub, hex pubkey, or user@domain.';
+          return;
+        }
+        const data = await res.json();
+        const label = data.source === 'nip05'
+          ? '✓ ' + escapeHtml(data.display || data.address) + ' (verified)'
+          : '✓ ' + truncatePubkey(data.pubkey);
+        status.style.color = '#6c6';
+        status.innerHTML = label;
+        // Keep the bar + verified confirmation visible as a "to:" indicator;
+        // selectConversation dismisses it when the moderator navigates elsewhere.
+        await fetchProfiles([data.pubkey]);
+        await selectConversation(data.pubkey, { keepRecipientBar: true });
+      } catch (err) {
+        status.style.color = '#e66';
+        status.textContent = 'Resolution failed. Try again.';
+        console.error('resolveRecipient error:', err);
+      }
+    }
+
+    // --- Templates ---
+
+    let templateCache = [];
+
+    async function loadTemplates() {
+      const sha = document.getElementById('compose-sha256')?.value?.trim();
+      const qs = sha ? '?sha256=' + encodeURIComponent(sha) : '';
+      try {
+        const res = await fetch('/admin/api/dm-templates' + qs);
+        if (!res.ok) return;
+        templateCache = await res.json();
+        const select = document.getElementById('template-select');
+        select.innerHTML = '<option value="">— none —</option>'
+          + templateCache.map((t, i) => '<option value="' + i + '">' + escapeHtml(t.label) + '</option>').join('');
+      } catch (err) {
+        console.error('loadTemplates error:', err);
+      }
+    }
+
+    function applyTemplate(index) {
+      const select = document.getElementById('template-select');
+      if (index === '') return;
+      const tpl = templateCache[Number(index)];
+      if (tpl && tpl.body) {
+        const composeInput = document.getElementById('compose-input');
+        if (composeInput.value.trim() && !confirm('Replace your current draft with this template?')) {
+          select.value = '';
+          return;
+        }
+        composeInput.value = tpl.body;
+      }
+      // Reset to "— none —" so re-selecting the same template re-fires onchange.
+      select.value = '';
+    }
+
     // --- Auto-resize textarea ---
 
     document.getElementById('compose-input').addEventListener('input', function() {
@@ -824,6 +924,7 @@
       const preselectedPubkey = urlParams.get('pubkey');
 
       await fetchConversations();
+      loadTemplates();
 
       if (preselectedPubkey) {
         // Fetch profile for the preselected pubkey if not already cached

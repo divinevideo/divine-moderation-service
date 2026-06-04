@@ -7079,3 +7079,137 @@ describe('age restricted preview reports real blossom drift', () => {
     }
   });
 });
+
+describe('GET /admin/api/recipient/resolve', () => {
+  const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+  const NPUB = 'npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqz4s0z660k';
+
+  it('resolves a bare hex pubkey', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=' + HEX),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ pubkey: HEX, source: 'hex' });
+  });
+
+  it('decodes an npub', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=' + NPUB),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ pubkey: HEX, source: 'npub' });
+  });
+
+  it('400s an invalid npub', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=npub1notreal'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('verifies a nip-05 via well-known', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: { alice: HEX } }) }));
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=alice@divine.video'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ pubkey: HEX, source: 'nip05', address: 'alice@divine.video' });
+    vi.unstubAllGlobals();
+  });
+
+  it('resolves a divine handle (@user.divine.video) to the subdomain identity with a friendly display', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: { _: HEX } }) }));
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=' + encodeURIComponent('@mjb.divine.video')),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      pubkey: HEX,
+      source: 'nip05',
+      address: '_@mjb.divine.video',
+      display: '@mjb.divine.video',
+    });
+    vi.unstubAllGlobals();
+  });
+
+  it('404s an unknown nip-05', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: {} }) }));
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve?input=ghost@divine.video'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(404);
+    vi.unstubAllGlobals();
+  });
+
+  it('400s empty input', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/recipient/resolve'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('GET /admin/api/messages/{pubkey} for an unknown pubkey', () => {
+  it('returns 200 with an empty messages array (not 404)', async () => {
+    const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ messages: [] });
+  });
+});
+
+describe('POST /admin/api/messages/{pubkey} when the send fails', () => {
+  it('returns 502 with a reason instead of a silent success', async () => {
+    const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+    // No NOSTR_PRIVATE_KEY in the env -> sendModeratorReply returns {sent:false},
+    // so the route must surface the failure rather than report success.
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'hello there' }),
+      }),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toBeTruthy();
+  });
+});
+
+describe('GET /admin/api/dm-templates', () => {
+  it('returns the creator-facing templates with rendered bodies', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/dm-templates'),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(200);
+    const templates = await res.json();
+    expect(templates.map(t => t.key)).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED']);
+    templates.forEach(t => {
+      expect(typeof t.label).toBe('string');
+      expect(typeof t.body).toBe('string');
+      expect(t.body.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('threads video context into the body when sha256 is given', async () => {
+    const sha = '22'.repeat(32);
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/dm-templates?sha256=' + sha),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    const templates = await res.json();
+    const ban = templates.find(t => t.key === 'PERMANENT_BAN');
+    expect(ban.body).toContain('divine.video/video/' + sha);
+  });
+});

@@ -15,6 +15,7 @@ import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMe
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
 import { getLastReportPollTimestamp, getReportLastRun, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
+import { decode as decodeNip19 } from 'nostr-tools/nip19';
 import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
@@ -3472,7 +3473,9 @@ async function runMigration() {
       const { getConversationByPubkey } = await import('./nostr/dm-store.mjs');
       const messages = await getConversationByPubkey(env.BLOSSOM_DB, pubkey);
       if (!messages) {
-        return new Response(JSON.stringify({ error: 'No conversation found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        // Never-messaged recipient: return an empty thread (200) so the compose UI
+        // can render for new conversations instead of showing a load error.
+        return new Response(JSON.stringify({ messages: [] }), { headers: { 'Content-Type': 'application/json' } });
       }
       return new Response(JSON.stringify(messages), { headers: { 'Content-Type': 'application/json' } });
     }
@@ -3488,8 +3491,68 @@ async function runMigration() {
         return new Response(JSON.stringify({ error: 'message is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
       const { sendModeratorReply } = await import('./nostr/dm-sender.mjs');
-      await sendModeratorReply(pubkey, message, sha256 || null, env, null);
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      // Honor the send result so the compose UI can surface real failures
+      // (e.g. no relays reachable) instead of silently reporting success.
+      const result = await sendModeratorReply(pubkey, message, sha256 || null, env, null);
+      if (!result || result.sent !== true) {
+        return new Response(JSON.stringify({ error: result?.reason || 'Failed to send message' }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ success: true, relaysPublished: result.relaysPublished }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin API: Resolve a recipient (hex / npub / verified nip-05) to a hex pubkey.
+    // Display-name lookup is intentionally NOT supported — see
+    // docs/superpowers/specs/2026-06-03-moderator-compose-new-dm-design.md (Non-goals).
+    if (url.pathname === '/admin/api/recipient/resolve' && request.method === 'GET') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      const input = (url.searchParams.get('input') || '').trim();
+      if (!input) {
+        return new Response(JSON.stringify({ error: 'input is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      // 1. Bare hex pubkey
+      if (/^[0-9a-f]{64}$/i.test(input)) {
+        return new Response(JSON.stringify({ pubkey: input.toLowerCase(), source: 'hex' }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      // 2. npub (deterministic decode)
+      if (input.startsWith('npub1')) {
+        try {
+          const decoded = decodeNip19(input);
+          if (decoded.type === 'npub' && typeof decoded.data === 'string') {
+            return new Response(JSON.stringify({ pubkey: decoded.data, source: 'npub' }), { headers: { 'Content-Type': 'application/json' } });
+          }
+        } catch { /* fall through to 400 */ }
+        return new Response(JSON.stringify({ error: 'invalid npub' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      // 3. nip-05 / divine handle — anything that isn't a raw key. Accepts the
+      //    forms moderators see on profiles (@mjb.divine.video, @mjb), bare
+      //    handles, canonical user@domain, and cross-domain nip-05. Normalization
+      //    + verification against the domain's well-known live in nostr/nip05.mjs.
+      const { resolveNip05 } = await import('./nostr/nip05.mjs');
+      const resolved = await resolveNip05(input, env);
+      if (!resolved) {
+        return new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ pubkey: resolved.pubkey, address: resolved.address, display: resolved.display, domain: resolved.domain, source: 'nip05' }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin API: List creator-facing DM templates (rendered, optionally with video context).
+    if (url.pathname === '/admin/api/dm-templates' && request.method === 'GET') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      const sha256 = url.searchParams.get('sha256') || null;
+      const title = url.searchParams.get('title') || null;
+      const publishedAt = url.searchParams.get('publishedAt') || null;
+      const category = url.searchParams.get('category') || null;
+      const { COMPOSE_TEMPLATES, renderComposeTemplate } = await import('./nostr/dm-sender.mjs');
+      const templates = COMPOSE_TEMPLATES.map(t => ({
+        key: t.key,
+        label: t.label,
+        body: renderComposeTemplate(t.key, { category, sha256, title, publishedAt }),
+      }));
+      return new Response(JSON.stringify(templates), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Admin API: Resolve Nostr profiles for pubkeys

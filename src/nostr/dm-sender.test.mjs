@@ -4,7 +4,7 @@
 // ABOUTME: Tests for DM sender module (dm-sender.mjs)
 // ABOUTME: Verifies message templates, key derivation, rate limiting, and relay discovery
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { bytesToHex } from '@noble/hashes/utils';
 import {
@@ -16,7 +16,11 @@ import {
   sendModerationDM,
   selectTemplate,
   notifyReporters,
+  COMPOSE_TEMPLATES,
+  renderComposeTemplate,
+  publishToRelays,
 } from './dm-sender.mjs';
+import { createMockKV } from '../test/helpers.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
 const testSecretKey = generateSecretKey();
@@ -565,3 +569,96 @@ describe('DM Sender - notifyReporters', () => {
     expect(result).toEqual({ notified: 0, failed: 0 });
   });
 });
+
+describe('COMPOSE_TEMPLATES / renderComposeTemplate', () => {
+  it('exposes the six creator-facing templates and excludes report-outcome', () => {
+    const keys = COMPOSE_TEMPLATES.map(t => t.key);
+    expect(keys).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED']);
+    expect(keys).not.toContain('REPORT_OUTCOME_ACTION');
+    COMPOSE_TEMPLATES.forEach(t => expect(typeof t.label).toBe('string'));
+  });
+
+  it('renders the account-state templates with no args', () => {
+    expect(renderComposeTemplate('ACCOUNT_BANNED')).toContain('account has been banned');
+    expect(renderComposeTemplate('ACCOUNT_RESTORED')).toContain('account has been restored');
+  });
+
+  it('renders without a video (null-safe) using the generic subject', () => {
+    const body = renderComposeTemplate('PERMANENT_BAN');
+    expect(body).toContain('Your content');
+    expect(body).not.toContain('divine.video/video/'); // no content link when sha256 is null
+  });
+
+  it('renders ACCOUNT_SUSPENDED with no args', () => {
+    const body = renderComposeTemplate('ACCOUNT_SUSPENDED');
+    expect(body).toContain('account has been suspended');
+  });
+
+  it('category specialization matches selectTemplate output', () => {
+    const sha = '11'.repeat(32);
+    expect(renderComposeTemplate('PERMANENT_BAN', { category: 'nudity', sha256: sha }))
+      .toBe(selectTemplate('PERMANENT_BAN', null, 'nudity', sha));
+  });
+
+  it('returns null for an unknown key', () => {
+    expect(renderComposeTemplate('NOPE')).toBeNull();
+  });
+});
+
+describe('publishToRelays — Workers WebSocket construction', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Regression guard: Cloudflare Workers' WebSocket constructor only accepts a
+  // subprotocol string/array as its 2nd arg. Passing an options/headers object
+  // throws "protocol header token is invalid", so publishing silently fails and
+  // composed messages never leave the worker. Connect with the URL alone.
+  it('constructs each relay WebSocket with the URL only (no options object)', async () => {
+    const ctorArgs = [];
+    class FakeWS {
+      constructor(...args) {
+        ctorArgs.push(args);
+        this._cbs = {};
+        queueMicrotask(() => {
+          this._cbs.open && this._cbs.open();
+          this._cbs.message && this._cbs.message({ data: JSON.stringify(['OK', 'evt1', true, '']) });
+        });
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send() {}
+      close() {}
+    }
+    vi.stubGlobal('WebSocket', FakeWS);
+
+    const res = await publishToRelays({ id: 'evt1' }, ['wss://relay.example.com'], {});
+
+    expect(res).toEqual({ success: 1, failed: 0 });
+    expect(ctorArgs).toHaveLength(1);
+    expect(ctorArgs[0]).toHaveLength(1); // URL only — the regression guard
+    expect(ctorArgs[0][0]).toBe('wss://relay.example.com');
+  });
+});
+
+describe('discoverUserRelays — Workers WebSocket construction', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('constructs the relay-list WebSocket with the URL only', async () => {
+    const ctorArgs = [];
+    class FakeWS {
+      constructor(...args) {
+        ctorArgs.push(args);
+        this._cbs = {};
+        setTimeout(() => this._cbs.error && this._cbs.error(new Error('x')), 0);
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send() {}
+      close() {}
+    }
+    vi.stubGlobal('WebSocket', FakeWS);
+
+    await discoverUserRelays('a'.repeat(64), { MODERATION_KV: createMockKV() });
+
+    expect(ctorArgs.length).toBeGreaterThan(0);
+    ctorArgs.forEach((args) => expect(args).toHaveLength(1));
+  });
+});
+
