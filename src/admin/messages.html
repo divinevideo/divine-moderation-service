@@ -444,6 +444,7 @@
     <h1>Messages</h1>
     <div class="header-actions">
       <a href="/admin/dashboard">Back to Dashboard</a>
+      <button class="btn-primary" onclick="openNewMessage()">New Message</button>
       <button class="btn-primary" onclick="refreshAll()">Refresh</button>
     </div>
   </div>
@@ -467,7 +468,13 @@
     <!-- Right Panel -->
     <div class="thread-panel" id="thread-panel">
       <div class="empty-state" id="thread-placeholder">
-        Select a conversation to view messages
+        Select a conversation, or start a New Message
+      </div>
+      <div id="new-recipient-bar" style="display:none; padding:12px; border-bottom:1px solid #333;">
+        <input type="text" id="recipient-input" placeholder="npub, hex pubkey, or user@domain (nip-05)"
+          style="width:60%;" onkeydown="if(event.key==='Enter'){event.preventDefault();resolveRecipient();}">
+        <button class="btn-primary" onclick="resolveRecipient()">Start</button>
+        <span id="recipient-status" style="margin-left:10px; font-size:13px;"></span>
       </div>
       <div id="thread-content" style="display: none; flex-direction: column; height: 100%;">
         <div class="thread-header">
@@ -486,6 +493,10 @@
             <button class="send-btn" id="send-btn" onclick="sendMessage()">Send</button>
           </div>
           <div class="compose-extras">
+            <label>Template:</label>
+            <select id="template-select" onchange="applyTemplate(this.value)">
+              <option value="">— none —</option>
+            </select>
             <label>Link video:</label>
             <input type="text" id="compose-sha256" placeholder="sha256 (optional)">
           </div>
@@ -727,7 +738,7 @@
       if (!messages.length) {
         const el = document.createElement('div');
         el.className = 'empty-state';
-        el.textContent = 'No messages in this conversation';
+        el.textContent = 'No messages yet — start the conversation';
         container.appendChild(el);
         return;
       }
@@ -811,6 +822,75 @@
       }
     }
 
+    // --- New Message compose ---
+
+    function openNewMessage() {
+      const bar = document.getElementById('new-recipient-bar');
+      bar.style.display = 'block';
+      document.getElementById('recipient-status').textContent = '';
+      const input = document.getElementById('recipient-input');
+      input.value = '';
+      input.focus();
+    }
+
+    async function resolveRecipient() {
+      const input = document.getElementById('recipient-input').value.trim();
+      const status = document.getElementById('recipient-status');
+      if (!input) return;
+      status.style.color = '#888';
+      status.textContent = 'Resolving…';
+      try {
+        const res = await fetch('/admin/api/recipient/resolve?input=' + encodeURIComponent(input));
+        if (!res.ok) {
+          status.style.color = '#e66';
+          status.textContent = res.status === 404
+            ? "Couldn't verify that nip-05. If you have their npub or pubkey, paste it instead."
+            : 'Invalid recipient. Paste an npub, hex pubkey, or user@domain.';
+          return;
+        }
+        const data = await res.json();
+        const label = data.source === 'nip05'
+          ? '✓ ' + escapeHtml(data.address) + ' (verified via ' + escapeHtml(data.domain) + ')'
+          : '✓ ' + truncatePubkey(data.pubkey);
+        status.style.color = '#6c6';
+        status.innerHTML = label;
+        document.getElementById('new-recipient-bar').style.display = 'none';
+        await fetchProfiles([data.pubkey]);
+        await selectConversation(data.pubkey);
+      } catch (err) {
+        status.style.color = '#e66';
+        status.textContent = 'Resolution failed. Try again.';
+        console.error('resolveRecipient error:', err);
+      }
+    }
+
+    // --- Templates ---
+
+    let templateCache = [];
+
+    async function loadTemplates() {
+      const sha = document.getElementById('compose-sha256')?.value?.trim();
+      const qs = sha ? '?sha256=' + encodeURIComponent(sha) : '';
+      try {
+        const res = await fetch('/admin/api/dm-templates' + qs);
+        if (!res.ok) return;
+        templateCache = await res.json();
+        const select = document.getElementById('template-select');
+        select.innerHTML = '<option value="">— none —</option>'
+          + templateCache.map((t, i) => '<option value="' + i + '">' + escapeHtml(t.label) + '</option>').join('');
+      } catch (err) {
+        console.error('loadTemplates error:', err);
+      }
+    }
+
+    function applyTemplate(index) {
+      if (index === '') return;
+      const tpl = templateCache[Number(index)];
+      if (tpl && tpl.body) {
+        document.getElementById('compose-input').value = tpl.body;
+      }
+    }
+
     // --- Auto-resize textarea ---
 
     document.getElementById('compose-input').addEventListener('input', function() {
@@ -824,6 +904,7 @@
       const preselectedPubkey = urlParams.get('pubkey');
 
       await fetchConversations();
+      loadTemplates();
 
       if (preselectedPubkey) {
         // Fetch profile for the preselected pubkey if not already cached
