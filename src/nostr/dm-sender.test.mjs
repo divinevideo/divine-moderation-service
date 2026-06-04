@@ -434,6 +434,11 @@ describe('DM Sender - selectTemplate (Category-Specific)', () => {
     expect(msg).toBeNull();
   });
 
+  it('should return null for non-string action', () => {
+    const msg = selectTemplate(null, null, '{"self_harm": 0.9}', 'abc123');
+    expect(msg).toBeNull();
+  });
+
   it('should handle plain string category', () => {
     const msg = selectTemplate('AGE_RESTRICTED', null, 'offensive', 'abc123');
 

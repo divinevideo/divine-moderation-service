@@ -136,7 +136,7 @@ export function selectTemplate(action, reason, categories, sha256, title = null,
   // Account-level actions (ACCOUNT_BANNED / ACCOUNT_SUSPENDED / ACCOUNT_RESTORED)
   // are not content-specific: they take no category, and category `extra` text
   // (e.g. self-harm crisis lines) must never be spliced into an account notice.
-  if (action.startsWith('ACCOUNT_')) {
+  if (typeof action === 'string' && action.startsWith('ACCOUNT_')) {
     const accountTemplate = TEMPLATES[action];
     return accountTemplate ? accountTemplate() : null;
   }
