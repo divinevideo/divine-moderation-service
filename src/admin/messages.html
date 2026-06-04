@@ -825,6 +825,7 @@
     // --- New Message compose ---
 
     function openNewMessage() {
+      document.getElementById('thread-placeholder').style.display = 'none';
       const bar = document.getElementById('new-recipient-bar');
       bar.style.display = 'block';
       document.getElementById('recipient-status').textContent = '';
@@ -855,6 +856,7 @@
         status.style.color = '#6c6';
         status.innerHTML = label;
         document.getElementById('new-recipient-bar').style.display = 'none';
+        status.textContent = '';
         await fetchProfiles([data.pubkey]);
         await selectConversation(data.pubkey);
       } catch (err) {
@@ -884,11 +886,19 @@
     }
 
     function applyTemplate(index) {
+      const select = document.getElementById('template-select');
       if (index === '') return;
       const tpl = templateCache[Number(index)];
       if (tpl && tpl.body) {
-        document.getElementById('compose-input').value = tpl.body;
+        const composeInput = document.getElementById('compose-input');
+        if (composeInput.value.trim() && !confirm('Replace your current draft with this template?')) {
+          select.value = '';
+          return;
+        }
+        composeInput.value = tpl.body;
       }
+      // Reset to "— none —" so re-selecting the same template re-fires onchange.
+      select.value = '';
     }
 
     // --- Auto-resize textarea ---
