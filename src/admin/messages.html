@@ -793,7 +793,10 @@
           body: JSON.stringify(body)
         });
 
-        if (!res.ok) throw new Error('Failed to send message');
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error || 'Failed to send message');
+        }
 
         input.value = '';
         sha256Input.value = '';

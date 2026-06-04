@@ -7152,6 +7152,24 @@ describe('GET /admin/api/messages/{pubkey} for an unknown pubkey', () => {
   });
 });
 
+describe('POST /admin/api/messages/{pubkey} when the send fails', () => {
+  it('returns 502 with a reason instead of a silent success', async () => {
+    const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+    // No NOSTR_PRIVATE_KEY in the env -> sendModeratorReply returns {sent:false},
+    // so the route must surface the failure rather than report success.
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'hello there' }),
+      }),
+      createEnv({ ALLOW_DEV_ACCESS: 'true' }),
+    );
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toBeTruthy();
+  });
+});
+
 describe('GET /admin/api/dm-templates', () => {
   it('returns the creator-facing templates with rendered bodies', async () => {
     const res = await worker.fetch(
