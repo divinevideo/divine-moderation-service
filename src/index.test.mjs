@@ -7160,7 +7160,7 @@ describe('GET /admin/api/dm-templates', () => {
     );
     expect(res.status).toBe(200);
     const templates = await res.json();
-    expect(templates.map(t => t.key)).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED']);
+    expect(templates.map(t => t.key)).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED']);
     templates.forEach(t => {
       expect(typeof t.label).toBe('string');
       expect(typeof t.body).toBe('string');

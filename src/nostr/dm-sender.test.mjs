@@ -569,11 +569,16 @@ describe('DM Sender - notifyReporters', () => {
 });
 
 describe('COMPOSE_TEMPLATES / renderComposeTemplate', () => {
-  it('exposes the four creator-facing templates and excludes report-outcome', () => {
+  it('exposes the six creator-facing templates and excludes report-outcome', () => {
     const keys = COMPOSE_TEMPLATES.map(t => t.key);
-    expect(keys).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED']);
+    expect(keys).toEqual(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED']);
     expect(keys).not.toContain('REPORT_OUTCOME_ACTION');
     COMPOSE_TEMPLATES.forEach(t => expect(typeof t.label).toBe('string'));
+  });
+
+  it('renders the account-state templates with no args', () => {
+    expect(renderComposeTemplate('ACCOUNT_BANNED')).toContain('account has been banned');
+    expect(renderComposeTemplate('ACCOUNT_RESTORED')).toContain('account has been restored');
   });
 
   it('renders without a video (null-safe) using the generic subject', () => {
