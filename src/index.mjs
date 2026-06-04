@@ -3491,8 +3491,13 @@ async function runMigration() {
         return new Response(JSON.stringify({ error: 'message is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
       const { sendModeratorReply } = await import('./nostr/dm-sender.mjs');
-      await sendModeratorReply(pubkey, message, sha256 || null, env, null);
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      // Honor the send result so the compose UI can surface real failures
+      // (e.g. no relays reachable) instead of silently reporting success.
+      const result = await sendModeratorReply(pubkey, message, sha256 || null, env, null);
+      if (!result || result.sent !== true) {
+        return new Response(JSON.stringify({ error: result?.reason || 'Failed to send message' }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ success: true, relaysPublished: result.relaysPublished }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Admin API: Resolve a recipient (hex / npub / verified nip-05) to a hex pubkey.

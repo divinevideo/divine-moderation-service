@@ -389,13 +389,10 @@ async function queryRelayList(pubkey, env) {
     }, RELAY_TIMEOUT_MS);
 
     try {
-      const headers = {};
-      if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
-        headers['CF-Access-Client-Id'] = env.CF_ACCESS_CLIENT_ID;
-        headers['CF-Access-Client-Secret'] = env.CF_ACCESS_CLIENT_SECRET;
-      }
-
-      ws = new WebSocket(DIVINE_RELAY, { headers });
+      // Workers' WebSocket takes only a subprotocol string/array as the 2nd arg;
+      // an options/headers object throws "protocol header token is invalid" and
+      // the connection silently fails. Connect with the URL alone.
+      ws = new WebSocket(DIVINE_RELAY);
       const relays = [];
       let resolved = false;
 
@@ -506,13 +503,13 @@ function publishToSingleRelay(event, relayUrl, env) {
     }, RELAY_TIMEOUT_MS);
 
     try {
-      const headers = {};
-      if (relayUrl.includes('relay.divine.video') && env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
-        headers['CF-Access-Client-Id'] = env.CF_ACCESS_CLIENT_ID;
-        headers['CF-Access-Client-Secret'] = env.CF_ACCESS_CLIENT_SECRET;
-      }
-
-      ws = new WebSocket(relayUrl, { headers });
+      // Cloudflare Workers' WebSocket constructor only accepts a subprotocol
+      // string/array as its 2nd argument. Passing an options/headers object
+      // throws "The protocol header token is invalid", so the connection never
+      // opens and the event never publishes. Custom headers can't be sent on a
+      // Workers WebSocket handshake; connect with the URL alone (same as the
+      // relay-list and profile-resolver paths).
+      ws = new WebSocket(relayUrl);
       let resolved = false;
 
       ws.addEventListener('open', () => {
@@ -739,7 +736,7 @@ export async function sendReportOutcomeDM(reporterPubkey, sha256, action, env, c
       console.log('[DM] DM store not available, skipping log');
     }
 
-    console.log(`[DM] Sent report outcome to ${reporterPubkey.substring(0, 16)}... for ${sha256.substring(0, 16)}... (${success} relays)`);
+    console.log(`[DM] Sent report outcome to ${reporterPubkey.substring(0, 16)}...${sha256 ? ` for ${sha256.substring(0, 16)}...` : ''} (${success} relays)`);
     return { sent: true, relaysPublished: success };
   } catch (err) {
     console.error('[DM] Unexpected error sending report outcome DM:', err.message);
@@ -894,7 +891,7 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
       console.log('[DM] DM store not available, skipping log');
     }
 
-    console.log(`[DM] Sent moderator reply to ${recipientPubkey.substring(0, 16)}... for ${sha256.substring(0, 16)}... (${success} relays)`);
+    console.log(`[DM] Sent moderator reply to ${recipientPubkey.substring(0, 16)}...${sha256 ? ` for ${sha256.substring(0, 16)}...` : ''} (${success} relays)`);
     return { sent: true, relaysPublished: success };
   } catch (err) {
     console.error('[DM] Unexpected error sending moderator reply:', err.message);

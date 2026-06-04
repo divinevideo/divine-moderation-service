@@ -4,7 +4,7 @@
 // ABOUTME: Tests for DM sender module (dm-sender.mjs)
 // ABOUTME: Verifies message templates, key derivation, rate limiting, and relay discovery
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { bytesToHex } from '@noble/hashes/utils';
 import {
@@ -18,6 +18,7 @@ import {
   notifyReporters,
   COMPOSE_TEMPLATES,
   renderComposeTemplate,
+  publishToRelays,
 } from './dm-sender.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
@@ -600,5 +601,38 @@ describe('COMPOSE_TEMPLATES / renderComposeTemplate', () => {
 
   it('returns null for an unknown key', () => {
     expect(renderComposeTemplate('NOPE')).toBeNull();
+  });
+});
+
+describe('publishToRelays — Workers WebSocket construction', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Regression guard: Cloudflare Workers' WebSocket constructor only accepts a
+  // subprotocol string/array as its 2nd arg. Passing an options/headers object
+  // throws "protocol header token is invalid", so publishing silently fails and
+  // composed messages never leave the worker. Connect with the URL alone.
+  it('constructs each relay WebSocket with the URL only (no options object)', async () => {
+    const ctorArgs = [];
+    class FakeWS {
+      constructor(...args) {
+        ctorArgs.push(args);
+        this._cbs = {};
+        queueMicrotask(() => {
+          this._cbs.open && this._cbs.open();
+          this._cbs.message && this._cbs.message({ data: JSON.stringify(['OK', 'evt1', true, '']) });
+        });
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send() {}
+      close() {}
+    }
+    vi.stubGlobal('WebSocket', FakeWS);
+
+    const res = await publishToRelays({ id: 'evt1' }, ['wss://relay.example.com'], {});
+
+    expect(res).toEqual({ success: 1, failed: 0 });
+    expect(ctorArgs).toHaveLength(1);
+    expect(ctorArgs[0]).toHaveLength(1); // URL only — the regression guard
+    expect(ctorArgs[0][0]).toBe('wss://relay.example.com');
   });
 });
