@@ -3520,16 +3520,16 @@ async function runMigration() {
         } catch { /* fall through to 400 */ }
         return new Response(JSON.stringify({ error: 'invalid npub' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
-      // 3. nip-05 (verified against the domain's well-known)
-      if (input.includes('@')) {
-        const { resolveNip05 } = await import('./nostr/nip05.mjs');
-        const resolved = await resolveNip05(input, env);
-        if (!resolved) {
-          return new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
-        }
-        return new Response(JSON.stringify({ pubkey: resolved.pubkey, address: resolved.address, domain: resolved.domain, source: 'nip05' }), { headers: { 'Content-Type': 'application/json' } });
+      // 3. nip-05 / divine handle — anything that isn't a raw key. Accepts the
+      //    forms moderators see on profiles (@mjb.divine.video, @mjb), bare
+      //    handles, canonical user@domain, and cross-domain nip-05. Normalization
+      //    + verification against the domain's well-known live in nostr/nip05.mjs.
+      const { resolveNip05 } = await import('./nostr/nip05.mjs');
+      const resolved = await resolveNip05(input, env);
+      if (!resolved) {
+        return new Response(JSON.stringify({ error: 'not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
       }
-      return new Response(JSON.stringify({ error: 'invalid input' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ pubkey: resolved.pubkey, address: resolved.address, display: resolved.display, domain: resolved.domain, source: 'nip05' }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Admin API: List creator-facing DM templates (rendered, optionally with video context).

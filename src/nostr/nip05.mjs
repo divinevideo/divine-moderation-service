@@ -13,6 +13,50 @@ const LOCAL_PART_RE = /^[a-z0-9._-]+$/i;
 const DOMAIN_RE = /^[a-z0-9.-]+\.[a-z]{2,}$/i;
 const HEX64_RE = /^[0-9a-f]{64}$/i;
 
+// Divine issues NIP-05 in two equivalent forms, both shown on profiles as
+// "@username.divine.video": username@divine.video (apex) and
+// _@username.divine.video (per-user subdomain). Profiles render the leading-@
+// form, so that is what moderators paste.
+const DIVINE_APEXES = ['divine.video', 'dvine.video'];
+const DEFAULT_DIVINE_APEX = 'divine.video';
+
+/**
+ * Normalize the recipient forms a moderator actually sees into a canonical
+ * "localpart@domain" NIP-05 address. Divine display forms map to the subdomain
+ * identity; canonical and cross-domain forms pass through unchanged:
+ *   @mjb.divine.video  -> _@mjb.divine.video   (profile badge)
+ *   @mjb / mjb         -> _@mjb.divine.video   (bare handle, divine default)
+ *   mjb.divine.video   -> _@mjb.divine.video   (subdomain host, e.g. from URL)
+ *   mjb@divine.video, _@mjb.divine.video, mjb@nos.social -> unchanged
+ * Returns the canonical address string, or null if there's nothing to resolve.
+ * @param {string} raw
+ * @returns {string | null}
+ */
+export function normalizeNip05Input(raw) {
+  if (typeof raw !== 'string') return null;
+  let s = raw.trim();
+  if (s.startsWith('@')) s = s.slice(1).trim();
+  if (!s) return null;
+  if (s.includes('@')) return s;          // already localpart@domain
+  if (s.includes('.')) return `_@${s}`;   // bare host (e.g. mjb.divine.video) -> root id
+  return `_@${s}.${DEFAULT_DIVINE_APEX}`;  // bare handle -> divine subdomain
+}
+
+/**
+ * Friendly display for a resolved divine address ("@username.divine.video"),
+ * matching what profile pages show. Returns null for non-divine addresses.
+ */
+function divineDisplayName(name, domain) {
+  for (const apex of DIVINE_APEXES) {
+    if (name === '_' && domain.endsWith(`.${apex}`)) {
+      const sub = domain.slice(0, -(apex.length + 1));
+      if (sub && !sub.includes('.')) return `@${sub}.${apex}`;
+    }
+    if (domain === apex) return `@${name}.${apex}`;
+  }
+  return null;
+}
+
 /**
  * Parse "user@domain" into { name, domain } or null if malformed.
  * @param {string} address
@@ -36,10 +80,11 @@ export function parseNip05(address) {
  * @param {Object} env - Cloudflare env (uses MODERATION_KV for caching)
  */
 export async function resolveNip05(address, env) {
-  const parsed = parseNip05(address);
+  const parsed = parseNip05(normalizeNip05Input(address));
   if (!parsed) return null;
   const { name, domain } = parsed;
   const canonical = `${name}@${domain}`;
+  const display = divineDisplayName(name, domain) || canonical;
   const cacheKey = `nip05:${canonical.toLowerCase()}`;
 
   if (env?.MODERATION_KV) {
@@ -47,7 +92,7 @@ export async function resolveNip05(address, env) {
       const cached = await env.MODERATION_KV.get(cacheKey);
       if (cached !== null) {
         const { pubkey } = JSON.parse(cached);
-        return pubkey ? { pubkey, address: canonical, domain } : null;
+        return pubkey ? { pubkey, address: canonical, domain, display } : null;
       }
     } catch { /* ignore cache read errors */ }
   }
@@ -85,5 +130,5 @@ export async function resolveNip05(address, env) {
     } catch { /* ignore cache write errors */ }
   }
 
-  return pubkey ? { pubkey, address: canonical, domain } : null;
+  return pubkey ? { pubkey, address: canonical, domain, display } : null;
 }

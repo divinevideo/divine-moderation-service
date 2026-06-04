@@ -471,7 +471,7 @@
         Select a conversation, or start a New Message
       </div>
       <div id="new-recipient-bar" style="display:none; padding:12px; border-bottom:1px solid #333;">
-        <input type="text" id="recipient-input" placeholder="npub, hex pubkey, or user@domain (nip-05)"
+        <input type="text" id="recipient-input" placeholder="@username.divine.video, npub, hex pubkey, or user@domain"
           style="width:60%;" onkeydown="if(event.key==='Enter'){event.preventDefault();resolveRecipient();}">
         <button class="btn-primary" onclick="resolveRecipient()">Start</button>
         <span id="recipient-status" style="margin-left:10px; font-size:13px;"></span>
@@ -851,7 +851,7 @@
         }
         const data = await res.json();
         const label = data.source === 'nip05'
-          ? '✓ ' + escapeHtml(data.address) + ' (verified via ' + escapeHtml(data.domain) + ')'
+          ? '✓ ' + escapeHtml(data.display || data.address) + ' (verified)'
           : '✓ ' + truncatePubkey(data.pubkey);
         status.style.color = '#6c6';
         status.innerHTML = label;

@@ -5,7 +5,7 @@
 // ABOUTME: Mocks global fetch; no real network.
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { parseNip05, resolveNip05 } from './nip05.mjs';
+import { parseNip05, resolveNip05, normalizeNip05Input } from './nip05.mjs';
 import { createMockKV } from '../test/helpers.mjs';
 
 const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
@@ -37,7 +37,7 @@ describe('resolveNip05', () => {
     }));
     const env = { MODERATION_KV: createMockKV() };
     const result = await resolveNip05('alice@divine.video', env);
-    expect(result).toEqual({ pubkey: HEX, address: 'alice@divine.video', domain: 'divine.video' });
+    expect(result).toEqual({ pubkey: HEX, address: 'alice@divine.video', domain: 'divine.video', display: '@alice.divine.video' });
     expect(fetch).toHaveBeenCalledWith(
       'https://divine.video/.well-known/nostr.json?name=alice',
       expect.objectContaining({ headers: expect.any(Object) }),
@@ -65,7 +65,8 @@ describe('resolveNip05', () => {
   it('returns null for malformed address and never fetches', async () => {
     const spy = vi.fn();
     vi.stubGlobal('fetch', spy);
-    const result = await resolveNip05('not-an-address', { MODERATION_KV: createMockKV() });
+    // A space in the local part survives normalization but fails parse, so no fetch.
+    const result = await resolveNip05('bad name@divine.video', { MODERATION_KV: createMockKV() });
     expect(result).toBeNull();
     expect(spy).not.toHaveBeenCalled();
   });
@@ -75,7 +76,37 @@ describe('resolveNip05', () => {
     const spy = vi.fn();
     vi.stubGlobal('fetch', spy);
     const result = await resolveNip05('alice@divine.video', { MODERATION_KV: kv });
-    expect(result).toEqual({ pubkey: HEX, address: 'alice@divine.video', domain: 'divine.video' });
+    expect(result).toEqual({ pubkey: HEX, address: 'alice@divine.video', domain: 'divine.video', display: '@alice.divine.video' });
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('resolves the divine profile-badge form (@user.divine.video) and echoes the @ display', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ names: { _: HEX } }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await resolveNip05('@mjb.divine.video', { MODERATION_KV: createMockKV() });
+    expect(result).toEqual({ pubkey: HEX, address: '_@mjb.divine.video', domain: 'mjb.divine.video', display: '@mjb.divine.video' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://mjb.divine.video/.well-known/nostr.json?name=_',
+      expect.objectContaining({ headers: expect.any(Object) }),
+    );
+  });
+});
+
+describe('normalizeNip05Input', () => {
+  it('maps divine display + bare forms to the subdomain identity', () => {
+    expect(normalizeNip05Input('@mjb.divine.video')).toBe('_@mjb.divine.video');
+    expect(normalizeNip05Input('@mjb')).toBe('_@mjb.divine.video');
+    expect(normalizeNip05Input('mjb')).toBe('_@mjb.divine.video');
+    expect(normalizeNip05Input('mjb.divine.video')).toBe('_@mjb.divine.video');
+  });
+  it('passes canonical and cross-domain forms through unchanged', () => {
+    expect(normalizeNip05Input('mjb@divine.video')).toBe('mjb@divine.video');
+    expect(normalizeNip05Input('_@mjb.divine.video')).toBe('_@mjb.divine.video');
+    expect(normalizeNip05Input('mjb@nos.social')).toBe('mjb@nos.social');
+  });
+  it('returns null for empty / @-only / non-string', () => {
+    expect(normalizeNip05Input('')).toBeNull();
+    expect(normalizeNip05Input('@')).toBeNull();
+    expect(normalizeNip05Input(null)).toBeNull();
   });
 });
