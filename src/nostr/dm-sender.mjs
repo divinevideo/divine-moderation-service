@@ -214,6 +214,12 @@ export const COMPOSE_TEMPLATES = [
   { key: 'AGE_RESTRICTED', label: 'Content age-restricted' },
   { key: 'QUARANTINE', label: 'Content under review' },
   { key: 'ACCOUNT_SUSPENDED', label: 'Account suspended' },
+  // TODO(after #150 lands on main + rebase): add the two new account-state
+  // notices so moderators can hand-send them. They reuse TEMPLATES via
+  // renderComposeTemplate -> selectTemplate and the rendered text stays
+  // editable before sending, so no duplicate copy is needed:
+  //   { key: 'ACCOUNT_BANNED', label: 'Account banned' },
+  //   { key: 'ACCOUNT_RESTORED', label: 'Account restored' },
 ];
 
 /**
