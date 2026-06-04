@@ -63,6 +63,16 @@ const TEMPLATES = {
   ACCOUNT_SUSPENDED: () =>
     `Your account has been suspended for violating Divine's content policies.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n\n${FOOTER}`,
 
+  // Account-level permanent ban: no content link, not content-specific.
+  // Distinct from ACCOUNT_SUSPENDED: signals the action is permanent.
+  ACCOUNT_BANNED: () =>
+    `Your account has been banned for violating Divine's content policies. This is a permanent action.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n\n${FOOTER}`,
+
+  // Account-level restoration: no content link, no appeal prompt.
+  // Sent when a previously suspended/banned account is reinstated.
+  ACCOUNT_RESTORED: () =>
+    `Good news: your account has been restored and you can use Divine again.\n\n${FOOTER}`,
+
   REPORT_OUTCOME_ACTION: (outcome, sha256, title, publishedAt, reportedAt) =>
     `Thanks for your report. We've reviewed ${contentSubject(title, 'the reported content')}${postedDate(publishedAt)} and it has been ${outcome}.${reportedAt ? ` You reported this content on ${formatDate(reportedAt)}.` : ''}\n${contentLink(sha256)}\nIf you have questions, you can reply to this message.\n\n${FOOTER}`,
 

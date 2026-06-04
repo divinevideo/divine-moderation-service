@@ -128,6 +128,24 @@ describe('DM Sender - Message Templates', () => {
     expect(message).not.toContain('Your content');
   });
 
+  it('should produce account banned message without content reference', () => {
+    const message = getMessageForAction('ACCOUNT_BANNED');
+    expect(message).toContain('Your account has been banned');
+    expect(message).toContain('This is a permanent action');
+    expect(message).toContain('reply to this message to appeal');
+    expect(message).not.toContain('divine.video/video/');
+    expect(message).not.toContain('Your content');
+  });
+
+  it('should produce account restored message without appeal or content reference', () => {
+    const message = getMessageForAction('ACCOUNT_RESTORED');
+    expect(message).toContain('your account has been restored');
+    expect(message).toContain('use Divine again');
+    expect(message).not.toContain('reply to this message to appeal');
+    expect(message).not.toContain('divine.video/video/');
+    expect(message).not.toContain('Your content');
+  });
+
   it('should produce correct report outcome message for no action', () => {
     const message = getReportOutcomeMessage('SAFE', 'ghi789');
 
