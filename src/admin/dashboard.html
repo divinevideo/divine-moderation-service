@@ -2839,6 +2839,21 @@
           } else {
             grid.innerHTML = triageVideos.map(video => createTriageCard(video)).join('');
           }
+          // Hydrate each newly rendered card's Nostr context lazily — the
+          // untriaged list query returns no per-row relay context (#164), so
+          // fetch it client-side per card (non-blocking) rather than blocking
+          // the list. In append mode only the new cards are in the DOM; in a
+          // full render newVideos === triageVideos.
+          newVideos.forEach(video => {
+            const container = document.getElementById('nostr-' + video.sha256);
+            if (!container) return;
+            if (video.nostrContext) {
+              container.innerHTML = createNostrMetadataHTML(video.nostrContext);
+              updateDivineLink(video.sha256, video.nostrContext);
+            } else {
+              loadNostrContext(video.sha256, container);
+            }
+          });
           // Set up pause handlers for newly rendered videos
           setTimeout(setupVideoPauseHandlers, 100);
         }
@@ -3140,7 +3155,7 @@
     }
 
     function createTriageCard(video) {
-      const { sha256, cdnUrl, thumbnailUrl, receivedAt, nostrContext, showDirectActions, showTranscriptTools } = video;
+      const { sha256, cdnUrl, thumbnailUrl, receivedAt, showDirectActions, showTranscriptTools } = video;
 
       // Format timestamp
       const timestamp = receivedAt ? new Date(receivedAt).toLocaleString() : 'Unknown';
@@ -3154,31 +3169,11 @@
       // Prefer resolved public URL when available (older imports often use stable IDs, not blob hashes)
       const divineUrl = video.divineUrl || 'https://divine.video/video/' + sha256;
 
-      // Nostr context display
-      const author = nostrContext?.author || null;
-      const title = nostrContext?.title || null;
-      const content = nostrContext?.content || null;
-      const client = nostrContext?.client || null;
-      const pubkey = nostrContext?.pubkey || null;
-
-      // Build metadata line
-      let metaLine = '';
-      if (author) {
-        metaLine += '<span style="color: #a78bfa;">👤 ' + escapeHtml(author) + '</span>';
-      } else if (pubkey) {
-        metaLine += '<span style="color: #666;">👤 ' + pubkey + '</span>';
-      }
-      if (client) {
-        metaLine += (metaLine ? ' · ' : '') + '<span style="color: #666;">' + escapeHtml(client) + '</span>';
-      }
-
-      // Build description (title or content)
-      let description = '';
-      if (title && title.trim()) {
-        description = escapeHtml(title.substring(0, 100));
-      } else if (content && content.trim()) {
-        description = escapeHtml(content.substring(0, 100));
-      }
+      // Nostr context (author/title/published + pre-AI/Vine-era badges) is
+      // hydrated lazily into the #nostr-${sha} container below — the same path
+      // the moderated grid uses. The untriaged list query no longer returns
+      // per-row relay context (#164), so each card fetches it client-side
+      // instead of the list blocking on ~50 round-trips.
 
       const directActions = showDirectActions ? (
         '<div class="action-buttons">' +
@@ -3210,8 +3205,7 @@
             '<button onclick="copyToClipboard(\'' + copyVideoUrl + '\'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy video URL">📋 URL</button> ' +
             '<button onclick="copyDashboardPermalink(\'' + sha256 + '\', this); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy permalink to this item">🔗 Link</button>' +
           '</div>' +
-          (metaLine ? '<div style="font-size: 12px; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + metaLine + '</div>' : '') +
-          (description ? '<div style="font-size: 13px; color: #ccc; margin-bottom: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + description + '</div>' : '') +
+          '<div class="nostr-context" id="nostr-' + sha256 + '"><div class="nostr-loading">Loading context...</div></div>' +
           provenanceHTML +
           '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">' +
             '<span style="font-size: 12px; color: #666;">' + (timeAgo ? '📅 ' + timeAgo : '') + '</span>' +
