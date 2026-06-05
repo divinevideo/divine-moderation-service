@@ -97,6 +97,10 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
 }
 
 export async function getConversation(db, conversationId) {
+  // id ASC is a load-bearing tiebreaker: created_at is CURRENT_TIMESTAMP at
+  // 1-second resolution, so messages sent in the same second tie on created_at
+  // alone and would render in an undefined order. id is the AUTOINCREMENT rowid
+  // (insertion order), so it gives a stable chronological thread.
   const rows = await db.prepare(`
     SELECT * FROM dm_log
     WHERE conversation_id = ?
