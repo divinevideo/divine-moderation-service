@@ -321,8 +321,8 @@ function buildAdminNostrMetadata(metadata = {}, extras = {}) {
 async function fetchFunnelcakeLookupVideo(identifier, env) {
   // Read through the CDN-cached host (api.divine.video) rather than the
   // uncached relay backup path, so repeat per-card lookups hit Fastly's
-  // edge cache instead of origin. Env-driven so staging points at its own
-  // funnelcake host; defaults to the canonical production cached host.
+  // edge cache instead of origin. Env-overridable so staging can point at
+  // its own funnelcake host; defaults to the canonical production cached host.
   const host = env?.FUNNELCAKE_LOOKUP_URL || 'https://api.divine.video';
   const response = await fetch(`${host}/api/videos/${encodeURIComponent(identifier)}`, {
     headers: {
@@ -895,7 +895,9 @@ async function fetchLookupNostrContext(hash, env) {
 // back and forth over the same handful of cards in a review session — skips the
 // origin round-trip. Short TTL keeps title/author from going meaningfully stale
 // (the underlying api.divine.video response is itself only ~15-60s fresh).
-const ADMIN_LOOKUP_CACHE_TTL_SECONDS = 300;
+// Env-overridable so an operator can drop the staleness window during an
+// incident without a redeploy.
+const ADMIN_LOOKUP_CACHE_TTL_DEFAULT_SECONDS = 300;
 
 async function enrichAdminLookupVideo(video, env) {
   if (!video) {
@@ -941,7 +943,8 @@ async function enrichAdminLookupVideo(video, env) {
       // "no context" for the whole TTL. Awaited (the cold path already paid for
       // the HTTP round-trip) so the write isn't dropped when the response returns.
       if (funnelcakeVideo) {
-        await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ADMIN_LOOKUP_CACHE_TTL_SECONDS }).catch((error) => {
+        const ttl = Number(env.ADMIN_LOOKUP_CACHE_TTL_SECONDS) || ADMIN_LOOKUP_CACHE_TTL_DEFAULT_SECONDS;
+        await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ttl }).catch((error) => {
           console.error(`[ADMIN] Failed to cache relay context for ${enriched.sha256}:`, error.message);
         });
       }

@@ -132,8 +132,8 @@ RELAY_REPORTS_REQUIRE_DIVINE_CLIENT = "true"      # Only ingest reports tagged a
 FUNNELCAKE_ADMIN_URL = "https://relay.divine.video"
 
 # Funnelcake read host for per-card admin video lookups (GET /api/videos/{id}).
-# The CDN-cached path; staging overrides this to its own funnelcake host. The
-# admin/NIP-98 write path above stays on the relay and is unaffected.
+# The CDN-cached path; env-overridable so staging can point at its own funnelcake
+# host. The admin/NIP-98 write path above stays on the relay and is unaffected.
 FUNNELCAKE_LOOKUP_URL = "https://api.divine.video"
 
 # Legacy moderation_results lookup-column backfill (perf/dashboard-speedup).
