@@ -10,6 +10,8 @@ import {
   latestBunnyEventBySha,
   latestBunnyEventForSha,
   countLatestBunnyEvents,
+  latestUntriagedBunnyEvents,
+  countUntriagedBunnyEvents,
 } from './bunny-events.mjs';
 
 const SHA_A = 'a'.repeat(64);
@@ -123,5 +125,38 @@ describe('latestBunnyEventForSha', () => {
   it('returns null for unknown sha', async () => {
     const row = await latestBunnyEventForSha(env, 'f'.repeat(64));
     expect(row).toBeNull();
+  });
+});
+
+describe('latestUntriagedBunnyEvents / countUntriagedBunnyEvents', () => {
+  // SHA_A gets a moderation_results row (= has a verdict). SHA_B does not
+  // (= needs triage). SHA_C's latest event is deleted (excluded regardless).
+  beforeEach(async () => {
+    await env.BLOSSOM_DB.prepare(`CREATE TABLE IF NOT EXISTS moderation_results (
+      sha256 TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      moderated_at TEXT
+    )`).run();
+    await env.BLOSSOM_DB.prepare('DELETE FROM moderation_results').run();
+    await env.BLOSSOM_DB.prepare(
+      `INSERT INTO moderation_results (sha256, action) VALUES (?, 'SAFE')`,
+    ).bind(SHA_A).run();
+  });
+
+  it('returns only videos with no moderation_results row', async () => {
+    const rows = await latestUntriagedBunnyEvents(env);
+    expect(rows.map((r) => r.sha256)).toEqual([SHA_B]);
+  });
+
+  it('counts only untriaged videos', async () => {
+    expect(await countUntriagedBunnyEvents(env)).toBe(1);
+  });
+
+  it('excludes a sha once it gains a moderation_results row', async () => {
+    await env.BLOSSOM_DB.prepare(
+      `INSERT INTO moderation_results (sha256, action) VALUES (?, 'REVIEW')`,
+    ).bind(SHA_B).run();
+    expect(await countUntriagedBunnyEvents(env)).toBe(0);
+    expect(await latestUntriagedBunnyEvents(env)).toEqual([]);
   });
 });

@@ -90,3 +90,65 @@ export async function latestBunnyEventForSha(env, sha256) {
   `).bind(sha256).first();
   return row || null;
 }
+
+/**
+ * Page through the latest event per sha whose sha has NO moderation_results
+ * row yet — i.e. videos the automation has produced no verdict for ("needs
+ * triage"). Same rank-then-filter semantic as latestBunnyEventBySha, plus a
+ * LEFT JOIN anti-join so already-decided videos are excluded in the query
+ * itself (no per-row KV lookups). moderation_results.sha256 is the PK, so the
+ * join is 1:1.
+ */
+export async function latestUntriagedBunnyEvents(env, options = {}) {
+  const { limit = 50, offset = 0, excludeStatusNames = DEFAULT_EXCLUDE_STATUS } = options;
+  const placeholders = excludeStatusNames.map(() => '?').join(',');
+  const sql = `
+    WITH ranked AS (
+      SELECT
+        sha256, video_guid, hls_url, mp4_url, thumbnail_url, received_at, status_name,
+        ROW_NUMBER() OVER (PARTITION BY sha256 ORDER BY received_at DESC) AS rn
+      FROM bunny_webhook_events
+      WHERE sha256 IS NOT NULL
+    )
+    SELECT r.sha256, r.video_guid, r.hls_url, r.mp4_url, r.thumbnail_url, r.received_at, r.status_name
+    FROM ranked r
+    LEFT JOIN moderation_results m ON m.sha256 = r.sha256
+    WHERE r.rn = 1
+      AND r.status_name NOT IN (${placeholders})
+      AND m.sha256 IS NULL
+    ORDER BY r.received_at DESC
+    LIMIT ? OFFSET ?
+  `;
+  const result = await env.BLOSSOM_DB.prepare(sql)
+    .bind(...excludeStatusNames, limit, offset)
+    .all();
+  return result.results || [];
+}
+
+/**
+ * Count of "needs triage" videos — latest event per sha, not in the excluded
+ * statuses, with NO moderation_results row. The exact anti-join the dashboard
+ * NEEDS TRIAGE card and the untriaged queue should both use, so the number and
+ * the list can't drift.
+ */
+export async function countUntriagedBunnyEvents(env, options = {}) {
+  const { excludeStatusNames = DEFAULT_EXCLUDE_STATUS } = options;
+  const placeholders = excludeStatusNames.map(() => '?').join(',');
+  const sql = `
+    WITH ranked AS (
+      SELECT
+        sha256, status_name,
+        ROW_NUMBER() OVER (PARTITION BY sha256 ORDER BY received_at DESC) AS rn
+      FROM bunny_webhook_events
+      WHERE sha256 IS NOT NULL
+    )
+    SELECT COUNT(*) AS total
+    FROM ranked r
+    LEFT JOIN moderation_results m ON m.sha256 = r.sha256
+    WHERE r.rn = 1
+      AND r.status_name NOT IN (${placeholders})
+      AND m.sha256 IS NULL
+  `;
+  const row = await env.BLOSSOM_DB.prepare(sql).bind(...excludeStatusNames).first();
+  return row?.total || 0;
+}
