@@ -51,5 +51,7 @@ describe('messages UI — progressive render + optimistic send', () => {
     expect(messagesHTML).toContain("encodeURIComponent(targetPubkey)");
     expect(messagesHTML).toContain('pendingBubble.isConnected');
     expect(messagesHTML).toContain('selectedPubkey === targetPubkey');
+    // Failed first message of an empty thread restores the empty-state placeholder.
+    expect(messagesHTML).toContain('renderThread([])');
   });
 });

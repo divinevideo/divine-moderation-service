@@ -862,7 +862,13 @@
         // Revert: remove the optimistic bubble if still present, and restore the
         // typed text only if we're still on the same thread (the composer is a
         // single shared element — don't dump this thread's text into another).
-        if (pendingBubble.isConnected) pendingBubble.remove();
+        if (pendingBubble.isConnected) {
+          pendingBubble.remove();
+          // If that was the only bubble (failed first message of an empty
+          // thread), restore the "no messages yet" placeholder appendOutgoingBubble removed.
+          const threadContainer = document.getElementById('thread-messages');
+          if (!threadContainer.querySelector('.message-bubble')) renderThread([]);
+        }
         if (selectedPubkey === targetPubkey) {
           input.value = text;
           if (sha256) sha256Input.value = sha256;
