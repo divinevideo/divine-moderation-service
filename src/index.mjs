@@ -923,6 +923,9 @@ async function enrichAdminLookupVideo(video, env) {
     || (ctx.client == null && ctx.content == null);
 
   if (enriched.sha256 && needsFunnelcake) {
+    // Keyed on sha256 (the stable content hash) even though the fetch below may
+    // resolve via lookupId/eventId — the cached value is the record for that
+    // content hash regardless of which identifier resolved it.
     const cacheKey = `admin:lookup:funnelcake:${enriched.sha256}`;
     let funnelcakeVideo = null;
 
