@@ -131,6 +131,11 @@ RELAY_REPORTS_REQUIRE_DIVINE_CLIENT = "true"      # Only ingest reports tagged a
 # so the corresponding pubkey must be in funnelcake's ADMIN_PUBKEYS.
 FUNNELCAKE_ADMIN_URL = "https://relay.divine.video"
 
+# Funnelcake read host for per-card admin video lookups (GET /api/videos/{id}).
+# The CDN-cached path; staging overrides this to its own funnelcake host. The
+# admin/NIP-98 write path above stays on the relay and is unaffected.
+FUNNELCAKE_LOOKUP_URL = "https://api.divine.video"
+
 # Legacy moderation_results lookup-column backfill (perf/dashboard-speedup).
 # Off by default; flip to "true" via `wrangler secret put` after the manual
 # trigger /admin/api/backfill/run has been verified on a small batch.

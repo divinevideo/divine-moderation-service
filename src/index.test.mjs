@@ -728,7 +728,7 @@ describe('Admin video lookup', () => {
 
     globalThis.fetch = async (url) => {
       restCalls.push(String(url));
-      if (String(url) === `https://relay.divine.video/api/videos/${SHA256}`) {
+      if (String(url) === `https://api.divine.video/api/videos/${SHA256}`) {
         return new Response(JSON.stringify({
           event: {
             id: 'd'.repeat(64),
@@ -794,7 +794,100 @@ describe('Admin video lookup', () => {
           }
         }
       });
-      expect(restCalls).toEqual([`https://relay.divine.video/api/videos/${SHA256}`]);
+      expect(restCalls).toEqual([`https://api.divine.video/api/videos/${SHA256}`]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
+    }
+  });
+
+  it('caches the per-card funnelcake lookup so a repeat view skips the REST call', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    const restCalls = [];
+
+    globalThis.WebSocket = class {
+      constructor() {
+        throw new Error('WebSocket should not be used for admin lookup metadata');
+      }
+    };
+
+    globalThis.fetch = async (url) => {
+      restCalls.push(String(url));
+      if (String(url) === `https://api.divine.video/api/videos/${SHA256}`) {
+        return new Response(JSON.stringify({
+          event: {
+            id: 'd'.repeat(64),
+            pubkey: 'b'.repeat(64),
+            created_at: 1700000000,
+            kind: 34236,
+            tags: [
+              ['d', SHA256],
+              ['title', 'REST title'],
+              ['imeta', 'url https://media.divine.video/rest-content.mp4', `x ${SHA256}`]
+            ],
+            content: 'REST description',
+            sig: 'e'.repeat(128)
+          },
+          stats: { author_name: 'REST author' }
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    // Map-backed KV so the first request's cache write is visible to the second.
+    const kvStore = new Map();
+    const kv = {
+      async get(key) { return kvStore.has(key) ? kvStore.get(key) : null; },
+      async put(key, value) { kvStore.set(key, value); },
+      async delete(key) { kvStore.delete(key); },
+      async list() { return { keys: [], list_complete: true, cursor: null }; }
+    };
+
+    const makeEnv = () => createEnv({
+      MODERATION_KV: kv,
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'REVIEW',
+          provider: 'hiveai',
+          scores: JSON.stringify({ nudity: 0.4 }),
+          categories: JSON.stringify(['nudity']),
+          moderated_at: '2026-03-07T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null,
+          uploaded_by: 'b'.repeat(64)
+        }]])
+      })
+    });
+
+    try {
+      const first = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        }),
+        makeEnv()
+      );
+      expect(first.status).toBe(200);
+      await expect(first.json()).resolves.toMatchObject({
+        video: { sha256: SHA256, nostrContext: { title: 'REST title', author: 'REST author' } }
+      });
+
+      const second = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        }),
+        makeEnv()
+      );
+      expect(second.status).toBe(200);
+      // Same enriched context on the cached read...
+      await expect(second.json()).resolves.toMatchObject({
+        video: { sha256: SHA256, nostrContext: { title: 'REST title', author: 'REST author' } }
+      });
+
+      // ...and the funnelcake REST endpoint was hit exactly once across both views.
+      const lookupCalls = restCalls.filter((u) => u === `https://api.divine.video/api/videos/${SHA256}`);
+      expect(lookupCalls).toEqual([`https://api.divine.video/api/videos/${SHA256}`]);
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;
@@ -927,7 +1020,7 @@ describe('Admin video lookup', () => {
     const mediaSha = 'b'.repeat(64);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (url) => {
-      if (String(url) === `https://relay.divine.video/api/videos/${SHA256}`) {
+      if (String(url) === `https://api.divine.video/api/videos/${SHA256}`) {
         return new Response(JSON.stringify({
           event: {
             id: SHA256,
@@ -985,7 +1078,7 @@ describe('Admin video lookup', () => {
     const stableId = 'video-imported-stable-id';
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (url) => {
-      if (String(url) === `https://relay.divine.video/api/videos/${stableId}`) {
+      if (String(url) === `https://api.divine.video/api/videos/${stableId}`) {
         return new Response(JSON.stringify({
           event: {
             id: SHA256,
@@ -1165,7 +1258,7 @@ describe('Admin nostr context lookup', () => {
 
     globalThis.fetch = async (url) => {
       restCalls.push(String(url));
-      if (String(url) === `https://relay.divine.video/api/videos/${SHA256}`) {
+      if (String(url) === `https://api.divine.video/api/videos/${SHA256}`) {
         return new Response(JSON.stringify({
           event: {
             id: 'd'.repeat(64),
@@ -1224,7 +1317,7 @@ describe('Admin nostr context lookup', () => {
           createdAt: 1700000000
         }
       });
-      expect(restCalls).toEqual([`https://relay.divine.video/api/videos/${SHA256}`]);
+      expect(restCalls).toEqual([`https://api.divine.video/api/videos/${SHA256}`]);
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;
