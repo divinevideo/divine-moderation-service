@@ -26,3 +26,21 @@ describe('messages UI — new message compose hooks', () => {
     expect(messagesHTML).toContain('No messages yet');
   });
 });
+
+describe('messages UI — progressive render + optimistic send', () => {
+  it('renders the conversation list before profiles resolve (background patch)', () => {
+    // #152: paint immediately, then fetch profiles and re-render.
+    expect(messagesHTML).toContain('fetchProfiles(pubkeys).then(() => renderConversations())');
+  });
+
+  it('appends an optimistic pending bubble and reverts on failure', () => {
+    // #151: optimistic append + clear composer immediately, revert on error.
+    expect(messagesHTML).toContain('function createMessageBubble(');
+    expect(messagesHTML).toContain('function appendOutgoingBubble(');
+    expect(messagesHTML).toContain('appendOutgoingBubble(text, sha256, { pending: true })');
+    expect(messagesHTML).toContain('pending-tag');
+    // Revert path restores the typed text.
+    expect(messagesHTML).toContain('pendingBubble.remove();');
+    expect(messagesHTML).toContain('input.value = text;');
+  });
+});

@@ -306,6 +306,15 @@
       align-items: center;
     }
 
+    /* Optimistic outgoing bubble awaiting the publish round-trip. */
+    .message-bubble.pending {
+      opacity: 0.6;
+    }
+
+    .message-bubble .pending-tag {
+      font-style: italic;
+    }
+
     .message-bubble .video-link {
       display: inline-block;
       margin-top: 6px;
@@ -624,11 +633,13 @@
         const data = await res.json();
         conversations = data.conversations || data || [];
 
-        // Fetch profiles for all participants
-        const pubkeys = conversations.map(c => c.participant_pubkey || c.pubkey).filter(Boolean);
-        await fetchProfiles(pubkeys);
-
+        // Paint immediately — displayName() falls back to the truncated pubkey,
+        // so rows show last message + timestamp without waiting on the
+        // relay-bound profile lookup. Then fetch profiles in the background and
+        // re-render to patch in names/avatars when they arrive.
         renderConversations();
+        const pubkeys = conversations.map(c => c.participant_pubkey || c.pubkey).filter(Boolean);
+        fetchProfiles(pubkeys).then(() => renderConversations()).catch(() => {});
       } catch (err) {
         container.innerHTML = '<div class="empty-state">Failed to load conversations</div>';
         console.error('fetchConversations error:', err);
@@ -750,32 +761,52 @@
         return;
       }
 
-      messages.forEach(msg => {
-        const direction = msg.direction || (msg.from_moderator ? 'outgoing' : 'incoming');
-        const bubble = document.createElement('div');
-        bubble.className = 'message-bubble ' + direction;
-
-        let html = '<div>' + escapeHtml(msg.content || msg.message || '') + '</div>';
-
-        if (msg.sha256) {
-          html += '<a class="video-link" href="/admin/video/' + encodeURIComponent(msg.sha256) + '" target="_blank">View video: ' + msg.sha256.slice(0, 12) + '...</a>';
-        }
-
-        const ts = msg.created_at || msg.timestamp;
-        const msgType = msg.message_type;
-        html += '<div class="bubble-meta">';
-        html += '<span>' + relativeTime(ts) + '</span>';
-        if (msgType) {
-          html += '<span class="type-tag">' + badgeLabel(msgType) + '</span>';
-        }
-        html += '</div>';
-
-        bubble.innerHTML = html;
-        container.appendChild(bubble);
-      });
+      messages.forEach(msg => container.appendChild(createMessageBubble(msg)));
 
       // Auto-scroll to bottom
       container.scrollTop = container.scrollHeight;
+    }
+
+    // Build a single message bubble. Shared by renderThread (server rows) and
+    // the optimistic-send append path (a pending outgoing bubble).
+    function createMessageBubble(msg) {
+      const direction = msg.direction || (msg.from_moderator ? 'outgoing' : 'incoming');
+      const bubble = document.createElement('div');
+      bubble.className = 'message-bubble ' + direction + (msg.pending ? ' pending' : '');
+
+      let html = '<div>' + escapeHtml(msg.content || msg.message || '') + '</div>';
+
+      if (msg.sha256) {
+        html += '<a class="video-link" href="/admin/video/' + encodeURIComponent(msg.sha256) + '" target="_blank">View video: ' + msg.sha256.slice(0, 12) + '...</a>';
+      }
+
+      html += '<div class="bubble-meta">';
+      if (msg.pending) {
+        html += '<span class="pending-tag">Sending…</span>';
+      } else {
+        const ts = msg.created_at || msg.timestamp;
+        html += '<span>' + relativeTime(ts) + '</span>';
+        if (msg.message_type) {
+          html += '<span class="type-tag">' + badgeLabel(msg.message_type) + '</span>';
+        }
+      }
+      html += '</div>';
+
+      bubble.innerHTML = html;
+      return bubble;
+    }
+
+    // Optimistically append an outgoing bubble (used by sendMessage before the
+    // publish round-trip resolves). Returns the bubble node so the caller can
+    // mark it delivered or revert it.
+    function appendOutgoingBubble(text, sha256, { pending } = {}) {
+      const container = document.getElementById('thread-messages');
+      const empty = container.querySelector('.empty-state');
+      if (empty) empty.remove();
+      const bubble = createMessageBubble({ direction: 'outgoing', content: text, sha256: sha256 || null, pending });
+      container.appendChild(bubble);
+      container.scrollTop = container.scrollHeight;
+      return bubble;
     }
 
     // --- Send message ---
@@ -788,10 +819,18 @@
       const text = input.value.trim();
       if (!text) return;
 
-      sendBtn.disabled = true;
-      const body = { message: text };
       const sha256 = sha256Input.value.trim();
+      const body = { message: text };
       if (sha256) body.sha256 = sha256;
+
+      // Optimistic: append a pending bubble and clear the composer immediately,
+      // so the UI doesn't block on the relay-bound publish round-trip. On
+      // success we mark the bubble delivered; on failure we revert (remove the
+      // bubble, restore the typed text) so the moderator can retry.
+      const pendingBubble = appendOutgoingBubble(text, sha256, { pending: true });
+      input.value = '';
+      sha256Input.value = '';
+      sendBtn.disabled = true;
 
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(selectedPubkey), {
@@ -805,10 +844,15 @@
           throw new Error(errBody.error || 'Failed to send message');
         }
 
-        input.value = '';
-        sha256Input.value = '';
-        await loadThread(selectedPubkey);
+        // Delivered: drop the pending state and stamp a timestamp.
+        pendingBubble.classList.remove('pending');
+        const meta = pendingBubble.querySelector('.bubble-meta');
+        if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
       } catch (err) {
+        // Revert: remove the optimistic bubble and restore the composer text.
+        pendingBubble.remove();
+        input.value = text;
+        if (sha256) sha256Input.value = sha256;
         alert('Failed to send message: ' + err.message);
         console.error('sendMessage error:', err);
       } finally {
