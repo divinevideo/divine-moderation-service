@@ -448,7 +448,11 @@ describe('DM Store - getConversations against real D1', () => {
         content,
         nostrEventId: eventId,
       });
-      // Stagger so created_at orders deterministically.
+      // Small gap between inserts. Note created_at is CURRENT_TIMESTAMP at
+      // 1-second resolution, so these rows usually share a last_message_at;
+      // deterministic ordering comes from the `dl.id DESC` tiebreaker in the
+      // query, not from this stagger. The assertions below only check page
+      // sizes, which hold regardless of intra-second tie order.
       await new Promise(r => setTimeout(r, 15));
     }
 
