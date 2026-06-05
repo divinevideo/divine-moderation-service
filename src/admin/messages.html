@@ -823,6 +823,11 @@
       const body = { message: text };
       if (sha256) body.sha256 = sha256;
 
+      // Snapshot the target thread: the moderator can switch conversations
+      // while the publish is in flight, and selectedPubkey would change under
+      // us — we must POST to (and reconcile against) the thread we sent from.
+      const targetPubkey = selectedPubkey;
+
       // Optimistic: append a pending bubble and clear the composer immediately,
       // so the UI doesn't block on the relay-bound publish round-trip. On
       // success we mark the bubble delivered; on failure we revert (remove the
@@ -833,7 +838,7 @@
       sendBtn.disabled = true;
 
       try {
-        const res = await fetch('/admin/api/messages/' + encodeURIComponent(selectedPubkey), {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(targetPubkey), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -844,15 +849,24 @@
           throw new Error(errBody.error || 'Failed to send message');
         }
 
-        // Delivered: drop the pending state and stamp a timestamp.
-        pendingBubble.classList.remove('pending');
-        const meta = pendingBubble.querySelector('.bubble-meta');
-        if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
+        // Delivered: drop the pending state and stamp a timestamp — but only if
+        // the bubble is still in the DOM. If the moderator navigated/refreshed
+        // mid-send it was wiped; the server render on next open of that thread
+        // shows the logged row, so there's nothing to reconcile here.
+        if (pendingBubble.isConnected) {
+          pendingBubble.classList.remove('pending');
+          const meta = pendingBubble.querySelector('.bubble-meta');
+          if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
+        }
       } catch (err) {
-        // Revert: remove the optimistic bubble and restore the composer text.
-        pendingBubble.remove();
-        input.value = text;
-        if (sha256) sha256Input.value = sha256;
+        // Revert: remove the optimistic bubble if still present, and restore the
+        // typed text only if we're still on the same thread (the composer is a
+        // single shared element — don't dump this thread's text into another).
+        if (pendingBubble.isConnected) pendingBubble.remove();
+        if (selectedPubkey === targetPubkey) {
+          input.value = text;
+          if (sha256) sha256Input.value = sha256;
+        }
         alert('Failed to send message: ' + err.message);
         console.error('sendMessage error:', err);
       } finally {

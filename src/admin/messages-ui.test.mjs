@@ -43,4 +43,13 @@ describe('messages UI — progressive render + optimistic send', () => {
     expect(messagesHTML).toContain('pendingBubble.remove();');
     expect(messagesHTML).toContain('input.value = text;');
   });
+
+  it('guards the optimistic send against mid-send navigation / thread switch', () => {
+    // Snapshot the target thread (don't POST to whatever is selected when the
+    // fetch line runs) and only touch the bubble if it's still in the DOM.
+    expect(messagesHTML).toContain('const targetPubkey = selectedPubkey;');
+    expect(messagesHTML).toContain("encodeURIComponent(targetPubkey)");
+    expect(messagesHTML).toContain('pendingBubble.isConnected');
+    expect(messagesHTML).toContain('selectedPubkey === targetPubkey');
+  });
 });
