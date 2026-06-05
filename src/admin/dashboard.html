@@ -3209,7 +3209,7 @@
           provenanceHTML +
           '<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">' +
             '<span style="font-size: 12px; color: #666;">' + (timeAgo ? '📅 ' + timeAgo : '') + '</span>' +
-            '<a href="' + divineUrl + '" target="_blank" style="color: #8b5cf6; font-size: 12px; text-decoration: none;">View →</a>' +
+            '<a id="divine-link-' + sha256 + '" href="' + divineUrl + '" target="_blank" style="color: #8b5cf6; font-size: 12px; text-decoration: none;">View →</a>' +
           '</div>' +
           '<div style="display: flex; gap: 8px;">' +
             '<button onclick="sendToHive(\'' + sha256 + '\', this)" style="background: linear-gradient(135deg, #8b5cf6, #6366f1); color: white; border: none; padding: 10px 12px; border-radius: 6px; cursor: pointer; flex: 1; font-weight: 600; font-size: 13px;">' +

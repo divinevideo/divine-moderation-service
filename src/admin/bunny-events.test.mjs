@@ -122,4 +122,19 @@ describe('latestUntriagedBunnyEvents / countUntriagedBunnyEvents', () => {
     // Only SHA_B is untriaged-and-not-deleted; SHA_A has a verdict, C and D are deleted.
     expect(await countUntriagedBunnyEvents(env)).toBe(1);
   });
+
+  it('honors LIMIT and OFFSET, ordered by received_at DESC', async () => {
+    // Add a second untriaged sha newer than SHA_B (received_at 250) so the
+    // anti-join returns two rows to page through: [SHA_E@500, SHA_B@250].
+    const SHA_E = 'e'.repeat(64);
+    await env.BLOSSOM_DB.prepare(
+      `INSERT INTO bunny_webhook_events (sha256, video_guid, hls_url, status_name, received_at) VALUES (?,?,?,?,?)`,
+    ).bind(SHA_E, 'g-e-1', 'E', 'finished', 500).run();
+
+    expect(await countUntriagedBunnyEvents(env)).toBe(2);
+    const first = await latestUntriagedBunnyEvents(env, { limit: 1, offset: 0 });
+    const second = await latestUntriagedBunnyEvents(env, { limit: 1, offset: 1 });
+    expect(first.map((r) => r.sha256)).toEqual([SHA_E]);
+    expect(second.map((r) => r.sha256)).toEqual([SHA_B]);
+  });
 });
