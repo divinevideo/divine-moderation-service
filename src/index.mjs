@@ -1039,7 +1039,9 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
   const hash = isValidSha256(identifier) ? identifier.toLowerCase() : null;
   const cdnUrl = `https://${env.CDN_DOMAIN || 'media.divine.video'}/${hash}`;
   if (hash) {
-    // Independent reads — run them in parallel rather than serially.
+    // Independent reads — run them in parallel rather than serially. On a D1
+    // error the KV read still fires (harmless, vs. serial where it wouldn't),
+    // and Promise.all surfaces the first rejection to the caller's try/catch.
     const [moderatedRow, kvModerationRaw] = await Promise.all([
       env.BLOSSOM_DB.prepare(`
         SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}, review_notes, raw_response, videoseal
