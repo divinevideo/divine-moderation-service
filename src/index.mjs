@@ -1642,7 +1642,7 @@ export default {
           const pendingFlagged = pending.review + pending.quarantine + pending.ageRestricted + pending.permanentBan;
           // Exact anti-join (videos with no moderation_results row) — the same
           // definition the untriaged list uses, so card and queue can't drift.
-          // (Was `totalInD1 − totalModerated`, an approximation that counts
+          // (Was `totalInD1 - totalModerated`, an approximation that counts
           // moderation_results rows for non-bunny shas.)
           const untriaged = untriagedCount;
 
@@ -1725,8 +1725,11 @@ export default {
         return authError;
       }
 
-      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
-      const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+      // Guard the query boundary: a non-numeric or negative limit/offset
+      // (?limit=abc, ?limit=-5) must not bind NaN or a negative LIMIT (which
+      // SQLite reads as unbounded) into the untriaged query.
+      const limit = Math.min(Math.max(1, parseInt(url.searchParams.get('limit') || '50', 10) || 50), 200);
+      const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
       console.log(`[${requestId}] Fetching untriaged videos: limit=${limit}, offset=${offset}`);
 
       try {
