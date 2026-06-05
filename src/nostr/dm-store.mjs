@@ -100,7 +100,7 @@ export async function getConversation(db, conversationId) {
   const rows = await db.prepare(`
     SELECT * FROM dm_log
     WHERE conversation_id = ?
-    ORDER BY created_at ASC
+    ORDER BY created_at ASC, id ASC
   `).bind(conversationId).all();
   return rows.results || [];
 }
