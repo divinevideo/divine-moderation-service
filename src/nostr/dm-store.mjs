@@ -45,15 +45,25 @@ export async function logDm(db, { conversationId, sha256, direction, senderPubke
 }
 
 export async function getConversations(db, { limit = 20, offset = 0, moderatorPubkey } = {}) {
-  // An earlier revision of this query put MAX()/COUNT() in the outer SELECT
-  // without a GROUP BY, which SQLite collapses into a single aggregated row
-  // across the whole filtered set. That made every multi-conversation inbox
-  // render as exactly one sidebar item regardless of how many conversations
-  // actually existed. The subquery already picks the latest id per
-  // conversation, so we select those rows directly and compute
-  // message_count per conversation via a correlated subquery (bounded by
-  // LIMIT).
+  // One grouped pass computes both the latest row id AND the per-conversation
+  // message_count in the same scan, then we join back for the latest row's
+  // columns. This replaces the earlier shape (a per-returned-row correlated
+  // `(SELECT COUNT(*) ...)` subquery on top of a separate MAX(id) GROUP BY),
+  // which did the grouped scan AND an extra index lookup per row.
+  //
+  // No extra index is needed: `id` is INTEGER PRIMARY KEY (the rowid), so the
+  // existing idx_dm_conversation on (conversation_id) is physically
+  // (conversation_id, id) and already covers MAX(id)/COUNT(*) GROUP BY. The
+  // final ORDER BY runs over the reduced one-row-per-conversation set (bounded
+  // by the moderation account's conversation count), so it doesn't warrant its
+  // own created_at index. id DESC is a deterministic tiebreaker for rows that
+  // share a (1-second-resolution) created_at, so pagination is stable.
   const rows = await db.prepare(`
+    WITH latest AS (
+      SELECT conversation_id, MAX(id) AS max_id, COUNT(*) AS message_count
+      FROM dm_log
+      GROUP BY conversation_id
+    )
     SELECT
       dl.conversation_id,
       dl.created_at as last_message_at,
@@ -63,12 +73,10 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       dl.content as last_message,
       dl.sha256 as last_sha256,
       dl.message_type as last_message_type,
-      (SELECT COUNT(*) FROM dm_log WHERE conversation_id = dl.conversation_id) as message_count
-    FROM dm_log dl
-    WHERE dl.id IN (
-      SELECT MAX(id) FROM dm_log GROUP BY conversation_id
-    )
-    ORDER BY last_message_at DESC
+      latest.message_count
+    FROM latest
+    JOIN dm_log dl ON dl.id = latest.max_id
+    ORDER BY last_message_at DESC, dl.id DESC
     LIMIT ? OFFSET ?
   `).bind(limit, offset).all();
   const results = rows.results || [];
@@ -97,8 +105,19 @@ export async function getConversation(db, conversationId) {
   return rows.results || [];
 }
 
-export async function getConversationByPubkey(db, pubkey) {
-  // Find conversations where this pubkey is a participant
+export async function getConversationByPubkey(db, pubkey, moderatorPubkey) {
+  // Fast path: the conversation id is deterministic, so when we know the
+  // moderator pubkey we derive it directly and hit the indexed conversation_id
+  // column — no scan. (The old `sender_pubkey = ? OR recipient_pubkey = ?` form
+  // can't use an index on both sides: sender_pubkey is unindexed.)
+  if (moderatorPubkey) {
+    const conversationId = computeConversationId(moderatorPubkey, pubkey);
+    const messages = await getConversation(db, conversationId);
+    return messages.length ? messages : null;
+  }
+
+  // Fallback (no moderator pubkey available, e.g. no signing key configured):
+  // find any conversation this pubkey participates in via the OR query.
   const rows = await db.prepare(`
     SELECT DISTINCT conversation_id FROM dm_log
     WHERE sender_pubkey = ? OR recipient_pubkey = ?

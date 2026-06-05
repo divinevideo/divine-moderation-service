@@ -506,3 +506,45 @@ describe('DM Store - getConversationByPubkey', () => {
     expect(result).toBeNull();
   });
 });
+
+describe('DM Store - getConversationByPubkey against real D1', () => {
+  const db = env.BLOSSOM_DB;
+  const MODERATOR = 'f'.repeat(64);
+  const CREATOR = ('a'.repeat(63) + '1').slice(0, 64);
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+  });
+
+  it('resolves the thread via the deterministic conversation id (moderator-aware fast path)', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi from creator',
+      nostrEventId: 'evt-1',
+    });
+    await logDm(db, {
+      conversationId,
+      direction: 'outgoing',
+      senderPubkey: MODERATOR,
+      recipientPubkey: CREATOR,
+      content: 'moderator reply',
+      nostrEventId: 'evt-2',
+    });
+
+    // Look up by the creator pubkey with the moderator known — must resolve the
+    // same conversation without touching sender_pubkey (the unindexed OR path).
+    const messages = await getConversationByPubkey(db, CREATOR, MODERATOR);
+    expect(messages).not.toBeNull();
+    expect(messages.map((m) => m.content)).toEqual(['hi from creator', 'moderator reply']);
+  });
+
+  it('returns null for a participant with no conversation (fast path)', async () => {
+    const messages = await getConversationByPubkey(db, 'd'.repeat(64), MODERATOR);
+    expect(messages).toBeNull();
+  });
+});
