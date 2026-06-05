@@ -895,9 +895,11 @@ async function fetchLookupNostrContext(hash, env) {
 // back and forth over the same handful of cards in a review session — skips the
 // origin round-trip. Short TTL keeps title/author from going meaningfully stale
 // (the underlying api.divine.video response is itself only ~15-60s fresh).
-// Env-overridable so an operator can drop the staleness window during an
-// incident without a redeploy.
-const ADMIN_LOOKUP_CACHE_TTL_DEFAULT_SECONDS = 300;
+// Deliberately a fixed constant, not env-configurable: there's no operational
+// need to tune a 300s cache of non-critical title/author context (moderation
+// decisions key off the sha, not the title), and KV's 60s expirationTtl floor
+// would make a finer knob low-value and easy to misconfigure.
+const ADMIN_LOOKUP_CACHE_TTL_SECONDS = 300;
 
 async function enrichAdminLookupVideo(video, env) {
   if (!video) {
@@ -943,8 +945,7 @@ async function enrichAdminLookupVideo(video, env) {
       // "no context" for the whole TTL. Awaited (the cold path already paid for
       // the HTTP round-trip) so the write isn't dropped when the response returns.
       if (funnelcakeVideo) {
-        const ttl = Number(env.ADMIN_LOOKUP_CACHE_TTL_SECONDS) || ADMIN_LOOKUP_CACHE_TTL_DEFAULT_SECONDS;
-        await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ttl }).catch((error) => {
+        await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ADMIN_LOOKUP_CACHE_TTL_SECONDS }).catch((error) => {
           console.error(`[ADMIN] Failed to cache relay context for ${enriched.sha256}:`, error.message);
         });
       }
