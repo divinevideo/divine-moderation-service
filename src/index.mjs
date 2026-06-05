@@ -1039,13 +1039,15 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
   const hash = isValidSha256(identifier) ? identifier.toLowerCase() : null;
   const cdnUrl = `https://${env.CDN_DOMAIN || 'media.divine.video'}/${hash}`;
   if (hash) {
-    const moderatedRow = await env.BLOSSOM_DB.prepare(`
-      SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}, review_notes, raw_response, videoseal
-      FROM moderation_results
-      WHERE sha256 = ?
-    `).bind(hash).first();
-
-    const kvModerationRaw = await env.MODERATION_KV.get(`moderation:${hash}`);
+    // Independent reads — run them in parallel rather than serially.
+    const [moderatedRow, kvModerationRaw] = await Promise.all([
+      env.BLOSSOM_DB.prepare(`
+        SELECT ${ADMIN_VIDEO_COLUMNS.join(', ')}, review_notes, raw_response, videoseal
+        FROM moderation_results
+        WHERE sha256 = ?
+      `).bind(hash).first(),
+      env.MODERATION_KV.get(`moderation:${hash}`),
+    ]);
     const kvModeration = parseMaybeJson(kvModerationRaw, null);
 
     if (moderatedRow || kvModeration) {
