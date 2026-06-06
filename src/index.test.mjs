@@ -894,6 +894,84 @@ describe('Admin video lookup', () => {
     }
   });
 
+  it('still returns live funnelcake context when the per-card KV cache write is unavailable', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalWebSocket = globalThis.WebSocket;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const restCalls = [];
+
+    globalThis.WebSocket = class {
+      constructor() {
+        throw new Error('WebSocket should not be used for admin lookup metadata');
+      }
+    };
+
+    globalThis.fetch = async (url) => {
+      restCalls.push(String(url));
+      if (String(url) === `https://api.divine.video/api/videos/${SHA256}`) {
+        return new Response(JSON.stringify({
+          event: {
+            id: 'd'.repeat(64),
+            pubkey: 'b'.repeat(64),
+            created_at: 1700000000,
+            kind: 34236,
+            tags: [
+              ['d', SHA256],
+              ['title', 'REST title'],
+              ['imeta', 'url https://media.divine.video/rest-content.mp4', `x ${SHA256}`]
+            ],
+            content: 'REST description',
+            sig: 'e'.repeat(128)
+          },
+          stats: { author_name: 'REST author' }
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        }),
+        createEnv({
+          MODERATION_KV: {
+            async get() { return null; },
+            async delete() {},
+            async list() { return { keys: [], list_complete: true, cursor: null }; }
+          },
+          BLOSSOM_DB: createDbMock({
+            moderationResults: new Map([[SHA256, {
+              sha256: SHA256,
+              action: 'REVIEW',
+              provider: 'hiveai',
+              scores: JSON.stringify({ nudity: 0.4 }),
+              categories: JSON.stringify(['nudity']),
+              moderated_at: '2026-03-07T00:00:00.000Z',
+              reviewed_by: null,
+              reviewed_at: null,
+              uploaded_by: 'b'.repeat(64)
+            }]])
+          })
+        })
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        video: { sha256: SHA256, nostrContext: { title: 'REST title', author: 'REST author' } }
+      });
+      expect(restCalls).toEqual([`https://api.divine.video/api/videos/${SHA256}`]);
+      expect(consoleError).toHaveBeenCalledWith(
+        `[ADMIN] Failed to cache relay context for ${SHA256}:`,
+        expect.any(String)
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      globalThis.WebSocket = originalWebSocket;
+      consoleError.mockRestore();
+    }
+  });
+
   it('returns stored relay context fields in the admin video list without per-row fan-out', async () => {
     // Contract change (perf/dashboard-speedup):
     //   /admin/api/videos used to fire one funnelcake REST call per row

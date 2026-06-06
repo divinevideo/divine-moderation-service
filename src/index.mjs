@@ -948,9 +948,11 @@ async function enrichAdminLookupVideo(video, env) {
       // "no context" for the whole TTL. Awaited (the cold path already paid for
       // the HTTP round-trip) so the write isn't dropped when the response returns.
       if (funnelcakeVideo) {
-        await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ADMIN_LOOKUP_CACHE_TTL_SECONDS }).catch((error) => {
+        try {
+          await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ADMIN_LOOKUP_CACHE_TTL_SECONDS });
+        } catch (error) {
           console.error(`[ADMIN] Failed to cache relay context for ${enriched.sha256}:`, error.message);
-        });
+        }
       }
     }
 
