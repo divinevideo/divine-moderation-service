@@ -121,10 +121,16 @@ export async function getConversationByPubkey(db, pubkey, moderatorPubkey) {
   }
 
   // Fallback (no moderator pubkey available, e.g. no signing key configured):
-  // find any conversation this pubkey participates in via the OR query.
+  // find the most recently updated conversation this pubkey participates in
+  // via the OR query. This keeps the legacy behavior available while making
+  // the "first conversation" choice deterministic.
   const rows = await db.prepare(`
-    SELECT DISTINCT conversation_id FROM dm_log
+    SELECT conversation_id
+    FROM dm_log
     WHERE sender_pubkey = ? OR recipient_pubkey = ?
+    GROUP BY conversation_id
+    ORDER BY MAX(id) DESC
+    LIMIT 1
   `).bind(pubkey, pubkey).all();
 
   if (!rows.results || rows.results.length === 0) return null;

@@ -515,6 +515,7 @@ describe('DM Store - getConversationByPubkey against real D1', () => {
   const db = env.BLOSSOM_DB;
   const MODERATOR = 'f'.repeat(64);
   const CREATOR = ('a'.repeat(63) + '1').slice(0, 64);
+  const OTHER = ('b'.repeat(63) + '1').slice(0, 64);
 
   beforeEach(async () => {
     await initDmLogTable(db);
@@ -550,5 +551,32 @@ describe('DM Store - getConversationByPubkey against real D1', () => {
   it('returns null for a participant with no conversation (fast path)', async () => {
     const messages = await getConversationByPubkey(db, 'd'.repeat(64), MODERATOR);
     expect(messages).toBeNull();
+  });
+
+  it('uses the most recently updated matching conversation in the legacy fallback', async () => {
+    const olderConversationId = computeConversationId(CREATOR, OTHER);
+    const newerConversationId = computeConversationId(MODERATOR, CREATOR);
+
+    await logDm(db, {
+      conversationId: olderConversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: OTHER,
+      content: 'older unrelated conversation',
+      nostrEventId: 'evt-fallback-older',
+    });
+    await logDm(db, {
+      conversationId: newerConversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'newer moderator conversation',
+      nostrEventId: 'evt-fallback-newer',
+    });
+
+    const messages = await getConversationByPubkey(db, CREATOR);
+
+    expect(messages).not.toBeNull();
+    expect(messages.map((m) => m.content)).toEqual(['newer moderator conversation']);
   });
 });
