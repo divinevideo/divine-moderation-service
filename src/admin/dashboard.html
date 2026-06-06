@@ -2393,6 +2393,7 @@
 
     function getVideoBySha(sha256) {
       return allVideos.find(v => v.sha256 === sha256)
+        || triageVideos.find(v => v.sha256 === sha256)
         || (currentLookupVideo && currentLookupVideo.sha256 === sha256 ? currentLookupVideo : null);
     }
 
@@ -2596,6 +2597,7 @@
       const nostrContainer = document.getElementById(`nostr-${video.sha256}`);
       if (nostrContainer) {
         if (video.nostrContext) {
+          applyNostrMetadataToVideo(video.sha256, video.nostrContext);
           nostrContainer.innerHTML = createNostrMetadataHTML(video.nostrContext);
           updateDivineLink(video.sha256, video.nostrContext);
         } else {
@@ -2848,6 +2850,7 @@
             const container = document.getElementById('nostr-' + video.sha256);
             if (!container) return;
             if (video.nostrContext) {
+              applyNostrMetadataToVideo(video.sha256, video.nostrContext);
               container.innerHTML = createNostrMetadataHTML(video.nostrContext);
               updateDivineLink(video.sha256, video.nostrContext);
             } else {
@@ -3094,6 +3097,12 @@
       return '<div class="uploader-history" id="' + containerId + '" data-pubkey="' + pubkey + '"><div class="uploader-history-loading" style="font-size: 11px; color: #666; padding: 4px 0;">Loading uploader history…</div></div>';
     }
 
+    function createCreatorMessageLink(video) {
+      return video.uploaded_by
+        ? '<div class="divine-link"><a href="/admin/messages?pubkey=' + escapeHtml(video.uploaded_by) + '" target="_blank" rel="noopener noreferrer">Message Creator →</a></div>'
+        : '';
+    }
+
     async function hydrateUploaderHistory(containerId, pubkey) {
       const el = document.getElementById(containerId);
       if (!el) return;
@@ -3220,8 +3229,9 @@
             '</button>' +
           '</div>' +
           '<div class="action-buttons compact">' + creatorInfoButton + '</div>' +
-          uploaderEnforcementPanel +
-          uploaderHistoryPanel +
+          '<div id="creator-message-slot-' + sha256 + '"></div>' +
+          '<div id="uploader-enforcement-slot-' + sha256 + '">' + uploaderEnforcementPanel + '</div>' +
+          '<div id="uploader-history-slot-' + sha256 + '">' + uploaderHistoryPanel + '</div>' +
           directActions +
           transcriptTools +
         '</div>' +
@@ -3664,6 +3674,7 @@
         if (!resp.ok) throw new Error('fetch failed');
         const data = await resp.json();
         if (data.found && data.metadata) {
+          applyNostrMetadataToVideo(sha256, data.metadata);
           container.innerHTML = createNostrMetadataHTML(data.metadata);
           updateDivineLink(sha256, data.metadata);
         } else {
@@ -3671,6 +3682,43 @@
         }
       } catch (e) {
         container.innerHTML = '<div class="nostr-not-found">No Nostr event found</div>';
+      }
+    }
+
+    function applyNostrMetadataToVideo(sha256, metadata) {
+      if (!metadata) return null;
+      const video = getVideoBySha(sha256);
+      if (!video) return null;
+
+      video.nostrContext = { ...(video.nostrContext || {}), ...metadata };
+      if (metadata.eventId) video.eventId = metadata.eventId;
+      if (metadata.pubkey && isFullHexPubkey(metadata.pubkey)) video.uploaded_by = metadata.pubkey;
+      if (metadata.author) video.author = metadata.author;
+      if (metadata.publishedAt) video.publishedAt = metadata.publishedAt;
+
+      refreshHydratedCardContext(video);
+      return video;
+    }
+
+    function refreshHydratedCardContext(video) {
+      const eventMeta = document.getElementById('event-meta-' + video.sha256);
+      if (eventMeta) {
+        eventMeta.outerHTML = createEventMetaHTML(video);
+      }
+
+      const enforcement = document.getElementById('uploader-enforcement-slot-' + video.sha256);
+      if (enforcement) {
+        enforcement.innerHTML = createUploaderEnforcementPanel(video);
+      }
+
+      const history = document.getElementById('uploader-history-slot-' + video.sha256);
+      if (history) {
+        history.innerHTML = createUploaderHistoryPanel(video);
+      }
+
+      const messageLink = document.getElementById('creator-message-slot-' + video.sha256);
+      if (messageLink) {
+        messageLink.innerHTML = createCreatorMessageLink(video);
       }
     }
 
@@ -3853,7 +3901,7 @@
         : '';
 
       return (
-        '<div class="event-meta">' +
+        '<div class="event-meta" id="event-meta-' + escapeHtml(video.sha256 || '') + '">' +
           '<div class="event-meta-avatar" aria-hidden="true">' + escapeHtml(avatarChar) + '</div>' +
           '<div class="event-meta-body">' +
             '<div class="event-meta-name">' + escapeHtml(authorName) + '</div>' +
@@ -4108,16 +4156,10 @@
                 View on divine.video →
               </a>
             </div>
-            ${video.uploaded_by ? `
-            <div class="divine-link">
-              <a href="/admin/messages?pubkey=${video.uploaded_by}" target="_blank" rel="noopener noreferrer">
-                Message Creator →
-              </a>
-            </div>
-            ` : ''}
+            <div id="creator-message-slot-${sha256}">${createCreatorMessageLink(video)}</div>
 
-            ${uploaderEnforcementPanel}
-            ${uploaderHistoryPanel}
+            <div id="uploader-enforcement-slot-${sha256}">${uploaderEnforcementPanel}</div>
+            <div id="uploader-history-slot-${sha256}">${uploaderHistoryPanel}</div>
 
             <div class="action-buttons compact">
               ${creatorInfoButton}

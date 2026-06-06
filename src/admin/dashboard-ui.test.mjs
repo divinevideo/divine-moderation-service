@@ -45,5 +45,10 @@ describe('dashboard provenance UI hooks', () => {
     expect(dashboardHTML).toContain('<div class="nostr-context" id="nostr-\' + sha256 + \'">');
     expect(dashboardHTML).toContain('id="divine-link-\' + sha256 + \'"');
     expect(dashboardHTML).toContain('loadNostrContext(video.sha256, container)');
+    expect(dashboardHTML).toContain('applyNostrMetadataToVideo(sha256, data.metadata)');
+    expect(dashboardHTML).toContain('triageVideos.find(v => v.sha256 === sha256)');
+    expect(dashboardHTML).toContain('id="event-meta-\' + escapeHtml(video.sha256 || \'\') + \'"');
+    expect(dashboardHTML).toContain('uploader-enforcement-slot-\' + sha256 + \'');
+    expect(dashboardHTML).toContain('uploader-history-slot-\' + sha256 + \'');
   });
 });

@@ -256,7 +256,7 @@ function buildFunnelcakeVideoLookup(eventResponse, identifier) {
       content: metadata.content || event.content || null,
       url: videoUrl || null,
       publishedAt: metadata.publishedAt || null,
-      pubkey: event.pubkey ? `${event.pubkey.substring(0, 16)}...` : null,
+      pubkey: event.pubkey || null,
       eventId: event.id,
       platform: metadata.platform || null
     },
@@ -289,7 +289,7 @@ function buildStoredLookupMetadata(row) {
       content: null,
       url: row.content_url || null,
       publishedAt: Number.isFinite(publishedAt) ? publishedAt : null,
-      pubkey: row.uploaded_by ? `${row.uploaded_by.substring(0, 16)}...` : null,
+      pubkey: row.uploaded_by || null,
       eventId,
       platform: null
     } : null
@@ -313,6 +313,7 @@ function buildAdminNostrMetadata(metadata = {}, extras = {}) {
     vineHashId: metadata.vineHashId ?? null,
     vineUserId: metadata.vineUserId ?? null,
     content: metadata.content || null,
+    pubkey: metadata.pubkey || null,
     eventId: metadata.eventId || null,
     createdAt: extras.createdAt ?? metadata.createdAt ?? null
   };
@@ -2428,6 +2429,7 @@ export default {
           metadata: buildAdminNostrMetadata({
             ...metadata,
             content: metadata.content || event.content || null,
+            pubkey: event.pubkey || metadata.pubkey || null,
             eventId
           }, {
             createdAt: event.created_at || null
