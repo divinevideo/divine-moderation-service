@@ -620,6 +620,10 @@
       renderConversationList(filtered);
     }
 
+    function currentConversationSearch() {
+      return document.getElementById('search-input')?.value || '';
+    }
+
     // --- Fetch conversations ---
 
     async function fetchConversations() {
@@ -647,7 +651,7 @@
     }
 
     function renderConversations() {
-      renderConversationList(conversations);
+      filterConversations(currentConversationSearch());
     }
 
     function renderConversationList(list) {
@@ -676,7 +680,7 @@
             <div class="preview">${escapeHtml(preview) || '(no messages)'}</div>
             <div class="meta">
               <span>${relativeTime(ts)}</span>
-              ${msgType ? '<span class="badge ' + badgeClass(msgType) + '">' + badgeLabel(msgType) + '</span>' : ''}
+              ${msgType ? '<span class="badge ' + badgeClass(msgType) + '">' + escapeHtml(badgeLabel(msgType)) + '</span>' : ''}
             </div>
           </div>
         `;
@@ -777,7 +781,8 @@
       let html = '<div>' + escapeHtml(msg.content || msg.message || '') + '</div>';
 
       if (msg.sha256) {
-        html += '<a class="video-link" href="/admin/video/' + encodeURIComponent(msg.sha256) + '" target="_blank">View video: ' + msg.sha256.slice(0, 12) + '...</a>';
+        const sha256 = String(msg.sha256);
+        html += '<a class="video-link" href="/admin/video/' + encodeURIComponent(sha256) + '" target="_blank">View video: ' + escapeHtml(sha256.slice(0, 12)) + '...</a>';
       }
 
       html += '<div class="bubble-meta">';
@@ -787,7 +792,7 @@
         const ts = msg.created_at || msg.timestamp;
         html += '<span>' + relativeTime(ts) + '</span>';
         if (msg.message_type) {
-          html += '<span class="type-tag">' + badgeLabel(msg.message_type) + '</span>';
+          html += '<span class="type-tag">' + escapeHtml(badgeLabel(msg.message_type)) + '</span>';
         }
       }
       html += '</div>';

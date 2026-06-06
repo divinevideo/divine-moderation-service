@@ -31,6 +31,7 @@ describe('messages UI — progressive render + optimistic send', () => {
   it('renders the conversation list before profiles resolve (background patch)', () => {
     // #152: paint immediately, then fetch profiles and re-render.
     expect(messagesHTML).toContain('fetchProfiles(pubkeys).then(() => renderConversations())');
+    expect(messagesHTML).toContain("filterConversations(currentConversationSearch())");
   });
 
   it('appends an optimistic pending bubble and reverts on failure', () => {
