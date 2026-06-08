@@ -37,7 +37,7 @@ import { notifyRelay } from './relay-notifier.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { cachedStat } from './admin/cache.mjs';
-import { latestBunnyEventBySha, latestBunnyEventForSha, countLatestBunnyEvents } from './admin/bunny-events.mjs';
+import { latestBunnyEventForSha, latestUntriagedBunnyEvents, countUntriagedBunnyEvents } from './admin/bunny-events.mjs';
 import { runBackfill } from './admin/backfill-lookup-columns.mjs';
 import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
@@ -256,7 +256,7 @@ function buildFunnelcakeVideoLookup(eventResponse, identifier) {
       content: metadata.content || event.content || null,
       url: videoUrl || null,
       publishedAt: metadata.publishedAt || null,
-      pubkey: event.pubkey ? `${event.pubkey.substring(0, 16)}...` : null,
+      pubkey: event.pubkey || null,
       eventId: event.id,
       platform: metadata.platform || null
     },
@@ -289,7 +289,7 @@ function buildStoredLookupMetadata(row) {
       content: null,
       url: row.content_url || null,
       publishedAt: Number.isFinite(publishedAt) ? publishedAt : null,
-      pubkey: row.uploaded_by ? `${row.uploaded_by.substring(0, 16)}...` : null,
+      pubkey: row.uploaded_by || null,
       eventId,
       platform: null
     } : null
@@ -313,6 +313,7 @@ function buildAdminNostrMetadata(metadata = {}, extras = {}) {
     vineHashId: metadata.vineHashId ?? null,
     vineUserId: metadata.vineUserId ?? null,
     content: metadata.content || null,
+    pubkey: metadata.pubkey || null,
     eventId: metadata.eventId || null,
     createdAt: extras.createdAt ?? metadata.createdAt ?? null
   };
@@ -1692,7 +1693,7 @@ export default {
         const fresh = url.searchParams.get('fresh') === '1';
         const stats = await cachedStat(env, ctx, 'admin-stats', 60, async () => {
           // All stats from D1 - fast SQL queries instead of KV iteration
-          const [totalResult, moderationStats, pendingStats] = await Promise.all([
+          const [totalResult, moderationStats, pendingStats, untriagedCount] = await Promise.all([
             env.BLOSSOM_DB.prepare(`
               SELECT COUNT(DISTINCT sha256) as total
               FROM bunny_webhook_events
@@ -1706,6 +1707,7 @@ export default {
               SELECT action, COUNT(*) as count FROM moderation_results
               WHERE reviewed_by IS NULL GROUP BY action
             `).all(),
+            countUntriagedBunnyEvents(env),
           ]);
 
           const totalInD1 = totalResult?.total || 0;
@@ -1730,7 +1732,11 @@ export default {
           }
 
           const pendingFlagged = pending.review + pending.quarantine + pending.ageRestricted + pending.permanentBan;
-          const untriaged = Math.max(0, totalInD1 - totalModerated);
+          // Exact anti-join (videos with no moderation_results row) — the same
+          // definition the untriaged list uses, so card and queue can't drift.
+          // (Was `totalInD1 - totalModerated`, an approximation that counts
+          // moderation_results rows for non-bunny shas.)
+          const untriaged = untriagedCount;
 
           return { totalInD1, totalModerated, untriaged, pendingFlagged, breakdown, pending };
         }, { fresh });
@@ -1811,87 +1817,38 @@ export default {
         return authError;
       }
 
-      const limit = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
-      const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+      // Guard the query boundary: a non-numeric or negative limit/offset
+      // (?limit=abc, ?limit=-5) must not bind NaN or a negative LIMIT (which
+      // SQLite reads as unbounded) into the untriaged query.
+      const limit = Math.min(Math.max(1, parseInt(url.searchParams.get('limit') || '50', 10) || 50), 200);
+      const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
       console.log(`[${requestId}] Fetching untriaged videos: limit=${limit}, offset=${offset}`);
 
       try {
-        const rows = await latestBunnyEventBySha(env, { limit, offset });
+        // "Needs triage" = videos the automation produced no verdict for, i.e.
+        // no moderation_results row. The anti-join does that filtering in the
+        // query itself (no per-row KV reads). These are unprocessed uploads with
+        // no decision to enrich; the per-card /admin/api/video path fills in any
+        // Nostr context lazily when a card is opened. See #158.
+        const rows = await latestUntriagedBunnyEvents(env, { limit, offset });
 
-        // Filter to rows that haven't been moderated yet. Old code did
-        // a sequential `for` loop with await — this is one parallel batch.
-        const moderationFlags = await Promise.all(
-          rows.map((row) => env.MODERATION_KV.get(`moderation:${row.sha256}`)),
-        );
-        const unmoderatedRows = rows.filter((_, i) => !moderationFlags[i]);
+        const videos = rows.map((row) => ({
+          sha256: row.sha256,
+          videoGuid: row.video_guid,
+          hlsUrl: row.hls_url,
+          mp4Url: row.mp4_url,
+          thumbnailUrl: row.thumbnail_url,
+          receivedAt: row.received_at,
+          status: 'UNTRIAGED',
+          cdnUrl: `https://${env.CDN_DOMAIN}/${row.sha256}`,
+          eventId: null,
+          uploaded_by: null,
+          nostrContext: null,
+        }));
 
-        // Fetch Nostr context per unmoderated row, with a 1-hour KV cache
-        // so the next page render doesn't pay the WS roundtrip cost.
-        const nostrPromises = unmoderatedRows.map(async (row) => {
-          const cacheKey = `nostr:event:${row.sha256}`;
-          try {
-            const cached = await env.MODERATION_KV.get(cacheKey);
-            if (cached) {
-              const event = JSON.parse(cached);
-              const metadata = parseVideoEventMetadata(event);
-              return {
-                sha256: row.sha256,
-                eventId: event.id,
-                title: metadata?.title || null,
-                author: metadata?.author || null,
-                client: metadata?.client || null,
-                content: metadata?.content || event.content || null,
-                pubkey: event.pubkey || null,
-              };
-            }
-            const event = await fetchNostrEventBySha256(row.sha256, ['wss://relay.divine.video'], env);
-            if (event) {
-              ctx.waitUntil(env.MODERATION_KV.put(cacheKey, JSON.stringify(event), { expirationTtl: 3600 }));
-              const metadata = parseVideoEventMetadata(event);
-              return {
-                sha256: row.sha256,
-                eventId: event.id,
-                title: metadata?.title || null,
-                author: metadata?.author || null,
-                client: metadata?.client || null,
-                content: metadata?.content || event.content || null,
-                pubkey: event.pubkey || null,
-              };
-            }
-          } catch (e) {
-            console.error(`[ADMIN] Failed to fetch Nostr context for ${row.sha256}:`, e.message);
-          }
-          return { sha256: row.sha256 };
-        });
+        const total = await cachedStat(env, ctx, 'untriaged-total', 60, () => countUntriagedBunnyEvents(env));
 
-        const nostrResults = await Promise.all(nostrPromises);
-        const nostrMap = new Map(nostrResults.map((r) => [r.sha256, r]));
-
-        const videos = unmoderatedRows.map((row) => {
-          const nostr = nostrMap.get(row.sha256) || {};
-          return {
-            sha256: row.sha256,
-            videoGuid: row.video_guid,
-            hlsUrl: row.hls_url,
-            mp4Url: row.mp4_url,
-            thumbnailUrl: row.thumbnail_url,
-            receivedAt: row.received_at,
-            status: 'UNTRIAGED',
-            cdnUrl: `https://${env.CDN_DOMAIN}/${row.sha256}`,
-            eventId: nostr.eventId || null,
-            uploaded_by: nostr.pubkey || null,
-            nostrContext: {
-              title: nostr.title,
-              author: nostr.author,
-              client: nostr.client,
-              content: nostr.content,
-              pubkey: nostr.pubkey ? `${nostr.pubkey.substring(0, 16)}...` : null,
-            },
-          };
-        });
-
-        const total = await cachedStat(env, ctx, 'untriaged-total', 60, () => countLatestBunnyEvents(env));
-
+        console.log(`[${requestId}] Returning ${videos.length} untriaged videos in ${Date.now() - startTime}ms`);
         return new Response(JSON.stringify({
           videos,
           total,
@@ -2576,6 +2533,7 @@ export default {
           metadata: buildAdminNostrMetadata({
             ...metadata,
             content: metadata.content || event.content || null,
+            pubkey: event.pubkey || metadata.pubkey || null,
             eventId
           }, {
             createdAt: event.created_at || null

@@ -35,4 +35,20 @@ describe('dashboard provenance UI hooks', () => {
     expect(dashboardHTML).toContain('src="${cardThumbUrl}"');
     expect(dashboardHTML).toContain('openVideoModal');
   });
+
+  it('triage cards carry the lazy Nostr-context hydration hooks', () => {
+    // Regression guard: the untriaged list query no longer returns per-row
+    // relay context, so triage cards must hydrate it client-side. createTriageCard
+    // emits the #nostr-${sha} container (string-concat form, distinct from the
+    // moderated grid's template-literal form) and the View link's divine-link id
+    // so updateDivineLink can upgrade it; loadTriageVideos drives loadNostrContext.
+    expect(dashboardHTML).toContain('<div class="nostr-context" id="nostr-\' + sha256 + \'">');
+    expect(dashboardHTML).toContain('id="divine-link-\' + sha256 + \'"');
+    expect(dashboardHTML).toContain('loadNostrContext(video.sha256, container)');
+    expect(dashboardHTML).toContain('applyNostrMetadataToVideo(sha256, data.metadata)');
+    expect(dashboardHTML).toContain('triageVideos.find(v => v.sha256 === sha256)');
+    expect(dashboardHTML).toContain('id="event-meta-\' + escapeHtml(video.sha256 || \'\') + \'"');
+    expect(dashboardHTML).toContain('uploader-enforcement-slot-\' + sha256 + \'');
+    expect(dashboardHTML).toContain('uploader-history-slot-\' + sha256 + \'');
+  });
 });

@@ -664,7 +664,7 @@ describe('Admin video lookup', () => {
             url: 'https://media.divine.video/content.mp4',
             publishedAt: 1389756506,
             eventId: 'c'.repeat(64),
-            pubkey: `${'b'.repeat(16)}...`
+            pubkey: 'b'.repeat(64)
           }
         }
       });
@@ -1314,6 +1314,7 @@ describe('Admin nostr context lookup', () => {
           vineHashId: null,
           vineUserId: null,
           content: null,
+          pubkey: 'b'.repeat(64),
           eventId: 'c'.repeat(64),
           createdAt: null
         }
@@ -1391,6 +1392,7 @@ describe('Admin nostr context lookup', () => {
           vineHashId: null,
           vineUserId: null,
           content: 'REST description',
+          pubkey: 'b'.repeat(64),
           eventId: 'd'.repeat(64),
           createdAt: 1700000000
         }
