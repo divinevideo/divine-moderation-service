@@ -448,7 +448,11 @@ describe('DM Store - getConversations against real D1', () => {
         content,
         nostrEventId: eventId,
       });
-      // Stagger so created_at orders deterministically.
+      // Small gap between inserts. Note created_at is CURRENT_TIMESTAMP at
+      // 1-second resolution, so these rows usually share a last_message_at;
+      // deterministic ordering comes from the `dl.id DESC` tiebreaker in the
+      // query, not from this stagger. The assertions below only check page
+      // sizes, which hold regardless of intra-second tie order.
       await new Promise(r => setTimeout(r, 15));
     }
 
@@ -504,5 +508,75 @@ describe('DM Store - getConversationByPubkey', () => {
 
     const result = await getConversationByPubkey(emptyDb, 'z'.repeat(64));
     expect(result).toBeNull();
+  });
+});
+
+describe('DM Store - getConversationByPubkey against real D1', () => {
+  const db = env.BLOSSOM_DB;
+  const MODERATOR = 'f'.repeat(64);
+  const CREATOR = ('a'.repeat(63) + '1').slice(0, 64);
+  const OTHER = ('b'.repeat(63) + '1').slice(0, 64);
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+  });
+
+  it('resolves the thread via the deterministic conversation id (moderator-aware fast path)', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi from creator',
+      nostrEventId: 'evt-1',
+    });
+    await logDm(db, {
+      conversationId,
+      direction: 'outgoing',
+      senderPubkey: MODERATOR,
+      recipientPubkey: CREATOR,
+      content: 'moderator reply',
+      nostrEventId: 'evt-2',
+    });
+
+    // Look up by the creator pubkey with the moderator known — must resolve the
+    // same conversation without touching sender_pubkey (the unindexed OR path).
+    const messages = await getConversationByPubkey(db, CREATOR, MODERATOR);
+    expect(messages).not.toBeNull();
+    expect(messages.map((m) => m.content)).toEqual(['hi from creator', 'moderator reply']);
+  });
+
+  it('returns null for a participant with no conversation (fast path)', async () => {
+    const messages = await getConversationByPubkey(db, 'd'.repeat(64), MODERATOR);
+    expect(messages).toBeNull();
+  });
+
+  it('uses the most recently updated matching conversation in the legacy fallback', async () => {
+    const olderConversationId = computeConversationId(CREATOR, OTHER);
+    const newerConversationId = computeConversationId(MODERATOR, CREATOR);
+
+    await logDm(db, {
+      conversationId: olderConversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: OTHER,
+      content: 'older unrelated conversation',
+      nostrEventId: 'evt-fallback-older',
+    });
+    await logDm(db, {
+      conversationId: newerConversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'newer moderator conversation',
+      nostrEventId: 'evt-fallback-newer',
+    });
+
+    const messages = await getConversationByPubkey(db, CREATOR);
+
+    expect(messages).not.toBeNull();
+    expect(messages.map((m) => m.content)).toEqual(['newer moderator conversation']);
   });
 });

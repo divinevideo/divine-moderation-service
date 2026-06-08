@@ -3533,7 +3533,11 @@ async function runMigration() {
 
       const pubkey = url.pathname.split('/')[4];
       const { getConversationByPubkey } = await import('./nostr/dm-store.mjs');
-      const messages = await getConversationByPubkey(env.BLOSSOM_DB, pubkey);
+      const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+      // Pass moderatorPubkey so the lookup derives the deterministic
+      // conversation_id (indexed) instead of the unindexed sender/recipient OR scan.
+      const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
+      const messages = await getConversationByPubkey(env.BLOSSOM_DB, pubkey, moderatorPubkey);
       if (!messages) {
         // Never-messaged recipient: return an empty thread (200) so the compose UI
         // can render for new conversations instead of showing a load error.
