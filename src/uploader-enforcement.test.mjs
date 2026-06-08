@@ -196,12 +196,95 @@ describe('admin uploader enforcement routes', () => {
         }
       });
       expect(fetchCalls).toHaveLength(1);
-      expect(fetchCalls[0].input).toBe('https://relay.admin.divine.video/api/moderate');
+      expect(fetchCalls[0].input).toBe('https://relay.admin.divine.video/api/relay-rpc');
       expect(fetchCalls[0].init.headers['CF-Access-Client-Id']).toBe('client-id');
-      expect(JSON.parse(fetchCalls[0].init.body)).toMatchObject({
-        action: 'ban_pubkey',
-        pubkey: PUBKEY
+      const banBody = JSON.parse(fetchCalls[0].init.body);
+      expect(banBody.method).toBe('banpubkey');
+      expect(banBody.params[0]).toBe(PUBKEY);
+      expect(banBody.params[1]).toBe('Escalated by trust and safety');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('removes the relay ban via unbanpubkey when relayBanned is cleared', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchCalls = [];
+    globalThis.fetch = async (input, init) => {
+      fetchCalls.push({ input: String(input), init });
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
       });
+    };
+
+    try {
+      const db = createDbMock({
+        uploaderEnforcements: new Map([[PUBKEY, {
+          pubkey: PUBKEY,
+          approval_required: 0,
+          approval_reason: null,
+          relay_banned: 1,
+          relay_ban_reason: 'prior ban',
+          created_at: '2026-03-14T00:00:00.000Z',
+          updated_at: '2026-03-14T00:00:00.000Z'
+        }]])
+      });
+      const response = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/uploader/${PUBKEY}/enforcement`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ relayBanned: false, reason: 'Cleared by trust and safety' })
+        }),
+        createEnv({
+          BLOSSOM_DB: db,
+          RELAY_ADMIN_URL: 'https://relay.admin.divine.video',
+          CF_ACCESS_CLIENT_ID: 'client-id',
+          CF_ACCESS_CLIENT_SECRET: 'client-secret'
+        })
+      );
+
+      expect(response.status).toBe(200);
+      expect(fetchCalls).toHaveLength(1);
+      expect(fetchCalls[0].input).toBe('https://relay.admin.divine.video/api/relay-rpc');
+      const unbanBody = JSON.parse(fetchCalls[0].init.body);
+      expect(unbanBody.method).toBe('unbanpubkey');
+      expect(unbanBody.params[0]).toBe(PUBKEY);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fails fast with a timeout error when the relay-admin call aborts', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/uploader/${PUBKEY}/enforcement`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
+        }),
+        createEnv({
+          BLOSSOM_DB: createDbMock(),
+          RELAY_ADMIN_URL: 'https://relay.admin.divine.video',
+          CF_ACCESS_CLIENT_ID: 'client-id',
+          CF_ACCESS_CLIENT_SECRET: 'client-secret'
+        })
+      );
+
+      expect(response.status).toBe(502);
+      const body = await response.json();
+      expect(String(body.error || '')).toMatch(/timed out/i);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -285,11 +368,9 @@ describe('admin uploader enforcement routes', () => {
 
       expect(response.status).toBe(200);
       expect(fetchCalls).toHaveLength(1);
-      expect(JSON.parse(fetchCalls[0].init.body)).toMatchObject({
-        action: 'delete_event',
-        eventId: EVENT_ID,
-        reason: 'Delete bad event'
-      });
+      const delBody = JSON.parse(fetchCalls[0].init.body);
+      expect(delBody.method).toBe('banevent');
+      expect(delBody.params).toEqual([EVENT_ID, 'Delete bad event']);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -379,7 +460,7 @@ describe('admin uploader enforcement routes', () => {
         }
       });
       expect(fetchCalls).toHaveLength(2);
-      expect(fetchCalls.map((call) => JSON.parse(call.init.body).eventId)).toEqual([EVENT_ID, secondEventId]);
+      expect(fetchCalls.map((call) => JSON.parse(call.init.body).params[0])).toEqual([EVENT_ID, secondEventId]);
     } finally {
       globalThis.fetch = originalFetch;
       globalThis.WebSocket = originalWebSocket;

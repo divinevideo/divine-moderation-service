@@ -3441,19 +3441,29 @@
           throw new Error(data.error || `HTTP ${response.status}`);
         }
 
-        if (currentLookupVideo?.uploaded_by === pubkey) {
-          const reloadId = currentLookupVideo.lookupId || currentLookupVideo.sha256;
-          await lookupVideo(reloadId);
-        } else {
-          await loadVideos();
-        }
-
+        // Confirm success immediately (before the slower list refresh) so the
+        // moderator always gets a prompt, unmistakable signal it landed.
         button.innerHTML = originalText;
         button.disabled = false;
+        showToast(successMessage);
         setLookupStatus(successMessage);
+
+        // Refresh the affected view. A refresh hiccup must not look like the
+        // action itself failed, since it already succeeded above.
+        try {
+          if (currentLookupVideo?.uploaded_by === pubkey) {
+            const reloadId = currentLookupVideo.lookupId || currentLookupVideo.sha256;
+            await lookupVideo(reloadId);
+          } else {
+            await loadVideos();
+          }
+        } catch (refreshError) {
+          console.error('Enforcement view refresh failed:', refreshError);
+        }
       } catch (error) {
         button.innerHTML = originalText;
         button.disabled = false;
+        showToast(`User action failed: ${error.message}`, null, 5000);
         setLookupStatus(`User action failed: ${error.message}`, true);
       }
     }

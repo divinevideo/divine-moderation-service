@@ -735,21 +735,65 @@ async function processPendingTranscriptReprocess(env) {
   }
 }
 
+// The relay-admin `/api/moderate` endpoint is deprecated and is no longer
+// routed to the worker at the Cloudflare edge (it returns HTTP 522). Call the
+// live `/api/relay-rpc` endpoint instead (the same one the relay admin UI uses),
+// translating our internal action names to NIP-86 RPC methods.
+//
+// Side effects relative to the old `/api/moderate` path: banpubkey triggers
+// relay-manager's ACCOUNT_BANNED DM; unbanpubkey intentionally sends no DM
+// (relay-manager #96). Calling `/api/relay-rpc` directly also bypasses the
+// markHumanReviewed + Zendesk sync that handleModerate ran; that bookkeeping
+// is owned by moderation-service's own review flow, so it is not duplicated here.
+const RELAY_ADMIN_TIMEOUT_MS = 15000;
+
+function relayRpcForAction(payload) {
+  switch (payload?.action) {
+    case 'ban_pubkey':
+      return { method: 'banpubkey', params: [payload.pubkey, payload.reason || ''] };
+    case 'allow_pubkey':
+      return { method: 'unbanpubkey', params: [payload.pubkey] };
+    case 'delete_event':
+      return { method: 'banevent', params: [payload.eventId, payload.reason || ''] };
+    default:
+      throw new Error(`Unsupported relay admin action: ${payload?.action}`);
+  }
+}
+
 async function callRelayAdminAction(env, payload) {
   const hasCfAccessSecrets = !!(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET);
   if (!hasCfAccessSecrets) {
-    console.warn('[RELAY-ADMIN] CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET not configured on this worker — calls to relay.admin.divine.video will be blocked by Cloudflare Access. See project memory cf_access_relay_admin_secrets.md.');
+    console.warn('[RELAY-ADMIN] CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET not configured on this worker — calls to the relay-admin API will be blocked by Cloudflare Access. See project memory cf_access_relay_admin_secrets.md.');
   }
 
-  const response = await fetch(`${getRelayAdminUrl(env)}/api/moderate`, {
-    method: 'POST',
-    headers: getRelayAdminHeaders(env),
-    body: JSON.stringify(payload),
-    redirect: 'manual'
-  });
+  const rpcBody = relayRpcForAction(payload);
+  const url = `${getRelayAdminUrl(env)}/api/relay-rpc`;
+
+  // Bound the call so a dead/slow relay-admin endpoint fails fast instead of
+  // hanging the request (and the moderator's UI) for the full CF edge timeout.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), RELAY_ADMIN_TIMEOUT_MS);
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: getRelayAdminHeaders(env),
+      body: JSON.stringify(rpcBody),
+      redirect: 'manual',
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Relay admin call timed out after ${RELAY_ADMIN_TIMEOUT_MS / 1000}s (${url})`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   // Detect Cloudflare Access bouncing the request to the login page.
-  // *.admin.divine.video is behind CF Access; without a valid service token,
+  // The relay-admin API host is behind CF Access; without a valid service token,
   // any call returns a 302 to <team>.cloudflareaccess.com. Surface a self-
   // documenting error instead of a generic "HTTP 302".
   if (response.status === 302) {
@@ -1884,11 +1928,24 @@ export default {
       const current = await getUploaderEnforcement(env.BLOSSOM_DB, pubkey);
 
       if (hasRelayUpdate && body.relayBanned !== Boolean(current?.relay_banned)) {
-        await callRelayAdminAction(env, {
-          action: body.relayBanned ? 'ban_pubkey' : 'allow_pubkey',
-          pubkey,
-          reason: body.reason || `Moderator action by ${moderatorEmail}`
-        });
+        try {
+          await callRelayAdminAction(env, {
+            action: body.relayBanned ? 'ban_pubkey' : 'allow_pubkey',
+            pubkey,
+            reason: body.reason || `Moderator action by ${moderatorEmail}`
+          });
+        } catch (relayError) {
+          // Surface the failure (e.g. timeout) with its message instead of an
+          // opaque 500, and do not record an enforcement the relay never applied.
+          console.error('[ENFORCE] Relay admin action failed:', relayError);
+          return new Response(JSON.stringify({
+            success: false,
+            error: relayError instanceof Error ? relayError.message : 'Relay admin action failed'
+          }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
       }
 
       const enforcement = await setUploaderEnforcement(env.BLOSSOM_DB, pubkey, {
