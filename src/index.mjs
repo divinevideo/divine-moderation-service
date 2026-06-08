@@ -318,8 +318,13 @@ function buildAdminNostrMetadata(metadata = {}, extras = {}) {
   };
 }
 
-async function fetchFunnelcakeLookupVideo(identifier) {
-  const response = await fetch(`https://relay.divine.video/api/videos/${encodeURIComponent(identifier)}`, {
+async function fetchFunnelcakeLookupVideo(identifier, env) {
+  // Read through the CDN-cached host (api.divine.video) rather than the
+  // uncached relay backup path, so repeat per-card lookups hit Fastly's
+  // edge cache instead of origin. Env-overridable so staging can point at
+  // its own funnelcake host; defaults to the canonical production cached host.
+  const host = env?.FUNNELCAKE_LOOKUP_URL || 'https://api.divine.video';
+  const response = await fetch(`${host}/api/videos/${encodeURIComponent(identifier)}`, {
     headers: {
       'Accept': 'application/json'
     }
@@ -929,6 +934,17 @@ async function fetchLookupNostrContext(hash, env) {
   }
 }
 
+// Per-card relay context is fetched on demand for the detail view. Cache the
+// successful funnelcake result for a few minutes so the common case — paging
+// back and forth over the same handful of cards in a review session — skips the
+// origin round-trip. Short TTL keeps title/author from going meaningfully stale
+// (the underlying api.divine.video response is itself only ~15-60s fresh).
+// Deliberately a fixed constant, not env-configurable: there's no operational
+// need to tune a 300s cache of non-critical title/author context (moderation
+// decisions key off the sha, not the title), and KV's 60s expirationTtl floor
+// would make a finer knob low-value and easy to misconfigure.
+const ADMIN_LOOKUP_CACHE_TTL_SECONDS = 300;
+
 async function enrichAdminLookupVideo(video, env) {
   if (!video) {
     return null;
@@ -951,10 +967,38 @@ async function enrichAdminLookupVideo(video, env) {
     || (ctx.client == null && ctx.content == null);
 
   if (enriched.sha256 && needsFunnelcake) {
-    const funnelcakeVideo = await fetchFunnelcakeLookupVideo(enriched.lookupId || enriched.eventId || enriched.sha256).catch((error) => {
-      console.error(`[ADMIN] Failed to fetch relay context for ${enriched.sha256}:`, error.message);
-      return null;
-    });
+    // Keyed on sha256 (the stable content hash) even though the fetch below may
+    // resolve via lookupId/eventId — the cached value is the record for that
+    // content hash regardless of which identifier resolved it.
+    const cacheKey = `admin:lookup:funnelcake:${enriched.sha256}`;
+    let funnelcakeVideo = null;
+
+    try {
+      const cached = await env.MODERATION_KV.get(cacheKey);
+      if (cached) {
+        funnelcakeVideo = JSON.parse(cached);
+      }
+    } catch (error) {
+      console.error(`[ADMIN] Failed to read cached relay context for ${enriched.sha256}:`, error.message);
+    }
+
+    if (!funnelcakeVideo) {
+      funnelcakeVideo = await fetchFunnelcakeLookupVideo(enriched.lookupId || enriched.eventId || enriched.sha256, env).catch((error) => {
+        console.error(`[ADMIN] Failed to fetch relay context for ${enriched.sha256}:`, error.message);
+        return null;
+      });
+
+      // Cache successful results only — never pin a transient miss/failure as
+      // "no context" for the whole TTL. Awaited (the cold path already paid for
+      // the HTTP round-trip) so the write isn't dropped when the response returns.
+      if (funnelcakeVideo) {
+        try {
+          await env.MODERATION_KV.put(cacheKey, JSON.stringify(funnelcakeVideo), { expirationTtl: ADMIN_LOOKUP_CACHE_TTL_SECONDS });
+        } catch (error) {
+          console.error(`[ADMIN] Failed to cache relay context for ${enriched.sha256}:`, error.message);
+        }
+      }
+    }
 
     if (funnelcakeVideo) {
       enriched = mergeLookupMetadata(enriched, funnelcakeVideo);
@@ -1174,7 +1218,7 @@ async function getAdminLookupVideo(identifier, env, options = {}) {
     return null;
   }
 
-  const funnelcakeVideo = await fetchFunnelcakeLookupVideo(identifier);
+  const funnelcakeVideo = await fetchFunnelcakeLookupVideo(identifier, env);
   if (!funnelcakeVideo) {
     return null;
   }
@@ -1747,7 +1791,7 @@ export default {
       try {
         const result = await runBackfill(env, {
           limit: count,
-          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256),
+          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256, env),
         });
         return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
       } catch (error) {
@@ -2501,7 +2545,7 @@ export default {
           });
         }
 
-        const funnelcakeVideo = await fetchFunnelcakeLookupVideo(sha256).catch((error) => {
+        const funnelcakeVideo = await fetchFunnelcakeLookupVideo(sha256, env).catch((error) => {
           console.error(`[ADMIN] Failed to fetch relay context for ${sha256}:`, error.message);
           return null;
         });
@@ -4853,7 +4897,7 @@ async function runMigration() {
       // when another run holds the KV mutex.
       try {
         const result = await runBackfill(env, {
-          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256),
+          fetchLookup: (sha256) => fetchFunnelcakeLookupVideo(sha256, env),
         });
         if (!result.skipped) {
           console.log(`[BACKFILL] picked=${result.picked} updated=${result.updated} missing=${result.missing} errored=${result.errored}`);
