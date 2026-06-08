@@ -26,3 +26,33 @@ describe('messages UI — new message compose hooks', () => {
     expect(messagesHTML).toContain('No messages yet');
   });
 });
+
+describe('messages UI — progressive render + optimistic send', () => {
+  it('renders the conversation list before profiles resolve (background patch)', () => {
+    // #152: paint immediately, then fetch profiles and re-render.
+    expect(messagesHTML).toContain('fetchProfiles(pubkeys).then(() => renderConversations())');
+    expect(messagesHTML).toContain("filterConversations(currentConversationSearch())");
+  });
+
+  it('appends an optimistic pending bubble and reverts on failure', () => {
+    // #151: optimistic append + clear composer immediately, revert on error.
+    expect(messagesHTML).toContain('function createMessageBubble(');
+    expect(messagesHTML).toContain('function appendOutgoingBubble(');
+    expect(messagesHTML).toContain('appendOutgoingBubble(text, sha256, { pending: true })');
+    expect(messagesHTML).toContain('pending-tag');
+    // Revert path restores the typed text.
+    expect(messagesHTML).toContain('pendingBubble.remove();');
+    expect(messagesHTML).toContain('input.value = text;');
+  });
+
+  it('guards the optimistic send against mid-send navigation / thread switch', () => {
+    // Snapshot the target thread (don't POST to whatever is selected when the
+    // fetch line runs) and only touch the bubble if it's still in the DOM.
+    expect(messagesHTML).toContain('const targetPubkey = selectedPubkey;');
+    expect(messagesHTML).toContain("encodeURIComponent(targetPubkey)");
+    expect(messagesHTML).toContain('pendingBubble.isConnected');
+    expect(messagesHTML).toContain('selectedPubkey === targetPubkey');
+    // Failed first message of an empty thread restores the empty-state placeholder.
+    expect(messagesHTML).toContain('renderThread([])');
+  });
+});
