@@ -40,6 +40,18 @@ max_batch_size = 10
 max_batch_timeout = 30
 max_retries = 3
 
+# Service binding to the relay-admin worker (divine-relay-admin-api-prod) for
+# ban/unban/delete-event RPCs. Worker-to-worker, so it bypasses the public CF
+# edge and CF Access (the source of the deprecated /api/moderate 522 and the
+# per-card Ban User 502, issue #170) and avoids relay-admin cold starts. The
+# relay-admin worker authorizes server-to-server callers via the X-Admin-Key
+# header (divine-relay-manager worker/src/index.ts), so set RELAY_ADMIN_API_KEY
+# (secret) to relay-admin's ADMIN_API_KEY. When the binding is absent the code
+# falls back to the public-edge HTTPS + CF Access path.
+[[services]]
+binding = "RELAY_ADMIN"
+service = "divine-relay-admin-api-prod"
+
 # Environment variables
 [vars]
 MODERATION_ENABLED = "true"
@@ -167,6 +179,10 @@ crons = ["* * * * *", "*/5 * * * *"]
 # RELAY_ADMIN_URL - relay-admin API host. Default in src/index.mjs is api-relay-prod.divine.video
 # (divine-relay-admin-api-prod worker, has NOSTR_NSEC binding). Override to
 # api-relay-staging.divine.video or relay.admin.divine.video only when needed.
+# Only used for the public-edge fallback; the RELAY_ADMIN service binding is preferred.
+# RELAY_ADMIN_API_KEY - shared admin key for the RELAY_ADMIN service binding; must equal
+# the relay-admin worker's ADMIN_API_KEY. Sent as the X-Admin-Key header so the call
+# authenticates without CF Access. Required when the RELAY_ADMIN binding is configured.
 # REALITY_DEFENDER_API_KEY - Reality Defender API key for secondary AI verification (api.prd.realitydefender.xyz)
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
 # ATPROTO_LABELER_WEBHOOK_URL - URL of the divine-labeler webhook endpoint (https://labels.divine.video/webhook/moderation-result)

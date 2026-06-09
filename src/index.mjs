@@ -767,45 +767,62 @@ function relayRpcForAction(payload) {
 }
 
 async function callRelayAdminAction(env, payload) {
-  const hasCfAccessSecrets = !!(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET);
-  if (!hasCfAccessSecrets) {
-    console.warn('[RELAY-ADMIN] CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET not configured on this worker — calls to the relay-admin API will be blocked by Cloudflare Access. See project memory cf_access_relay_admin_secrets.md.');
-  }
-
   const rpcBody = relayRpcForAction(payload);
   const url = `${getRelayAdminUrl(env)}/api/relay-rpc`;
+
+  // Prefer the worker-to-worker service binding when configured: it bypasses the
+  // public CF edge and CF Access (the source of the deprecated-endpoint 522 and
+  // the per-card Ban User 502, issue #170) and avoids relay-admin cold starts.
+  // The relay-admin worker authorizes server-to-server callers via the X-Admin-Key
+  // header (divine-relay-manager worker/src/index.ts). When the binding is absent
+  // (local dev, or as a safety net) we fall back to the public-edge HTTPS + CF
+  // Access path. With the binding the URL host is ignored; only the path matters.
+  const binding = env.RELAY_ADMIN;
+  const viaBinding = !!binding;
+
+  if (viaBinding && !env.RELAY_ADMIN_API_KEY) {
+    console.warn('[RELAY-ADMIN] RELAY_ADMIN service binding is present but RELAY_ADMIN_API_KEY is not set — the relay-admin worker will reject the call as unauthorized.');
+  } else if (!viaBinding && !(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET)) {
+    console.warn('[RELAY-ADMIN] No RELAY_ADMIN service binding and no CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET — relay-admin API calls will be blocked. See project memory cf_access_relay_admin_secrets.md.');
+  }
 
   // Bound the call so a dead/slow relay-admin endpoint fails fast instead of
   // hanging the request (and the moderator's UI) for the full CF edge timeout.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), RELAY_ADMIN_TIMEOUT_MS);
 
+  const init = {
+    method: 'POST',
+    headers: viaBinding
+      ? { 'Content-Type': 'application/json', 'X-Admin-Key': env.RELAY_ADMIN_API_KEY || '' }
+      : getRelayAdminHeaders(env),
+    body: JSON.stringify(rpcBody),
+    redirect: 'manual',
+    signal: controller.signal
+  };
+
   let response;
   try {
-    response = await fetch(url, {
-      method: 'POST',
-      headers: getRelayAdminHeaders(env),
-      body: JSON.stringify(rpcBody),
-      redirect: 'manual',
-      signal: controller.signal
-    });
+    response = viaBinding ? await binding.fetch(url, init) : await fetch(url, init);
   } catch (err) {
     if (err?.name === 'AbortError') {
-      throw new Error(`Relay admin call timed out after ${RELAY_ADMIN_TIMEOUT_MS / 1000}s (${url})`);
+      const transport = viaBinding ? ', via service binding' : '';
+      throw new Error(`Relay admin call timed out after ${RELAY_ADMIN_TIMEOUT_MS / 1000}s (${url}${transport})`);
     }
     throw err;
   } finally {
     clearTimeout(timeoutId);
   }
 
-  // Detect Cloudflare Access bouncing the request to the login page.
-  // The relay-admin API host is behind CF Access; without a valid service token,
-  // any call returns a 302 to <team>.cloudflareaccess.com. Surface a self-
-  // documenting error instead of a generic "HTTP 302".
-  if (response.status === 302) {
+  // Detect Cloudflare Access bouncing the request to the login page. Only the
+  // public-edge fallback goes through Access; the service binding skips it, so
+  // this check is irrelevant there. Without a valid service token the host
+  // returns a 302 to <team>.cloudflareaccess.com. Surface a self-documenting
+  // error instead of a generic "HTTP 302".
+  if (!viaBinding && response.status === 302) {
     const location = response.headers.get('location') || '';
     if (/cloudflareaccess\.com/i.test(location)) {
-      const hint = hasCfAccessSecrets
+      const hint = (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET)
         ? 'service token may be invalid, expired, or not authorized for this Access application'
         : 'CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET secrets are not set on this worker';
       throw new Error(`Relay admin call blocked by Cloudflare Access (${hint}). See project memory cf_access_relay_admin_secrets.md.`);

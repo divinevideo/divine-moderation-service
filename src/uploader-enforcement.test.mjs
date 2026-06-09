@@ -207,6 +207,57 @@ describe('admin uploader enforcement routes', () => {
     }
   });
 
+  it('routes relay bans through the RELAY_ADMIN service binding with X-Admin-Key when configured', async () => {
+    const originalFetch = globalThis.fetch;
+    // Prove the public-edge fetch is NOT used when the binding is present.
+    globalThis.fetch = async () => {
+      throw new Error('public-edge fetch should not be called when RELAY_ADMIN binding is configured');
+    };
+    const bindingCalls = [];
+    const RELAY_ADMIN = {
+      fetch: async (input, init) => {
+        bindingCalls.push({ input: String(input), init });
+        return new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    };
+
+    try {
+      const db = createDbMock();
+      const response = await worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/uploader/${PUBKEY}/enforcement`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          },
+          body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
+        }),
+        createEnv({
+          BLOSSOM_DB: db,
+          RELAY_ADMIN,
+          RELAY_ADMIN_API_KEY: 'super-secret-admin-key',
+          // CF Access secrets intentionally omitted: the binding path must not need them.
+          RELAY_ADMIN_URL: 'https://relay.admin.divine.video'
+        })
+      );
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ success: true, pubkey: PUBKEY });
+      expect(bindingCalls).toHaveLength(1);
+      expect(bindingCalls[0].input).toBe('https://relay.admin.divine.video/api/relay-rpc');
+      expect(bindingCalls[0].init.headers['X-Admin-Key']).toBe('super-secret-admin-key');
+      expect(bindingCalls[0].init.headers['CF-Access-Client-Id']).toBeUndefined();
+      const banBody = JSON.parse(bindingCalls[0].init.body);
+      expect(banBody.method).toBe('banpubkey');
+      expect(banBody.params[0]).toBe(PUBKEY);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('removes the relay ban via unbanpubkey when relayBanned is cleared', async () => {
     const originalFetch = globalThis.fetch;
     const fetchCalls = [];
