@@ -766,6 +766,14 @@ function relayRpcForAction(payload) {
   }
 }
 
+// Resolve a secret that may be either a plain string (wrangler secret / [vars])
+// or a Cloudflare Secrets Store binding (async .get()). Mirrors the relay-admin
+// worker's resolveSecret so the shared key works regardless of how it is bound.
+async function resolveSecret(binding) {
+  if (!binding) return null;
+  return typeof binding === 'string' ? binding : await binding.get();
+}
+
 async function callRelayAdminAction(env, payload) {
   const rpcBody = relayRpcForAction(payload);
   const url = `${getRelayAdminUrl(env)}/api/relay-rpc`;
@@ -780,7 +788,11 @@ async function callRelayAdminAction(env, payload) {
   const binding = env.RELAY_ADMIN;
   const viaBinding = !!binding;
 
-  if (viaBinding && !env.RELAY_ADMIN_API_KEY) {
+  // RELAY_ADMIN_API_KEY is a Secrets Store binding in prod (async .get()); also
+  // accept a plain string for local dev / tests.
+  const adminKey = await resolveSecret(env.RELAY_ADMIN_API_KEY);
+
+  if (viaBinding && !adminKey) {
     console.warn('[RELAY-ADMIN] RELAY_ADMIN service binding is present but RELAY_ADMIN_API_KEY is not set — the relay-admin worker will reject the call as unauthorized.');
   } else if (!viaBinding && !(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET)) {
     console.warn('[RELAY-ADMIN] No RELAY_ADMIN service binding and no CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET — relay-admin API calls will be blocked. See project memory cf_access_relay_admin_secrets.md.');
@@ -794,7 +806,7 @@ async function callRelayAdminAction(env, payload) {
   const init = {
     method: 'POST',
     headers: viaBinding
-      ? { 'Content-Type': 'application/json', 'X-Admin-Key': env.RELAY_ADMIN_API_KEY || '' }
+      ? { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey || '' }
       : getRelayAdminHeaders(env),
     body: JSON.stringify(rpcBody),
     redirect: 'manual',
