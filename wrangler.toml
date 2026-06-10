@@ -55,6 +55,11 @@ service = "divine-relay-admin-api-prod"
 # (MODERATION_TO_RELAY_ADMIN_KEY), the same secret divine-relay-manager binds as
 # MOD_RELAY_ADMIN_KEY, so both sides reference one value (#170). Resolved in code
 # via .get(); a plain string is also accepted for local dev.
+#
+# DEPLOY NOTE: binding a Secrets Store secret requires the deploy token
+# (CLOUDFLARE_API_TOKEN in CI) to have account "Secrets Store: Write" (Edit)
+# permission, not just Read — otherwise wrangler deploy fails with code 10021.
+# The CI token is the account token "divine-moderation-service-ci-deploy".
 [[secrets_store_secrets]]
 binding = "RELAY_ADMIN_API_KEY"
 store_id = "ef490704b12a4feb91c7feb51229c364"
