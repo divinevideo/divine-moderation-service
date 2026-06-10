@@ -40,6 +40,31 @@ max_batch_size = 10
 max_batch_timeout = 30
 max_retries = 3
 
+# Service binding to the relay-admin worker (divine-relay-admin-api-prod) for
+# ban/unban/delete-event RPCs. Worker-to-worker, so it bypasses the public CF
+# edge and CF Access (the source of the deprecated /api/moderate 522 and the
+# per-card Ban User 502, issue #170) and avoids relay-admin cold starts. The
+# relay-admin worker authorizes server-to-server callers via the X-Admin-Key
+# header (divine-relay-manager worker/src/index.ts). When the binding is absent
+# the code falls back to the public-edge HTTPS + CF Access path.
+[[services]]
+binding = "RELAY_ADMIN"
+service = "divine-relay-admin-api-prod"
+
+# Shared X-Admin-Key sent on the RELAY_ADMIN binding calls. Secrets Store secret
+# (MODERATION_TO_RELAY_ADMIN_KEY), the same secret divine-relay-manager binds as
+# MOD_RELAY_ADMIN_KEY, so both sides reference one value (#170). Resolved in code
+# via .get(); a plain string is also accepted for local dev.
+#
+# DEPLOY NOTE: binding a Secrets Store secret requires the deploy token
+# (CLOUDFLARE_API_TOKEN in CI) to have account "Secrets Store: Write" (Edit)
+# permission, not just Read — otherwise wrangler deploy fails with code 10021.
+# The CI token is the account token "divine-moderation-service-ci-deploy".
+[[secrets_store_secrets]]
+binding = "RELAY_ADMIN_API_KEY"
+store_id = "ef490704b12a4feb91c7feb51229c364"
+secret_name = "MODERATION_TO_RELAY_ADMIN_KEY"
+
 # Environment variables
 [vars]
 MODERATION_ENABLED = "true"
@@ -167,6 +192,9 @@ crons = ["* * * * *", "*/5 * * * *"]
 # RELAY_ADMIN_URL - relay-admin API host. Default in src/index.mjs is api-relay-prod.divine.video
 # (divine-relay-admin-api-prod worker, has NOSTR_NSEC binding). Override to
 # api-relay-staging.divine.video or relay.admin.divine.video only when needed.
+# Only used for the public-edge fallback; the RELAY_ADMIN service binding is preferred.
+# RELAY_ADMIN_API_KEY is NOT a per-worker secret — it is the Secrets Store binding
+# defined above (secret MODERATION_TO_RELAY_ADMIN_KEY), sent as the X-Admin-Key header.
 # REALITY_DEFENDER_API_KEY - Reality Defender API key for secondary AI verification (api.prd.realitydefender.xyz)
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
 # ATPROTO_LABELER_WEBHOOK_URL - URL of the divine-labeler webhook endpoint (https://labels.divine.video/webhook/moderation-result)
