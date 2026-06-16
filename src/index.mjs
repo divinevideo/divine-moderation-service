@@ -7,7 +7,7 @@
 import { validateQueueMessage } from './schemas/queue-message.mjs';
 import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
 import { applyForceProvider, shouldQueueHiveRecheck } from './moderation/report-trigger.mjs';
-import { publishToFaro, publishToContentRelay, publishLabelEvent } from './nostr/publisher.mjs';
+import { publishToFaro, publishToContentRelay, publishLabelEvent, publishDmInboxRelayList } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
@@ -5053,6 +5053,36 @@ async function runMigration() {
           console.log(`[CRON] DM inbox sync: ${syncResult.synced} new, ${syncResult.skipped} deduped, ${syncResult.errors} errors`);
         } catch (err) {
           console.error('[CRON] DM inbox sync failed:', err);
+        }
+      }
+
+      // Republish moderation@'s NIP-17 DM inbox relay list (kind 10050) ~daily so the
+      // account is reachable over standard NIP-17. Flag-gated so it can ship dormant
+      // until the relay accepts kind 10050 (divine-funnelcake#536); KV-throttled to
+      // avoid republishing this static record every cron tick.
+      if (env.DM_INBOX_PUBLISH_ENABLED === 'true') {
+        try {
+          const lastStr = env.MODERATION_KV
+            ? await env.MODERATION_KV.get('dm-inbox-relay-list:last-published')
+            : null;
+          const last = lastStr ? parseInt(lastStr, 10) : 0;
+          const dayMs = 24 * 60 * 60 * 1000;
+          if (Date.now() - last >= dayMs) {
+            const result = await publishDmInboxRelayList(env);
+            if (result.published) {
+              console.log(`[DM-INBOX] kind 10050 published to ${result.relays.length} relay(s); home relay ${result.homeRelayPublished ? 'accepted' : 'NOT yet (will retry next cron)'}${result.failed?.length ? `, ${result.failed.length} failed` : ''}`);
+              // Only throttle once the home relay (the sole inbox tag, and where we actually read
+              // DMs) accepted it. Discovery-relay success alone must not stop us retrying the relay
+              // that matters — e.g. before divine-funnelcake#536 the home relay rejects kind 10050.
+              if (result.homeRelayPublished && env.MODERATION_KV) {
+                await env.MODERATION_KV.put('dm-inbox-relay-list:last-published', String(Date.now()));
+              }
+            } else {
+              console.log(`[DM-INBOX] Publish skipped/failed: ${result.reason || 'all relays failed'}`);
+            }
+          }
+        } catch (error) {
+          console.error('[DM-INBOX] Republish error:', error.message);
         }
       }
 

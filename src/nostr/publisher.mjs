@@ -336,3 +336,98 @@ function createLabelEvent(labelData, privateKeyHex) {
 
   return signedEvent;
 }
+
+/**
+ * Build a signed NIP-17 kind 10050 DM inbox relay list event.
+ *
+ * The `relay` tags advertise where this pubkey receives gift-wrapped (kind 1059)
+ * DMs. They must match where we actually read from (see dm-reader), or senders
+ * will deliver to relays we don't listen on.
+ *
+ * @param {string[]} inboxRelays - Relay URLs where moderation@ receives DMs.
+ * @param {string} privateKeyHex - Signing key (hex).
+ * @returns {Object} Signed kind-10050 event.
+ */
+function createDmInboxRelayListEvent(inboxRelays, privateKeyHex) {
+  const tags = inboxRelays.map((url) => ['relay', url]);
+
+  const unsignedEvent = {
+    kind: 10050,  // NIP-17 DM inbox relay list
+    created_at: Math.floor(Date.now() / 1000),
+    tags,
+    content: ''
+  };
+
+  const secretKey = hexToBytes(privateKeyHex);
+  return finalizeEvent(unsignedEvent, secretKey);
+}
+
+/**
+ * Publish moderation@'s NIP-17 kind 10050 DM inbox relay list.
+ *
+ * Without this, the moderation account has no advertised DM inbox, so a strict
+ * NIP-17 client "shouldn't try" to message it. The `relay` tags point only at
+ * the relay we actually poll for DMs; we additionally push the event to public
+ * aggregators so clients can discover it. Replaceable (kind 10050), so this is
+ * idempotent and safe to republish.
+ *
+ * @param {Object} env - Worker environment (NOSTR_PRIVATE_KEY, relay config).
+ * @param {Object} [mockRelay] - Mock relay for testing.
+ * @returns {Promise<Object>} Publish summary.
+ */
+export async function publishDmInboxRelayList(env, mockRelay = null) {
+  if (!env.NOSTR_PRIVATE_KEY) {
+    console.log('[DM-INBOX] No NOSTR_PRIVATE_KEY configured, skipping DM inbox publish');
+    return { published: false, reason: 'No signing key configured' };
+  }
+
+  // Inbox = where dm-reader actually polls for gift-wrapped DMs. Keep in sync with it.
+  const homeRelay = env.RELAY_POLLING_RELAY_URL || 'wss://relay.divine.video';
+  const inboxRelays = [homeRelay];
+
+  // Discovery targets: where we publish the event so clients can resolve it.
+  const discoveryRelays = env.DM_INBOX_DISCOVERY_RELAYS
+    ? env.DM_INBOX_DISCOVERY_RELAYS.split(',').map((r) => r.trim()).filter(Boolean)
+    : ['wss://purplepag.es', 'wss://relay.nostr.band', 'wss://relay.damus.io'];
+  const targets = [...new Set([homeRelay, ...discoveryRelays])];
+
+  const event = createDmInboxRelayListEvent(inboxRelays, env.NOSTR_PRIVATE_KEY);
+  console.log(`[DM-INBOX] Publishing kind 10050 ${event.id} (inbox: ${inboxRelays.join(', ')}) to ${targets.length} relays`);
+
+  if (mockRelay) {
+    await mockRelay.publish(event);
+    return { published: true, homeRelayPublished: true, eventId: event.id, pubkey: event.pubkey, relays: targets, failed: [] };
+  }
+
+  const published = [];
+  const failed = [];
+  for (const url of targets) {
+    try {
+      // relay.divine.video is a public Nostr relay that does not require CF Access for
+      // protocol traffic (matches the read path in dm-reader.mjs), and CF Access creds
+      // must never be sent to third-party discovery relays — so we send no headers here.
+      const relay = await Relay.connect(url);
+      try {
+        await relay.publish(event);
+        console.log(`[DM-INBOX] Published kind 10050 ${event.id} to ${url}`);
+        published.push(url);
+      } finally {
+        relay.close();
+      }
+    } catch (error) {
+      console.error(`[DM-INBOX] Failed to publish to ${url}:`, error.message);
+      failed.push({ relay: url, reason: error.message });
+    }
+  }
+
+  return {
+    published: published.length > 0,
+    // The home relay is the only inbox tag and where we actually read DMs, so callers
+    // throttle on this rather than on best-effort discovery-relay success.
+    homeRelayPublished: published.includes(homeRelay),
+    eventId: event.id,
+    pubkey: event.pubkey,
+    relays: published,
+    failed
+  };
+}

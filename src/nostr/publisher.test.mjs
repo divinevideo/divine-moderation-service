@@ -5,7 +5,13 @@
 // ABOUTME: Verifies NIP-56 (kind 1984) reporting events are created correctly
 
 import { describe, it, expect, vi } from 'vitest';
-import { publishToFaro, publishLabelEvent } from './publisher.mjs';
+import { publishToFaro, publishLabelEvent, publishDmInboxRelayList } from './publisher.mjs';
+import { Relay } from 'nostr-tools/relay';
+
+// Mock the relay transport so the real (non-mockRelay) publish path can be exercised.
+// The other tests pass an explicit mockRelay and never reach Relay.connect, so this only
+// affects the throttle-branch test below.
+vi.mock('nostr-tools/relay', () => ({ Relay: { connect: vi.fn() } }));
 
 describe('Nostr Event Publisher', () => {
   it('should create a kind 1984 report event for QUARANTINE', async () => {
@@ -335,5 +341,77 @@ describe('publishLabelEvent (automated source)', () => {
     const metadata = JSON.parse(labelTag[3]);
     expect(metadata.source).toBe('automated');
     expect(metadata.rejected).toBe(true);
+  });
+});
+
+describe('DM inbox relay list (kind 10050)', () => {
+  it('publishes a signed kind-10050 listing only the home relay as inbox', async () => {
+    const mockRelay = { publish: vi.fn().mockResolvedValue(undefined) };
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video'
+    };
+
+    const result = await publishDmInboxRelayList(env, mockRelay);
+
+    expect(mockRelay.publish).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 10050,
+        content: '',
+        tags: [['relay', 'wss://relay.divine.video']]
+      })
+    );
+
+    const event = mockRelay.publish.mock.calls[0][0];
+    expect(event.id).toEqual(expect.any(String));
+    expect(event.sig).toEqual(expect.any(String));
+    expect(event.pubkey).toEqual(expect.any(String));
+    expect(result.published).toBe(true);
+    expect(result.homeRelayPublished).toBe(true);
+  });
+
+  it('never lists discovery relays as inbox tags', async () => {
+    const mockRelay = { publish: vi.fn().mockResolvedValue(undefined) };
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es,wss://relay.nostr.band'
+    };
+
+    await publishDmInboxRelayList(env, mockRelay);
+
+    const event = mockRelay.publish.mock.calls[0][0];
+    const inboxRelays = event.tags.filter((t) => t[0] === 'relay').map((t) => t[1]);
+    expect(inboxRelays).toEqual(['wss://relay.divine.video']);
+  });
+
+  it('returns {published:false} when no signing key is configured', async () => {
+    const result = await publishDmInboxRelayList({}, null);
+    expect(result.published).toBe(false);
+  });
+
+  it('does not advance the throttle when the home relay rejects but discovery succeeds', async () => {
+    // Real publish path (no mockRelay): home relay rejects (the pre-#536 state), discovery accepts.
+    Relay.connect.mockImplementation((url) => Promise.resolve({
+      publish: url === 'wss://relay.divine.video'
+        ? vi.fn().mockRejectedValue(new Error('kind 10050 not in allowed_kinds'))
+        : vi.fn().mockResolvedValue(undefined),
+      close: vi.fn()
+    }));
+
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es'
+    };
+
+    const result = await publishDmInboxRelayList(env);
+
+    // published is true (discovery succeeded) but homeRelayPublished is false, so the caller
+    // must keep retrying the home relay rather than throttling for 24h.
+    expect(result.published).toBe(true);
+    expect(result.homeRelayPublished).toBe(false);
+    expect(result.relays).toEqual(['wss://purplepag.es']);
+    expect(result.failed.map((f) => f.relay)).toContain('wss://relay.divine.video');
   });
 });

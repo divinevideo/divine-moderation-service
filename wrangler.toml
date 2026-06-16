@@ -169,6 +169,12 @@ BACKFILL_ROWS_PER_TICK = "200"
 
 # Creator-delete pipeline feature flag (default off; flip to "true" via `wrangler secret put` or [vars] once ready)
 CREATOR_DELETE_PIPELINE_ENABLED = "true"
+
+# moderation@ NIP-17 DM inbox relay list (kind 10050) publish. Ships dormant; flip
+# to "true" only AFTER divine-funnelcake#536 is live in prod so the relay accepts
+# kind 10050. Optional DM_INBOX_DISCOVERY_RELAYS overrides the default aggregator
+# list (purplepag.es, relay.nostr.band, relay.damus.io).
+DM_INBOX_PUBLISH_ENABLED = "false"
 # Relay used to fetch creator kind 5 delete events and target video events.
 CREATOR_DELETE_RELAY_URL = "wss://relay.divine.video"
 
