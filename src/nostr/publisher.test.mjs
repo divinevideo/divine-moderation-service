@@ -6,12 +6,6 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { publishToFaro, publishLabelEvent, publishDmInboxRelayList } from './publisher.mjs';
-import { Relay } from 'nostr-tools/relay';
-
-// Mock the relay transport so the real (non-mockRelay) publish path can be exercised.
-// The other tests pass an explicit mockRelay and never reach Relay.connect, so this only
-// affects the throttle-branch test below.
-vi.mock('nostr-tools/relay', () => ({ Relay: { connect: vi.fn() } }));
 
 describe('Nostr Event Publisher', () => {
   it('should create a kind 1984 report event for QUARANTINE', async () => {
@@ -391,13 +385,17 @@ describe('DM inbox relay list (kind 10050)', () => {
   });
 
   it('does not advance the throttle when the home relay rejects but discovery succeeds', async () => {
-    // Real publish path (no mockRelay): home relay rejects (the pre-#536 state), discovery accepts.
-    Relay.connect.mockImplementation((url) => Promise.resolve({
+    // Multi-relay path: home relay rejects (the pre-#536 state), discovery accepts.
+    // Inject the connector so per-relay outcomes are deterministic and never hit the
+    // network. A module-level mock of the transport does not reliably isolate under the
+    // single-worker pool, which let this test fall through to the real network (green
+    // locally with egress, red in CI without it).
+    const connect = (url) => Promise.resolve({
       publish: url === 'wss://relay.divine.video'
         ? vi.fn().mockRejectedValue(new Error('kind 10050 not in allowed_kinds'))
         : vi.fn().mockResolvedValue(undefined),
       close: vi.fn()
-    }));
+    });
 
     const env = {
       NOSTR_PRIVATE_KEY: 'a'.repeat(64),
@@ -405,7 +403,7 @@ describe('DM inbox relay list (kind 10050)', () => {
       DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es'
     };
 
-    const result = await publishDmInboxRelayList(env);
+    const result = await publishDmInboxRelayList(env, null, { connect });
 
     // published is true (discovery succeeded) but homeRelayPublished is false, so the caller
     // must keep retrying the home relay rather than throttling for 24h.

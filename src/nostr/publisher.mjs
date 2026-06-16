@@ -372,10 +372,16 @@ function createDmInboxRelayListEvent(inboxRelays, privateKeyHex) {
  * idempotent and safe to republish.
  *
  * @param {Object} env - Worker environment (NOSTR_PRIVATE_KEY, relay config).
- * @param {Object} [mockRelay] - Mock relay for testing.
+ * @param {Object} [mockRelay] - Mock relay for testing the single-publish short-circuit.
+ * @param {Object} [opts] - Test seams.
+ * @param {(url: string) => Promise<{publish: Function, close: Function}>} [opts.connect]
+ *   - Relay connector for the multi-relay path; defaults to the real transport.
+ *     Injected in tests so the per-relay success/failure branches are deterministic
+ *     and never touch the network (the pool runs all files in one worker, so a
+ *     module-level mock of the transport does not reliably isolate).
  * @returns {Promise<Object>} Publish summary.
  */
-export async function publishDmInboxRelayList(env, mockRelay = null) {
+export async function publishDmInboxRelayList(env, mockRelay = null, { connect = Relay.connect } = {}) {
   if (!env.NOSTR_PRIVATE_KEY) {
     console.log('[DM-INBOX] No NOSTR_PRIVATE_KEY configured, skipping DM inbox publish');
     return { published: false, reason: 'No signing key configured' };
@@ -406,7 +412,7 @@ export async function publishDmInboxRelayList(env, mockRelay = null) {
       // relay.divine.video is a public Nostr relay that does not require CF Access for
       // protocol traffic (matches the read path in dm-reader.mjs), and CF Access creds
       // must never be sent to third-party discovery relays — so we send no headers here.
-      const relay = await Relay.connect(url);
+      const relay = await connect(url);
       try {
         await relay.publish(event);
         console.log(`[DM-INBOX] Published kind 10050 ${event.id} to ${url}`);
