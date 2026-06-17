@@ -5,6 +5,19 @@
 // ABOUTME: Verifies public API exposure, admin isolation, and workers.dev disablement
 
 import { describe, expect, it, vi } from 'vitest';
+
+const publisherMocks = vi.hoisted(() => ({
+  publishDmInboxRelayList: vi.fn()
+}));
+
+vi.mock('./nostr/publisher.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    publishDmInboxRelayList: publisherMocks.publishDmInboxRelayList
+  };
+});
+
 import worker from './index.mjs';
 
 const SHA256 = 'a'.repeat(64);
@@ -552,6 +565,119 @@ describe('HTTP hostname routing', () => {
       action: 'PERMANENT_BAN',
       blocked: true
     });
+  });
+});
+
+describe('scheduled DM inbox relay list publish', () => {
+  function createDmInboxCronEnv({ flag = 'true', lastPublished = null } = {}) {
+    const kvStore = new Map();
+    if (lastPublished !== null) {
+      kvStore.set('dm-inbox-relay-list:last-published', lastPublished);
+    }
+    const puts = [];
+    const env = createEnv({
+      DM_INBOX_PUBLISH_ENABLED: flag,
+      RELAY_POLLING_ENABLED: 'false',
+      MODERATION_KV: {
+        store: kvStore,
+        async get(key) { return kvStore.get(key) ?? null; },
+        async put(key, value) {
+          puts.push({ key, value });
+          kvStore.set(key, value);
+        },
+        async delete(key) { kvStore.delete(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      }
+    });
+    return { env, kvStore, puts };
+  }
+
+  it('does not publish when the feature flag is off', async () => {
+    publisherMocks.publishDmInboxRelayList.mockReset();
+    const { env, puts } = createDmInboxCronEnv({ flag: 'false' });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(publisherMocks.publishDmInboxRelayList).not.toHaveBeenCalled();
+    expect(puts).toHaveLength(0);
+  });
+
+  it('advances the throttle when the home relay accepts', async () => {
+    publisherMocks.publishDmInboxRelayList.mockReset();
+    publisherMocks.publishDmInboxRelayList.mockResolvedValue({
+      published: true,
+      homeRelayPublished: true,
+      relays: ['wss://relay.divine.video'],
+      failed: []
+    });
+    const { env, kvStore } = createDmInboxCronEnv();
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(publisherMocks.publishDmInboxRelayList).toHaveBeenCalledWith(env);
+    expect(Number(kvStore.get('dm-inbox-relay-list:last-published'))).toBeGreaterThan(0);
+  });
+
+  it('does not publish again before the daily throttle expires', async () => {
+    publisherMocks.publishDmInboxRelayList.mockReset();
+    const { env, kvStore } = createDmInboxCronEnv({ lastPublished: String(Date.now()) });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(publisherMocks.publishDmInboxRelayList).not.toHaveBeenCalled();
+    expect(kvStore.get('dm-inbox-relay-list:last-published')).toEqual(expect.any(String));
+  });
+
+  it('does not advance the throttle when only discovery relays accept', async () => {
+    publisherMocks.publishDmInboxRelayList.mockReset();
+    publisherMocks.publishDmInboxRelayList.mockResolvedValue({
+      published: true,
+      homeRelayPublished: false,
+      relays: ['wss://purplepag.es'],
+      failed: [{ relay: 'wss://relay.divine.video', reason: 'kind 10050 not in allowed_kinds' }]
+    });
+    const { env, kvStore } = createDmInboxCronEnv();
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(publisherMocks.publishDmInboxRelayList).toHaveBeenCalledWith(env);
+    expect(kvStore.has('dm-inbox-relay-list:last-published')).toBe(false);
+  });
+
+  it('treats a corrupt throttle timestamp as due instead of getting stuck', async () => {
+    publisherMocks.publishDmInboxRelayList.mockReset();
+    publisherMocks.publishDmInboxRelayList.mockResolvedValue({
+      published: true,
+      homeRelayPublished: true,
+      relays: ['wss://relay.divine.video'],
+      failed: []
+    });
+    const { env, kvStore } = createDmInboxCronEnv({ lastPublished: 'not-a-number' });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(publisherMocks.publishDmInboxRelayList).toHaveBeenCalledWith(env);
+    expect(Number(kvStore.get('dm-inbox-relay-list:last-published'))).toBeGreaterThan(0);
   });
 });
 

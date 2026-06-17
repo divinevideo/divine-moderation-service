@@ -5,7 +5,7 @@
 // ABOUTME: Verifies NIP-56 (kind 1984) reporting events are created correctly
 
 import { describe, it, expect, vi } from 'vitest';
-import { publishToFaro, publishLabelEvent } from './publisher.mjs';
+import { publishToFaro, publishLabelEvent, publishDmInboxRelayList } from './publisher.mjs';
 
 describe('Nostr Event Publisher', () => {
   it('should create a kind 1984 report event for QUARANTINE', async () => {
@@ -335,5 +335,96 @@ describe('publishLabelEvent (automated source)', () => {
     const metadata = JSON.parse(labelTag[3]);
     expect(metadata.source).toBe('automated');
     expect(metadata.rejected).toBe(true);
+  });
+});
+
+describe('DM inbox relay list (kind 10050)', () => {
+  function createConnect() {
+    const publishes = new Map();
+    const connect = vi.fn(async (url) => {
+      const publish = vi.fn().mockResolvedValue(undefined);
+      const close = vi.fn();
+      publishes.set(url, publish);
+      return { publish, close };
+    });
+    return { connect, publishes };
+  }
+
+  it('publishes a signed kind-10050 listing only the home relay as inbox', async () => {
+    const { connect, publishes } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_INBOX_DISCOVERY_RELAYS: 'wss://relay.divine.video'
+    };
+
+    const result = await publishDmInboxRelayList(env, { connect });
+
+    expect(connect).toHaveBeenCalledWith('wss://relay.divine.video');
+    expect(publishes.get('wss://relay.divine.video')).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 10050,
+        content: '',
+        tags: [['relay', 'wss://relay.divine.video']]
+      })
+    );
+
+    const event = publishes.get('wss://relay.divine.video').mock.calls[0][0];
+    expect(event.id).toEqual(expect.any(String));
+    expect(event.sig).toEqual(expect.any(String));
+    expect(event.pubkey).toEqual(expect.any(String));
+    expect(result.published).toBe(true);
+    expect(result.homeRelayPublished).toBe(true);
+    expect(result.relays).toEqual(['wss://relay.divine.video']);
+  });
+
+  it('never lists discovery relays as inbox tags', async () => {
+    const { connect, publishes } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es,wss://relay.nostr.band'
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    expect(connect).toHaveBeenCalledTimes(3);
+    const event = publishes.get('wss://purplepag.es').mock.calls[0][0];
+    const inboxRelays = event.tags.filter((t) => t[0] === 'relay').map((t) => t[1]);
+    expect(inboxRelays).toEqual(['wss://relay.divine.video']);
+  });
+
+  it('returns {published:false} when no signing key is configured', async () => {
+    const result = await publishDmInboxRelayList({});
+    expect(result.published).toBe(false);
+  });
+
+  it('does not advance the throttle when the home relay rejects but discovery succeeds', async () => {
+    // Multi-relay path: home relay rejects (the pre-#536 state), discovery accepts.
+    // Inject the connector so per-relay outcomes are deterministic and never hit the
+    // network. A module-level mock of the transport does not reliably isolate under the
+    // single-worker pool, which let this test fall through to the real network (green
+    // locally with egress, red in CI without it).
+    const connect = (url) => Promise.resolve({
+      publish: url === 'wss://relay.divine.video'
+        ? vi.fn().mockRejectedValue(new Error('kind 10050 not in allowed_kinds'))
+        : vi.fn().mockResolvedValue(undefined),
+      close: vi.fn()
+    });
+
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es'
+    };
+
+    const result = await publishDmInboxRelayList(env, { connect });
+
+    // published is true (discovery succeeded) but homeRelayPublished is false, so the caller
+    // must keep retrying the home relay rather than throttling for 24h.
+    expect(result.published).toBe(true);
+    expect(result.homeRelayPublished).toBe(false);
+    expect(result.relays).toEqual(['wss://purplepag.es']);
+    expect(result.failed.map((f) => f.relay)).toContain('wss://relay.divine.video');
   });
 });
