@@ -339,16 +339,29 @@ describe('publishLabelEvent (automated source)', () => {
 });
 
 describe('DM inbox relay list (kind 10050)', () => {
+  function createConnect() {
+    const publishes = new Map();
+    const connect = vi.fn(async (url) => {
+      const publish = vi.fn().mockResolvedValue(undefined);
+      const close = vi.fn();
+      publishes.set(url, publish);
+      return { publish, close };
+    });
+    return { connect, publishes };
+  }
+
   it('publishes a signed kind-10050 listing only the home relay as inbox', async () => {
-    const mockRelay = { publish: vi.fn().mockResolvedValue(undefined) };
+    const { connect, publishes } = createConnect();
     const env = {
       NOSTR_PRIVATE_KEY: 'a'.repeat(64),
-      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video'
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_INBOX_DISCOVERY_RELAYS: 'wss://relay.divine.video'
     };
 
-    const result = await publishDmInboxRelayList(env, mockRelay);
+    const result = await publishDmInboxRelayList(env, { connect });
 
-    expect(mockRelay.publish).toHaveBeenCalledWith(
+    expect(connect).toHaveBeenCalledWith('wss://relay.divine.video');
+    expect(publishes.get('wss://relay.divine.video')).toHaveBeenCalledWith(
       expect.objectContaining({
         kind: 10050,
         content: '',
@@ -356,31 +369,33 @@ describe('DM inbox relay list (kind 10050)', () => {
       })
     );
 
-    const event = mockRelay.publish.mock.calls[0][0];
+    const event = publishes.get('wss://relay.divine.video').mock.calls[0][0];
     expect(event.id).toEqual(expect.any(String));
     expect(event.sig).toEqual(expect.any(String));
     expect(event.pubkey).toEqual(expect.any(String));
     expect(result.published).toBe(true);
     expect(result.homeRelayPublished).toBe(true);
+    expect(result.relays).toEqual(['wss://relay.divine.video']);
   });
 
   it('never lists discovery relays as inbox tags', async () => {
-    const mockRelay = { publish: vi.fn().mockResolvedValue(undefined) };
+    const { connect, publishes } = createConnect();
     const env = {
       NOSTR_PRIVATE_KEY: 'a'.repeat(64),
       RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
       DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es,wss://relay.nostr.band'
     };
 
-    await publishDmInboxRelayList(env, mockRelay);
+    await publishDmInboxRelayList(env, { connect });
 
-    const event = mockRelay.publish.mock.calls[0][0];
+    expect(connect).toHaveBeenCalledTimes(3);
+    const event = publishes.get('wss://purplepag.es').mock.calls[0][0];
     const inboxRelays = event.tags.filter((t) => t[0] === 'relay').map((t) => t[1]);
     expect(inboxRelays).toEqual(['wss://relay.divine.video']);
   });
 
   it('returns {published:false} when no signing key is configured', async () => {
-    const result = await publishDmInboxRelayList({}, null);
+    const result = await publishDmInboxRelayList({});
     expect(result.published).toBe(false);
   });
 
@@ -403,7 +418,7 @@ describe('DM inbox relay list (kind 10050)', () => {
       DM_INBOX_DISCOVERY_RELAYS: 'wss://purplepag.es'
     };
 
-    const result = await publishDmInboxRelayList(env, null, { connect });
+    const result = await publishDmInboxRelayList(env, { connect });
 
     // published is true (discovery succeeded) but homeRelayPublished is false, so the caller
     // must keep retrying the home relay rather than throttling for 24h.

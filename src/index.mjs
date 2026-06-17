@@ -5065,7 +5065,8 @@ async function runMigration() {
           const lastStr = env.MODERATION_KV
             ? await env.MODERATION_KV.get('dm-inbox-relay-list:last-published')
             : null;
-          const last = lastStr ? parseInt(lastStr, 10) : 0;
+          const parsedLast = lastStr ? parseInt(lastStr, 10) : 0;
+          const last = Number.isFinite(parsedLast) ? parsedLast : 0;
           const dayMs = 24 * 60 * 60 * 1000;
           if (Date.now() - last >= dayMs) {
             const result = await publishDmInboxRelayList(env);
@@ -5082,7 +5083,7 @@ async function runMigration() {
             }
           }
         } catch (error) {
-          console.error('[DM-INBOX] Republish error:', error.message);
+          console.error('[DM-INBOX] Republish error:', error?.message || String(error));
         }
       }
 

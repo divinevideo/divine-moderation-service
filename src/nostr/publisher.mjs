@@ -372,7 +372,6 @@ function createDmInboxRelayListEvent(inboxRelays, privateKeyHex) {
  * idempotent and safe to republish.
  *
  * @param {Object} env - Worker environment (NOSTR_PRIVATE_KEY, relay config).
- * @param {Object} [mockRelay] - Mock relay for testing the single-publish short-circuit.
  * @param {Object} [opts] - Test seams.
  * @param {(url: string) => Promise<{publish: Function, close: Function}>} [opts.connect]
  *   - Relay connector for the multi-relay path; defaults to the real transport.
@@ -381,7 +380,7 @@ function createDmInboxRelayListEvent(inboxRelays, privateKeyHex) {
  *     module-level mock of the transport does not reliably isolate).
  * @returns {Promise<Object>} Publish summary.
  */
-export async function publishDmInboxRelayList(env, mockRelay = null, { connect = Relay.connect } = {}) {
+export async function publishDmInboxRelayList(env, { connect = Relay.connect } = {}) {
   if (!env.NOSTR_PRIVATE_KEY) {
     console.log('[DM-INBOX] No NOSTR_PRIVATE_KEY configured, skipping DM inbox publish');
     return { published: false, reason: 'No signing key configured' };
@@ -400,11 +399,6 @@ export async function publishDmInboxRelayList(env, mockRelay = null, { connect =
   const event = createDmInboxRelayListEvent(inboxRelays, env.NOSTR_PRIVATE_KEY);
   console.log(`[DM-INBOX] Publishing kind 10050 ${event.id} (inbox: ${inboxRelays.join(', ')}) to ${targets.length} relays`);
 
-  if (mockRelay) {
-    await mockRelay.publish(event);
-    return { published: true, homeRelayPublished: true, eventId: event.id, pubkey: event.pubkey, relays: targets, failed: [] };
-  }
-
   const published = [];
   const failed = [];
   for (const url of targets) {
@@ -421,8 +415,9 @@ export async function publishDmInboxRelayList(env, mockRelay = null, { connect =
         relay.close();
       }
     } catch (error) {
-      console.error(`[DM-INBOX] Failed to publish to ${url}:`, error.message);
-      failed.push({ relay: url, reason: error.message });
+      const reason = error?.message || String(error);
+      console.error(`[DM-INBOX] Failed to publish to ${url}:`, reason);
+      failed.push({ relay: url, reason });
     }
   }
 
