@@ -33,9 +33,11 @@ function createDbMock({
   aiDetectionRecentRows = [],
   moderationWrites = [],
   reporterCount = 1,
+  onPrepare = null,
 } = {}) {
   return {
     prepare(sql) {
+      onPrepare?.(sql);
       let bindings = [];
 
       return {
@@ -161,6 +163,108 @@ describe('HTTP hostname routing', () => {
       action: 'SAFE',
       status: 'safe'
     });
+  });
+
+  it('serves public moderation status without schema initialization', async () => {
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'SAFE',
+          provider: 'hiveai',
+          scores: JSON.stringify({ nudity: 0.01 }),
+          categories: JSON.stringify(['safe']),
+          moderated_at: '2026-03-07T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null
+        }]]),
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-result/${SHA256}`),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(preparedSql.some((sql) => /CREATE\s+(?:TABLE|INDEX)/i.test(sql))).toBe(false);
+    expect(preparedSql).toHaveLength(1);
+  });
+
+  it('normalizes mixed-case public moderation status hashes', async () => {
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'SAFE',
+          provider: 'hiveai',
+          scores: JSON.stringify({ nudity: 0.01 }),
+          categories: JSON.stringify(['safe']),
+          moderated_at: '2026-03-07T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null
+        }]])
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-result/${SHA256.toUpperCase()}`),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      sha256: SHA256,
+      moderated: true,
+      action: 'SAFE',
+      status: 'safe'
+    });
+  });
+
+  it('rejects malformed public moderation status hashes without database access', async () => {
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/check-result/not-a-sha'),
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: 'Invalid sha256' });
+    expect(preparedSql).toHaveLength(0);
+  });
+
+  it('serves public moderation preflight without database access', async () => {
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-result/${SHA256}`, {
+        method: 'OPTIONS'
+      }),
+      env
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(preparedSql).toHaveLength(0);
   });
 
   it('rejects admin routes on moderation-api host', async () => {
@@ -3057,6 +3161,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_WEBHOOK_SECRET: 'test-secret',
@@ -3167,6 +3272,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_WEBHOOK_SECRET: 'test-secret',
@@ -3242,6 +3348,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       BLOSSOM_DB: {
@@ -3316,6 +3423,7 @@ describe('RD auto-escalation cron integration', () => {
 
     const env = {
       REALITY_DEFENDER_API_KEY: 'fake-rd-key',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_DB: {
         prepare() {
@@ -4325,6 +4433,7 @@ describe('Transcript reprocess cron integration', () => {
       CDN_DOMAIN: 'media.divine.video',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/admin/moderate',
       TRANSCRIPT_REPROCESS_MAX_AGE_DAYS: '7',
+      RELAY_POLLING_ENABLED: 'false',
       REPORT_POLLING_ENABLED: 'false',
       BLOSSOM_DB: {
         prepare(sql) {
