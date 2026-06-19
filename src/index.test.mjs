@@ -182,6 +182,56 @@ describe('HTTP hostname routing', () => {
     expect(preparedSql).toHaveLength(1);
   });
 
+  it('normalizes mixed-case public moderation status hashes', async () => {
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[SHA256, {
+          sha256: SHA256,
+          action: 'SAFE',
+          provider: 'hiveai',
+          scores: JSON.stringify({ nudity: 0.01 }),
+          categories: JSON.stringify(['safe']),
+          moderated_at: '2026-03-07T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null
+        }]])
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-result/${SHA256.toUpperCase()}`),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      sha256: SHA256,
+      moderated: true,
+      action: 'SAFE',
+      status: 'safe'
+    });
+  });
+
+  it('rejects malformed public moderation status hashes without database access', async () => {
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/check-result/not-a-sha'),
+      env
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ error: 'Invalid sha256' });
+    expect(preparedSql).toHaveLength(0);
+  });
+
   it('serves public moderation preflight without database access', async () => {
     const preparedSql = [];
     const env = createEnv({

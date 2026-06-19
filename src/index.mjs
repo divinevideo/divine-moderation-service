@@ -1366,7 +1366,12 @@ async function handleLegacyStatus(sha256, env) {
 }
 
 async function handlePublicCheckResult(url, env) {
-  const sha256 = url.pathname.split('/')[2];
+  const rawSha256 = url.pathname.split('/')[2];
+  if (!rawSha256 || !/^[0-9a-f]{64}$/i.test(rawSha256)) {
+    return corsResponse(jsonResponse(400, { error: 'Invalid sha256' }));
+  }
+
+  const sha256 = rawSha256.toLowerCase();
   const d1Result = await env.BLOSSOM_DB.prepare(`
     SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
     FROM moderation_results
