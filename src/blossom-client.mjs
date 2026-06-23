@@ -8,7 +8,7 @@
 // Its /admin/moderate webhook handler maps actions to states:
 //   SAFE/APPROVE → Active, RESTRICT/QUARANTINE → Restricted (404 to everyone but
 //   the owner), AGE_RESTRICTED → AgeRestricted, PERMANENT_BAN → Banned, DELETE → Deleted.
-// IMPORTANT: AgeRestricted is an adult-GATE, not a withhold — it serves full bytes
+// IMPORTANT: AgeRestricted is an auth-gate, not a withhold — it serves full bytes
 // to ANY signed-in viewer (only anonymous requests get 401). To actually hide
 // content (e.g. age-review restriction) use QUARANTINE → Restricted, which is
 // reversible (back to Active via SAFE/APPROVE).
