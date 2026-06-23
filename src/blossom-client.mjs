@@ -4,10 +4,14 @@
 // ABOUTME: Shared Blossom admin client. Called from the moderator-action pipeline and the creator-delete pipeline.
 // ABOUTME: Maps internal action names to Blossom-understood actions and POSTs to BLOSSOM_WEBHOOK_URL with Bearer auth.
 
-// Blossom has five states (Active/Restricted/Pending/Banned/Deleted).
-// Its webhook handler accepts: SAFE→Active, AGE_RESTRICTED→Restricted,
-// PERMANENT_BAN→Banned, RESTRICT→Restricted, DELETE→Deleted.
-// QUARANTINE maps to RESTRICT (owner can view, public gets 404).
+// Blossom states: Active/Restricted/Pending/Banned/Deleted plus AgeRestricted.
+// Its /admin/moderate webhook handler maps actions to states:
+//   SAFE/APPROVE → Active, RESTRICT/QUARANTINE → Restricted (404 to everyone but
+//   the owner), AGE_RESTRICTED → AgeRestricted, PERMANENT_BAN → Banned, DELETE → Deleted.
+// IMPORTANT: AgeRestricted is an auth-gate, not a withhold — it serves full bytes
+// to ANY signed-in viewer (only anonymous requests get 401). To actually hide
+// content (e.g. age-review restriction) use QUARANTINE → Restricted, which is
+// reversible (back to Active via SAFE/APPROVE).
 // REVIEW is internal only — content stays publicly accessible.
 const BLOSSOM_ACTION_MAP = {
   'SAFE': 'SAFE',
