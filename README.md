@@ -1,6 +1,6 @@
 # Divine Video Moderation Service
 
-Content moderation service for Divine 6-second videos using Sightengine API and Nostr-based human review workflow.
+Content moderation service for Divine 6-second videos using Sightengine API and Nostr-based human review workflow. It helps keep the feed human-made — detecting AI-generated content to uphold the "No slop. All human." policy.
 
 ## Features
 
@@ -252,7 +252,7 @@ Published as NIP-56 (kind 1984) reporting events:
 The Worker also ingests public NIP-56 reports from Nostr. On the five-minute cron,
 the report poller reads kind `1984` events from `REPORT_POLLING_RELAY_URL`
 (`wss://relay.divine.video` in production). By default, accepted inbound reports
-must come from the diVine client: `RELAY_REPORTS_REQUIRE_DIVINE_CLIENT=true`
+must come from the Divine client: `RELAY_REPORTS_REQUIRE_DIVINE_CLIENT=true`
 requires a `client` tag value of `divine`.
 
 Accepted reports are resolved through their target `e` tag. The poller fetches
@@ -373,3 +373,7 @@ This Source Code Form is subject to the terms of the Mozilla Public License, v. 
 2. Run `npm test` before committing
 3. Keep test coverage at 100%
 4. Follow existing code style
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
