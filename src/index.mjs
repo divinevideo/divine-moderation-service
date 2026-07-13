@@ -11,7 +11,7 @@ import { publishToFaro, publishToContentRelay, publishLabelEvent, publishDmInbox
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
-import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById } from './nostr/relay-client.mjs';
+import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById, fetchLabelEventsSince, fetchLabelEventsForVideo } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
 import { getLastReportPollTimestamp, getReportLastRun, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
@@ -43,6 +43,11 @@ import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
 import { runCreatorDeleteCron } from './creator-delete/cron.mjs';
+import { sendModeratorReply as sendModeratorReplyDm, getModeratorKeys } from './nostr/dm-sender.mjs';
+import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
+import { isEnabled as communityLabelsEnabled } from './community-labels/config.mjs';
+import { isDivineIdentity } from './community-labels/identity.mjs';
+import { listStrikeSummary } from './community-labels/d1.mjs';
 import { fetchKind5WithRetry } from './creator-delete/funnelcake-fetch.mjs';
 import {
   listAgeRestrictedCandidates,
@@ -1890,6 +1895,22 @@ export default {
           headers: JSON_HEADERS,
         });
       }
+    }
+
+    // Community strike review feed (#180): creators ranked by strikes for
+    // human ban decisions — the pipeline itself never bans.
+    if (url.pathname === '/admin/api/community-strikes') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to /admin/api/community-strikes`);
+        return authError;
+      }
+
+      const limit = Math.min(Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10) || 100), 500);
+      const creators = await listStrikeSummary(env.BLOSSOM_DB, { limit });
+      return new Response(JSON.stringify({ creators }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
     // Get untriaged (unmoderated) videos from D1
@@ -5238,6 +5259,47 @@ async function runMigration() {
         } catch (err) {
           console.error('[CRON] Reality Defender polling failed:', err);
         }
+      }
+
+      // Community content-warning aggregation (#180, divine-mobile #4771).
+      // Behind the KV kill switch community_labels_enabled ('true' to run) —
+      // deploying this code does not activate it. Isolated try/catch so a
+      // sweep failure cannot break the other */5 jobs.
+      try {
+        if (env.MODERATION_KV && env.BLOSSOM_DB && env.NOSTR_PRIVATE_KEY && await communityLabelsEnabled(env.MODERATION_KV)) {
+          const relayUrl = env.NOSTR_RELAY_URL || 'wss://relay.divine.video';
+          const moderationPubkey = getModeratorKeys(env).publicKey;
+
+          const summary = await runCommunityLabelSweep({
+            db: env.BLOSSOM_DB,
+            kv: env.MODERATION_KV,
+            now: Math.floor(Date.now() / 1000),
+            fetchLabelsSince: (since) => fetchLabelEventsSince(since, relayUrl, env),
+            fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
+            fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env),
+            isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV }),
+            publishLabel: async ({ videoEventId, sha256, label, voteCount }) => {
+              const result = await publishLabelEvent({
+                sha256,
+                category: label,
+                status: 'confirmed',
+                score: 1,
+                source: 'community',
+                voteCount,
+                nostrEventId: videoEventId,
+              }, env);
+              return { published: result.published === true, eventId: result.eventId };
+            },
+            sendWarningDm: async ({ creatorPubkey, strikeCount, videoSha256 }) => {
+              const message = `Heads up from Divine moderation: ${strikeCount} of your videos have had content warnings applied by community consensus because they were posted without labels. Please add content warnings when sharing sensitive content — repeated omissions are reviewed by our moderators and can lead to account restrictions.`;
+              return sendModeratorReplyDm(creatorPubkey, message, videoSha256, env, ctx);
+            },
+            moderationPubkey,
+          });
+          console.log(`[COMMUNITY-LABELS] Sweep complete: ${JSON.stringify(summary)}`);
+        }
+      } catch (error) {
+        console.error('[COMMUNITY-LABELS] Sweep failed:', error?.message || String(error));
       }
     }
   }

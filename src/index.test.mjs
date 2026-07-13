@@ -10,6 +10,25 @@ const publisherMocks = vi.hoisted(() => ({
   publishDmInboxRelayList: vi.fn()
 }));
 
+const communitySweepMocks = vi.hoisted(() => ({
+  runCommunityLabelSweep: vi.fn().mockResolvedValue({
+    swept: 0, published: 0, strikes: 0, warned: 0, cursorAdvanced: true
+  }),
+  listStrikeSummary: vi.fn().mockResolvedValue([])
+}));
+
+vi.mock('./community-labels/sweep.mjs', () => ({
+  runCommunityLabelSweep: communitySweepMocks.runCommunityLabelSweep
+}));
+
+vi.mock('./community-labels/d1.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    listStrikeSummary: communitySweepMocks.listStrikeSummary
+  };
+});
+
 vi.mock('./nostr/publisher.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   return {
@@ -7619,5 +7638,86 @@ describe('GET /admin/api/dm-templates', () => {
     const templates = await res.json();
     const ban = templates.find(t => t.key === 'PERMANENT_BAN');
     expect(ban.body).toContain('divine.video/video/' + sha);
+  });
+});
+
+describe('community label sweep cron (#180)', () => {
+  function createCommunityCronEnv({ enabled } = {}) {
+    const kvStore = new Map();
+    if (enabled) kvStore.set('community_labels_enabled', 'true');
+    const env = createEnv({
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_ENABLED: 'false',
+      MODERATION_KV: {
+        async get(key) { return kvStore.has(key) ? kvStore.get(key) : null; },
+        async put(key, value) { kvStore.set(key, value); },
+        async delete(key) { kvStore.delete(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      }
+    });
+    return { env, kvStore };
+  }
+
+  it('does not run the sweep when the kill switch is off', async () => {
+    communitySweepMocks.runCommunityLabelSweep.mockClear();
+    const { env } = createCommunityCronEnv({ enabled: false });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(communitySweepMocks.runCommunityLabelSweep).not.toHaveBeenCalled();
+  });
+
+  it('runs the sweep when community_labels_enabled is true', async () => {
+    communitySweepMocks.runCommunityLabelSweep.mockClear();
+    const { env } = createCommunityCronEnv({ enabled: true });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(communitySweepMocks.runCommunityLabelSweep).toHaveBeenCalledTimes(1);
+    const deps = communitySweepMocks.runCommunityLabelSweep.mock.calls[0][0];
+    expect(deps.moderationPubkey).toMatch(/^[0-9a-f]{64}$/);
+    expect(typeof deps.publishLabel).toBe('function');
+    expect(typeof deps.sendWarningDm).toBe('function');
+  });
+});
+
+describe('GET /admin/api/community-strikes (#180)', () => {
+  it('requires admin auth', async () => {
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/community-strikes'),
+      createEnv({ ALLOW_DEV_ACCESS: 'false' })
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it('returns the ranked strike summary for authenticated admins', async () => {
+    communitySweepMocks.listStrikeSummary.mockResolvedValue([
+      { creator_pubkey: 'c'.repeat(64), strikes: 4, last_at: 1700000000 }
+    ]);
+
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/community-strikes?limit=10', {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      creators: [{ creator_pubkey: 'c'.repeat(64), strikes: 4, last_at: 1700000000 }]
+    });
+    expect(communitySweepMocks.listStrikeSummary).toHaveBeenCalledWith(
+      expect.anything(),
+      { limit: 10 }
+    );
   });
 });
