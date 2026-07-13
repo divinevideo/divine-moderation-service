@@ -1,0 +1,87 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// ABOUTME: In-memory D1 fake for community-label tests, mirroring the
+// ABOUTME: production SQL arity in src/community-labels/d1.mjs.
+
+// Mirrors migrations/010-community-labels.sql: three tables keyed by their
+// primary keys. SQL is matched on shape, same approach as the
+// creator-delete makeFakeD1 helper.
+export function makeFakeCommunityD1() {
+  const decisions = new Map(); // `${video_event_id}:${label}`
+  const strikes = new Map(); // `${creator_pubkey}:${video_event_id}:${label}`
+  const warnings = new Map(); // `${creator_pubkey}:${strike_count}`
+
+  return {
+    decisions,
+    strikes,
+    warnings,
+    prepare(sql) {
+      return {
+        _sql: sql,
+        _binds: [],
+        bind(...args) { this._binds = args; return this; },
+        async run() {
+          if (this._sql.includes('INSERT') && this._sql.includes('community_label_decisions')) {
+            const [video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at] = this._binds;
+            const key = `${video_event_id}:${label}`;
+            if (decisions.has(key)) return { meta: { changes: 0 } };
+            decisions.set(key, { video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at });
+            return { meta: { changes: 1 } };
+          }
+          if (this._sql.includes('INSERT') && this._sql.includes('community_strikes')) {
+            const [creator_pubkey, video_event_id, label, created_at] = this._binds;
+            const key = `${creator_pubkey}:${video_event_id}:${label}`;
+            if (strikes.has(key)) return { meta: { changes: 0 } };
+            strikes.set(key, { creator_pubkey, video_event_id, label, created_at });
+            return { meta: { changes: 1 } };
+          }
+          if (this._sql.includes('INSERT') && this._sql.includes('community_strike_warnings')) {
+            const [creator_pubkey, strike_count, sent_at] = this._binds;
+            const key = `${creator_pubkey}:${strike_count}`;
+            if (warnings.has(key)) return { meta: { changes: 0 } };
+            warnings.set(key, { creator_pubkey, strike_count, sent_at });
+            return { meta: { changes: 1 } };
+          }
+          return { meta: { changes: 0 } };
+        },
+        async first() {
+          if (this._sql.includes('community_label_decisions')) {
+            const [video_event_id, label] = this._binds;
+            return decisions.get(`${video_event_id}:${label}`) || null;
+          }
+          if (this._sql.includes('COUNT(*)') && this._sql.includes('community_strikes')) {
+            const [creator_pubkey] = this._binds;
+            let n = 0;
+            for (const row of strikes.values()) {
+              if (row.creator_pubkey === creator_pubkey) n += 1;
+            }
+            return { n };
+          }
+          if (this._sql.includes('community_strike_warnings')) {
+            const [creator_pubkey, strike_count] = this._binds;
+            return warnings.get(`${creator_pubkey}:${strike_count}`) || null;
+          }
+          return null;
+        },
+        async all() {
+          if (this._sql.includes('GROUP BY creator_pubkey')) {
+            const [limit] = this._binds;
+            const byCreator = new Map();
+            for (const row of strikes.values()) {
+              const entry = byCreator.get(row.creator_pubkey) || { creator_pubkey: row.creator_pubkey, strikes: 0, last_at: 0 };
+              entry.strikes += 1;
+              entry.last_at = Math.max(entry.last_at, row.created_at);
+              byCreator.set(row.creator_pubkey, entry);
+            }
+            const results = [...byCreator.values()]
+              .sort((a, b) => b.strikes - a.strikes || b.last_at - a.last_at)
+              .slice(0, limit);
+            return { results };
+          }
+          return { results: [] };
+        },
+      };
+    },
+  };
+}
