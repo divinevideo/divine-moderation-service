@@ -453,6 +453,29 @@ export async function fetchKind5EventsSince(sinceSeconds, relayUrl = 'wss://rela
   return queryRelay(relayUrl, { kinds: [5], since: sinceSeconds }, env, { collectAll: true });
 }
 
+/**
+ * Fetch kind 1985 (NIP-32 label) events created since a cursor. Callers
+ * filter by namespace in code; relays are not assumed to index #L.
+ */
+export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://relay.divine.video', env = {}) {
+  return queryRelay(relayUrl, { kinds: [1985], since: sinceSeconds }, env, { collectAll: true });
+}
+
+/**
+ * Fetch every kind 1985 label event targeting a video, via its #e tag and —
+ * when the video is addressable — its #a tag, deduped by event id.
+ */
+export async function fetchLabelEventsForVideo({ eventId, addressableId }, relayUrl = 'wss://relay.divine.video', env = {}) {
+  const byId = new Map();
+  const viaE = await queryRelay(relayUrl, { kinds: [1985], '#e': [eventId] }, env, { collectAll: true });
+  for (const event of viaE) byId.set(event.id, event);
+  if (addressableId) {
+    const viaA = await queryRelay(relayUrl, { kinds: [1985], '#a': [addressableId] }, env, { collectAll: true });
+    for (const event of viaA) byId.set(event.id, event);
+  }
+  return [...byId.values()];
+}
+
 export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine.video'], env = {}, options = {}) {
   // Reject non-hex IDs to prevent path-traversal via attacker-controlled kind 5 e-tags
   if (!eventId || !/^[a-f0-9]{64}$/i.test(eventId)) return null;
