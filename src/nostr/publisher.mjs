@@ -265,8 +265,10 @@ export async function publishLabelEvent(labelData, env, mockRelay = null) {
  * @returns {Object} Signed Nostr event
  */
 function createLabelEvent(labelData, privateKeyHex) {
-  const { sha256, category, status, score, cdnUrl, nostrEventId } = labelData;
-  const source = labelData.source === 'automated' ? 'automated' : 'human-moderator';
+  const { sha256, category, status, score, cdnUrl, nostrEventId, voteCount } = labelData;
+  const source = ['automated', 'community'].includes(labelData.source)
+    ? labelData.source
+    : 'human-moderator';
   const verified = source === 'human-moderator';
 
   // Get the standard label name
@@ -317,10 +319,15 @@ function createLabelEvent(labelData, privateKeyHex) {
   tags.push(['x', sha256]);  // Content hash reference
 
   // Build content (human-readable summary)
-  const subject = source === 'automated' ? 'Automated moderator flagged' : 'Human moderator verified';
-  const content = status === 'confirmed'
-    ? `${subject}: This content contains ${labelName} (confidence: ${(score * 100).toFixed(0)}%)`
-    : `${subject}: This content does NOT contain ${labelName} (was ${(score * 100).toFixed(0)}%)`;
+  let content;
+  if (source === 'community') {
+    content = `Community consensus flagged: This content contains ${labelName} (${voteCount} distinct reporters)`;
+  } else {
+    const subject = source === 'automated' ? 'Automated moderator flagged' : 'Human moderator verified';
+    content = status === 'confirmed'
+      ? `${subject}: This content contains ${labelName} (confidence: ${(score * 100).toFixed(0)}%)`
+      : `${subject}: This content does NOT contain ${labelName} (was ${(score * 100).toFixed(0)}%)`;
+  }
 
   // Create unsigned event
   const unsignedEvent = {
