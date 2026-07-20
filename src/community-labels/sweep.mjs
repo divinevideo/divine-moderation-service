@@ -62,9 +62,10 @@ function sha256Of(videoEvent) {
  * oldest-first by their earliest new vote, and the watermark advances to
  * just before the earliest vote of any video that was deferred (batch cap)
  * or failed (transient error), so no vote is ever left behind it
- * unprocessed. A fully clean tick advances the watermark to `now` — or to
- * the newest vote seen when the since-poll page came back full and may be
- * truncated by the relay. The watermark persists every tick, so a fresh
+ * unprocessed. A fully clean tick advances the watermark to `now`; on a
+ * full (possibly truncated) page it holds — and freezes the cursor at its
+ * current value — so the oldest un-returned votes are re-polled next tick
+ * rather than skipped. The watermark persists every tick, so a fresh
  * deploy cannot age deferred votes out of the default lookback window.
  * All steps are idempotent, so re-processing retried videos is harmless.
  *

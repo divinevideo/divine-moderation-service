@@ -74,8 +74,9 @@ else reuses production-exercised plumbing in this worker.
    tick: videos process oldest-first by earliest new vote, and the
    watermark advances to just before the earliest vote of any deferred or
    failed video (so no vote is ever behind it unprocessed). A fully clean
-   tick advances to `now`, or to the newest vote seen when the since-poll
-   page came back full (possible relay truncation). Retried videos are
+   tick advances to `now`; on a full (possibly truncated) page it holds —
+   and freezes the cursor at its current value — so the oldest un-returned
+   votes are re-polled next tick rather than skipped. Retried videos are
    safe to re-process (all steps idempotent).
 
 ### D1 schema (new migration)
