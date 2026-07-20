@@ -117,7 +117,7 @@ Tests (mock deps): end-to-end crossing publishes once and re-sweep publishes zer
 **Files:** Modify `src/index.mjs` (scheduled handler `*/5 * * * *` branch + admin route), extend `src/index.test.mjs` (or nearest admin-endpoint test file)
 
 - Cron: inside the existing `*/5` branch, `if (await isEnabled(env.MODERATION_KV))` → build deps from real implementations (Tasks 3/4/6, `sendModerationDM` with a new `COMMUNITY_MISLABEL_WARNING` template added to dm-sender TEMPLATES) and call `runCommunityLabelSweep`, logging the result summary. Wrap in try/catch so a sweep failure cannot break the other `*/5` jobs.
-- Admin: `GET /admin/community-strikes` behind the existing admin auth pattern, returns `listStrikeSummary` (limit 100) as JSON.
+- Admin: `GET /admin/api/community-strikes` behind the existing admin auth pattern, returns `listStrikeSummary` (limit 100) as JSON.
 
 Tests: kill switch off → sweep not invoked; endpoint 401 without auth; endpoint returns ranked JSON with auth (follow neighboring admin endpoint tests). Red → green → commit `feat: wire community label sweep cron + strikes admin endpoint (#180)`.
 

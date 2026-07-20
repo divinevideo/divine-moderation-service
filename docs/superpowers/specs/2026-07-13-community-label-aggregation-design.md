@@ -107,7 +107,7 @@ Full 64-char hex everywhere; never truncate Nostr IDs.
 
 ### Admin surface
 
-`GET /admin/community-strikes` (existing admin auth): creators ranked
+`GET /admin/api/community-strikes` (existing admin auth): creators ranked
 by strike count with per-strike detail — the human-review feed for ban
 decisions. No write endpoints in v1.
 
