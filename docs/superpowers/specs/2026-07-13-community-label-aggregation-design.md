@@ -185,10 +185,16 @@ observable via the held-watermark-age log:
 
 - **Truncated poll window (>1000 votes/window).** Funnelcake truncates
   newest-first, so a full page has dropped the oldest votes. The sweep
-  now **holds the cursor** on a full page rather than advancing past the
-  unseen older votes (so no silent drop), but sustained >1000/window
-  wedges progress on the oldest until volume subsides. Scale fix:
-  page the window backward with `until`. Fast-follow.
+  now **holds and freezes the cursor** on a full page rather than
+  advancing past the unseen older votes, so there is no silent drop in
+  steady state or on cold start. The cost is a wedge: because a held
+  cursor's window never sheds votes on its own, sustained ≥1000/window
+  progress on the oldest stays stuck until new-vote arrivals slow enough
+  that a poll returns below the page limit — it does **not** self-heal
+  tick-to-tick while the burst continues. New content still labels (it
+  rides the newest-N page) and the wedge is observable via the
+  held-watermark-age log. Scale fix: page the window backward with
+  `until`. Fast-follow.
 - **Batch-boundary timestamp ties.** When the first deferred video shares
   its earliest-vote second with in-batch videos, those keep their slots
   and the deferred video is starved. Needs backlog above the batch cap

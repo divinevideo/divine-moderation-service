@@ -239,16 +239,34 @@ describe('runCommunityLabelSweep', () => {
     );
   });
 
-  it('holds the cursor when the since-poll page is full (possible truncation)', async () => {
+  it('holds and freezes the cursor when the since-poll page is full (possible truncation)', async () => {
     // Funnelcake truncates newest-first (ORDER BY created_at DESC LIMIT), so
     // a full page has dropped the OLDEST votes. Advancing the watermark at
     // all would skip those unseen older votes, so the sweep still processes
-    // what it saw but holds the cursor entirely.
+    // what it saw but holds — and freezes the first-run sliding cursor at
+    // its current value so the trailing edge stops moving.
     const result = await runCommunityLabelSweep({ ...deps, sincePollLimit: 3 });
 
     expect(result.published).toBe(1);
     expect(result.cursorAdvanced).toBe(false);
-    expect(deps.kv.store.has('community_labels_cursor')).toBe(false);
+    // Frozen at the first-run default (now - 24h), not advanced to now.
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 24 * 60 * 60),
+    );
+  });
+
+  it('a frozen first-run cursor does not slide on the next full-page tick', async () => {
+    // Cold start: without the freeze, getCursor keeps returning a sliding
+    // now-24h and a trailing-edge vote ages out. After a full-page tick
+    // freezes it, the next tick reads the frozen value, not a new slide.
+    await runCommunityLabelSweep({ ...deps, sincePollLimit: 3 });
+    await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300, sincePollLimit: 3 });
+
+    // Still the tick-1 freeze value, not a fresh (now+300)-24h slide (and
+    // not unpersisted, which is what the pre-freeze code left it at).
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 24 * 60 * 60),
+    );
   });
 
   it('advances the cursor on an empty poll', async () => {

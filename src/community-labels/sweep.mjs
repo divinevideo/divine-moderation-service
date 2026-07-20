@@ -230,6 +230,15 @@ export async function runCommunityLabelSweep({
 
   if (watermark > cursor) {
     await setCursor(kv, watermark);
+  } else if (pageFull) {
+    // Freeze the cursor on a full-page hold. On first run the cursor is an
+    // unpersisted sliding `now - lookback`; without this, a vote near the
+    // trailing edge that never makes the truncated newest-N page falls
+    // behind the sliding window and is dropped. Persisting the current
+    // value pins the window so those older votes are retained until volume
+    // drops below the page limit and they surface. No-op in steady state
+    // (rewrites the already-persisted value).
+    await setCursor(kv, cursor);
   }
   summary.cursorAdvanced = unprocessedAt.length === 0 && watermarkCeiling === now;
 
