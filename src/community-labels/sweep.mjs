@@ -25,8 +25,6 @@ import {
   warningSent,
   recordWarning,
 } from './d1.mjs';
-import { resolveDivineAuthors } from './identity.mjs';
-
 const HEX64 = /^[0-9a-f]{64}$/;
 
 function targetsOf(labelEvent) {

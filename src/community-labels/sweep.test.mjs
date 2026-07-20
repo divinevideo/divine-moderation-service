@@ -168,6 +168,18 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.sendWarningDm).not.toHaveBeenCalled();
   });
 
+  it('holds the cursor when fetching the video event throws', async () => {
+    // Transient relay failures must throw (throwOnTransient wiring) so the
+    // sweep retries next tick instead of advancing past the votes.
+    deps.fetchVideoEvent.mockRejectedValue(new Error('relay 503'));
+
+    const result = await runCommunityLabelSweep(deps);
+
+    expect(deps.publishLabel).not.toHaveBeenCalled();
+    expect(result.cursorAdvanced).toBe(false);
+    expect(deps.kv.store.has('community_labels_cursor')).toBe(false);
+  });
+
   it('skips a video whose event cannot be fetched without wedging the sweep', async () => {
     deps.fetchVideoEvent.mockResolvedValue(null);
 

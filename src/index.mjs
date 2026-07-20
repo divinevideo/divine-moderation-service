@@ -1909,7 +1909,7 @@ export default {
       const limit = Math.min(Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10) || 100), 500);
       const creators = await listStrikeSummary(env.BLOSSOM_DB, { limit });
       return new Response(JSON.stringify({ creators }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: JSON_HEADERS
       });
     }
 
@@ -5276,7 +5276,7 @@ async function runMigration() {
             now: Math.floor(Date.now() / 1000),
             fetchLabelsSince: (since) => fetchLabelEventsSince(since, relayUrl, env),
             fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
-            fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env),
+            fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env, { throwOnTransient: true }),
             isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV }),
             publishLabel: async ({ videoEventId, sha256, label, voteCount }) => {
               const result = await publishLabelEvent({
@@ -5291,7 +5291,7 @@ async function runMigration() {
               return { published: result.published === true, eventId: result.eventId };
             },
             sendWarningDm: async ({ creatorPubkey, strikeCount, videoSha256 }) => {
-              const message = `Heads up from Divine moderation: ${strikeCount} of your videos have had content warnings applied by community consensus because they were posted without labels. Please add content warnings when sharing sensitive content — repeated omissions are reviewed by our moderators and can lead to account restrictions.`;
+              const message = `Heads up from Divine moderation: your account has ${strikeCount} content-warning strikes. Community consensus applied warning labels to videos you posted without them. Please add content warnings when sharing sensitive content. Repeated omissions are reviewed by our moderators and can lead to account restrictions.`;
               return sendModeratorReplyDm(creatorPubkey, message, videoSha256, env, ctx);
             },
             moderationPubkey,

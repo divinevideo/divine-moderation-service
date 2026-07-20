@@ -217,7 +217,7 @@ export async function publishLabelEvent(labelData, env, mockRelay = null) {
   // Create the label event
   const event = createLabelEvent(labelData, privateKeyHex);
 
-  console.log(`[LABEL] Publishing kind 1985 label: ${category}=${status} for ${sha256.substring(0, 16)}...`);
+  console.log(`[LABEL] Publishing kind 1985 label: ${category}=${status} for ${sha256 ?? `event ${nostrEventId}`}`);
 
   try {
     if (mockRelay) {
@@ -315,8 +315,11 @@ function createLabelEvent(labelData, privateKeyHex) {
     tags.push(['r', cdnUrl]);
   }
 
-  // Always include the sha256 as an identifier
-  tags.push(['x', sha256]);  // Content hash reference
+  // Include the sha256 identifier when the video carries one; videos with
+  // no x/imeta-x tag stay targetable via the e tag alone.
+  if (sha256) {
+    tags.push(['x', sha256]);  // Content hash reference
+  }
 
   // Build content (human-readable summary)
   let content;

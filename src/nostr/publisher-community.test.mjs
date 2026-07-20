@@ -65,6 +65,27 @@ describe('publishLabelEvent (community source)', () => {
     expect(event.content).toContain('4 distinct reporters');
   });
 
+  it('publishes without an x tag when the video has no sha256', async () => {
+    // Videos lacking an x/imeta-x tag reach the publisher with sha256=null;
+    // the event stays targetable via its e tag.
+    const { mockRelay, env } = withMockRelay(baseEnv());
+
+    const result = await publishLabelEvent({
+      sha256: null,
+      category: 'gambling',
+      status: 'confirmed',
+      score: 1,
+      source: 'community',
+      voteCount: 3,
+      nostrEventId: 'd'.repeat(64),
+    }, env, mockRelay);
+
+    expect(result.published).toBe(true);
+    const event = mockRelay.publish.mock.calls[0][0];
+    expect(event.tags.some((t) => t[0] === 'x')).toBe(false);
+    expect(event.tags).toEqual(expect.arrayContaining([['e', 'd'.repeat(64)]]));
+  });
+
   it('does not change automated-source behavior', async () => {
     const { mockRelay, env } = withMockRelay(baseEnv());
 
