@@ -150,9 +150,59 @@ module must therefore never grow I/O or worker-specific dependencies.
 - Retraction / un-labeling (NIP-32 has no un-vote; moderators can
   NIP-09-delete a published label manually).
 - Automated bans (human-only, via existing tooling).
-- Reputation weighting beyond the Divine-identity gate.
+- Reputation weighting, rate limits, account-age gating, and brigading
+  / velocity detection beyond the Divine-identity gate. v1's authoritative
+  trigger is intentionally the **same** simple distinct-Divine-identity
+  count the client uses; hardening it against Sybil/brigading is the
+  Osprey rebuild's job (the `decision.mjs` seam). See the security note
+  below — this is a deliberate, stated posture, not an oversight.
+- `a`-only touched-video detection. The sweep detects touched videos by
+  their `e` (event id) tag; the whole pipeline is event-id-keyed, and the
+  client always co-tags `e`+`a`, so purely addressable-scoped votes from
+  a hypothetical other client are not evaluated.
 - Funnelcake-side SQL aggregation (optimization valve if sweep cost
   ever grows; not needed at current volume).
+
+### Security posture (v1)
+
+The authoritative trigger is the Divine-identity gate plus the distinct-
+author threshold — nothing stronger. Because Divine NIP-05 registration
+is open, a small number of minted identities (default 3) can force an
+authoritative label **and** a creator strike on any video, with no
+velocity, account-age, or brigading guard. This is acceptable **only**
+because the whole pipeline is kill-switched (default off), strikes never
+auto-ban (human review via the admin feed), and the abuse-resistance the
+issue asks for is deferred to the Osprey rebuild. The T&S sign-off before
+enabling in prod should treat this Sybil vector as a known, accepted v1
+limitation.
+
+### Known high-volume limitations (v1)
+
+The watermark cursor drains correctly at the volume this feature ships
+for. Three residuals appear only under load well beyond v1 (backlog
+above the batch cap, or >1000 votes in one poll window) and are all
+observable via the held-watermark-age log:
+
+- **Truncated poll window (>1000 votes/window).** Funnelcake truncates
+  newest-first, so a full page has dropped the oldest votes. The sweep
+  now **holds the cursor** on a full page rather than advancing past the
+  unseen older votes (so no silent drop), but sustained >1000/window
+  wedges progress on the oldest until volume subsides. Scale fix:
+  page the window backward with `until`. Fast-follow.
+- **Batch-boundary timestamp ties.** When the first deferred video shares
+  its earliest-vote second with in-batch videos, those keep their slots
+  and the deferred video is starved. Needs backlog above the batch cap
+  plus same-second ties.
+- **Permanently-failing oldest video.** A video whose publish fails every
+  tick pins the watermark, so videos beyond the batch cap never get a
+  turn (in-cap videos still process idempotently). Needs backlog above
+  the cap plus a persistent per-video failure.
+
+The last two share one fast-follow: batch-prioritise not-yet-processed
+videos and add a bounded-retry / dead-letter for persistent per-video
+failures — i.e. the per-video D1 processed-state that was consciously
+deferred at design time in favour of the simpler watermark. Acceptable
+for the staged, kill-switched, low-volume v1 rollout.
 
 ## Testing (Vitest, existing mock-relay patterns)
 

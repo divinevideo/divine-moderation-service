@@ -239,16 +239,16 @@ describe('runCommunityLabelSweep', () => {
     );
   });
 
-  it('caps the watermark at the newest seen vote when the since-poll page is full', async () => {
-    // Default deps carry 3 votes; a limit of 3 makes the page "full" and
-    // possibly truncated, so the watermark must not pass the newest vote.
+  it('holds the cursor when the since-poll page is full (possible truncation)', async () => {
+    // Funnelcake truncates newest-first (ORDER BY created_at DESC LIMIT), so
+    // a full page has dropped the OLDEST votes. Advancing the watermark at
+    // all would skip those unseen older votes, so the sweep still processes
+    // what it saw but holds the cursor entirely.
     const result = await runCommunityLabelSweep({ ...deps, sincePollLimit: 3 });
 
     expect(result.published).toBe(1);
     expect(result.cursorAdvanced).toBe(false);
-    expect(deps.kv.store.get('community_labels_cursor')).toBe(
-      String(NOW_SECONDS - 60),
-    );
+    expect(deps.kv.store.has('community_labels_cursor')).toBe(false);
   });
 
   it('advances the cursor on an empty poll', async () => {

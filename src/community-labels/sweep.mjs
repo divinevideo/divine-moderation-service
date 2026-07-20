@@ -93,15 +93,18 @@ export async function runCommunityLabelSweep({
 
   const newVotes = (await fetchLabelsSince(cursor)) ?? [];
 
-  // A full page may be truncated by the relay; never advance the watermark
-  // past the newest vote actually seen.
-  let watermarkCeiling = now;
-  if (newVotes.length >= sincePollLimit) {
-    watermarkCeiling = newVotes.reduce(
-      (max, vote) => Math.max(max, Number.isInteger(vote?.created_at) ? vote.created_at : cursor),
-      cursor,
-    );
-    console.log(`[COMMUNITY-LABELS] since-poll page full (${newVotes.length}); capping watermark at ${watermarkCeiling}`);
+  // A full page means the relay may have truncated the result. Funnelcake
+  // truncates newest-first (ORDER BY created_at DESC LIMIT), so the dropped
+  // votes are the OLDEST in the window — advancing the watermark at all
+  // would skip them. Hold the watermark at the cursor for this tick: the
+  // videos we did see are still processed (idempotently), and the next tick
+  // re-polls the same window. Sustained >limit volume wedges here (observable
+  // via the held-watermark-age log below); the scale fix is to page the
+  // window backward with `until`, deferred as a documented fast-follow.
+  const pageFull = newVotes.length >= sincePollLimit;
+  const watermarkCeiling = pageFull ? cursor : now;
+  if (pageFull) {
+    console.log(`[COMMUNITY-LABELS] since-poll page full (${newVotes.length} >= ${sincePollLimit}); holding cursor to avoid skipping truncated older votes`);
   }
 
   // Group new votes by target video with each video's earliest new vote;
@@ -111,6 +114,11 @@ export async function runCommunityLabelSweep({
   for (const vote of newVotes) {
     if (vote?.pubkey === moderationPubkey) continue;
     const target = targetsOf(vote);
+    // Touched-video detection keys on the `e` (event id) target only,
+    // though the per-video tally below fetches both `e` and `a`. The whole
+    // downstream is event-id-keyed (fetchVideoEvent by id, decision PK on
+    // video_event_id), so an `a`-only vote has no concrete event to label;
+    // the mobile client always co-tags `e`+`a`, so real votes carry an `e`.
     if (target.eventId === null) continue;
     const createdAt = Number.isInteger(vote?.created_at) ? vote.created_at : now;
     const existing = touched.get(target.eventId)
