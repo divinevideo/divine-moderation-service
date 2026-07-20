@@ -457,8 +457,10 @@ export async function fetchKind5EventsSince(sinceSeconds, relayUrl = 'wss://rela
  * Fetch kind 1985 (NIP-32 label) events created since a cursor. Callers
  * filter by namespace in code; relays are not assumed to index #L.
  */
-export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://relay.divine.video', env = {}) {
-  return queryRelay(relayUrl, { kinds: [1985], since: sinceSeconds }, env, { collectAll: true });
+export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://relay.divine.video', env = {}, { limit } = {}) {
+  const filter = { kinds: [1985], since: sinceSeconds };
+  if (Number.isInteger(limit) && limit > 0) filter.limit = limit;
+  return queryRelay(relayUrl, filter, env, { collectAll: true });
 }
 
 /**

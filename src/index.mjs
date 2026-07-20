@@ -45,7 +45,7 @@ import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
 import { runCreatorDeleteCron } from './creator-delete/cron.mjs';
 import { sendModeratorReply as sendModeratorReplyDm, getModeratorKeys } from './nostr/dm-sender.mjs';
 import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
-import { isEnabled as communityLabelsEnabled } from './community-labels/config.mjs';
+import { isEnabled as communityLabelsEnabled, SINCE_POLL_LIMIT as COMMUNITY_SINCE_POLL_LIMIT } from './community-labels/config.mjs';
 import { isDivineIdentity } from './community-labels/identity.mjs';
 import { listStrikeSummary } from './community-labels/d1.mjs';
 import { fetchKind5WithRetry } from './creator-delete/funnelcake-fetch.mjs';
@@ -5274,7 +5274,7 @@ async function runMigration() {
             db: env.BLOSSOM_DB,
             kv: env.MODERATION_KV,
             now: Math.floor(Date.now() / 1000),
-            fetchLabelsSince: (since) => fetchLabelEventsSince(since, relayUrl, env),
+            fetchLabelsSince: (since) => fetchLabelEventsSince(since, relayUrl, env, { limit: COMMUNITY_SINCE_POLL_LIMIT }),
             fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
             fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env, { throwOnTransient: true }),
             isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV }),

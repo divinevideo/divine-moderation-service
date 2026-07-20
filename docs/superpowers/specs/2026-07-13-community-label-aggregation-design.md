@@ -70,8 +70,13 @@ else reuses production-exercised plumbing in this worker.
    warning threshold and no warning at that level has been sent, DM
    the creator via the existing moderation-DM path and record the
    warning (send-once).
-6. **Advance cursor** only after a fully successful sweep; otherwise
-   leave it so the next tick retries (all steps idempotent).
+6. **Advance the watermark.** The cursor is a watermark persisted every
+   tick: videos process oldest-first by earliest new vote, and the
+   watermark advances to just before the earliest vote of any deferred or
+   failed video (so no vote is ever behind it unprocessed). A fully clean
+   tick advances to `now`, or to the newest vote seen when the since-poll
+   page came back full (possible relay truncation). Retried videos are
+   safe to re-process (all steps idempotent).
 
 ### D1 schema (new migration)
 

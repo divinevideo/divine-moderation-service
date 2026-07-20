@@ -2,7 +2,7 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: Cron orchestrator for community content-warning aggregation:
-// ABOUTME: poll votes since cursor, decide via the pure module, act, advance.
+// ABOUTME: poll votes since the watermark, decide via the pure module, act.
 
 import {
   getThreshold,
@@ -10,6 +10,7 @@ import {
   getBatchLimit,
   getCursor,
   setCursor,
+  SINCE_POLL_LIMIT,
 } from './config.mjs';
 import {
   extractVotes,
@@ -25,6 +26,7 @@ import {
   warningSent,
   recordWarning,
 } from './d1.mjs';
+
 const HEX64 = /^[0-9a-f]{64}$/;
 
 function targetsOf(labelEvent) {
@@ -56,9 +58,15 @@ function sha256Of(videoEvent) {
 }
 
 /**
- * One aggregation sweep. All steps are idempotent; the cursor advances only
- * when every touched video was processed without a transient failure, so a
- * failed tick is simply retried by the next one.
+ * One aggregation sweep. The cursor is a watermark: videos are processed
+ * oldest-first by their earliest new vote, and the watermark advances to
+ * just before the earliest vote of any video that was deferred (batch cap)
+ * or failed (transient error), so no vote is ever left behind it
+ * unprocessed. A fully clean tick advances the watermark to `now` — or to
+ * the newest vote seen when the since-poll page came back full and may be
+ * truncated by the relay. The watermark persists every tick, so a fresh
+ * deploy cannot age deferred votes out of the default lookback window.
+ * All steps are idempotent, so re-processing retried videos is harmless.
  *
  * Dependencies are injected (same shape as runCreatorDeleteCron) so the
  * orchestration is unit-testable without a relay, name server, or signer.
@@ -74,6 +82,7 @@ export async function runCommunityLabelSweep({
   publishLabel,
   sendWarningDm,
   moderationPubkey,
+  sincePollLimit = SINCE_POLL_LIMIT,
 }) {
   const threshold = await getThreshold(kv);
   const warningCount = await getWarningCount(kv);
@@ -84,24 +93,41 @@ export async function runCommunityLabelSweep({
 
   const newVotes = (await fetchLabelsSince(cursor)) ?? [];
 
-  // Group new votes by target video; the tally itself is recomputed from a
-  // full per-video fetch below so it is complete, not incremental.
-  const touched = new Map(); // eventId -> { eventId, addressableId }
+  // A full page may be truncated by the relay; never advance the watermark
+  // past the newest vote actually seen.
+  let watermarkCeiling = now;
+  if (newVotes.length >= sincePollLimit) {
+    watermarkCeiling = newVotes.reduce(
+      (max, vote) => Math.max(max, Number.isInteger(vote?.created_at) ? vote.created_at : cursor),
+      cursor,
+    );
+    console.log(`[COMMUNITY-LABELS] since-poll page full (${newVotes.length}); capping watermark at ${watermarkCeiling}`);
+  }
+
+  // Group new votes by target video with each video's earliest new vote;
+  // the tally itself is recomputed from a full per-video fetch below so it
+  // is complete, not incremental.
+  const touched = new Map(); // eventId -> { eventId, addressableId, earliestVoteAt }
   for (const vote of newVotes) {
     if (vote?.pubkey === moderationPubkey) continue;
     const target = targetsOf(vote);
     if (target.eventId === null) continue;
-    const existing = touched.get(target.eventId) ?? { eventId: target.eventId, addressableId: null };
+    const createdAt = Number.isInteger(vote?.created_at) ? vote.created_at : now;
+    const existing = touched.get(target.eventId)
+      ?? { eventId: target.eventId, addressableId: null, earliestVoteAt: createdAt };
     existing.addressableId ??= target.addressableId;
+    existing.earliestVoteAt = Math.min(existing.earliestVoteAt, createdAt);
     touched.set(target.eventId, existing);
   }
 
-  const targets = [...touched.values()];
+  const targets = [...touched.values()].sort((a, b) => a.earliestVoteAt - b.earliestVoteAt);
   const batch = targets.slice(0, batchLimit);
-  const deferred = targets.length - batch.length;
-  let cleanSweep = true;
+  // Earliest vote of every video the watermark must not pass: batch-cap
+  // deferrals up front, per-video failures appended below.
+  const unprocessedAt = targets.slice(batchLimit).map((target) => target.earliestVoteAt);
 
   for (const target of batch) {
+    let videoClean = true;
     try {
       const videoEvent = await fetchVideoEvent(target.eventId);
       if (!videoEvent) {
@@ -139,7 +165,7 @@ export async function runCommunityLabelSweep({
           voteCount: crossing.voteCount,
         });
         if (!publishResult?.published) {
-          cleanSweep = false;
+          videoClean = false;
           continue;
         }
 
@@ -176,24 +202,33 @@ export async function runCommunityLabelSweep({
           await recordWarning(db, { creatorPubkey: videoEvent.pubkey, strikeCount: strikes, now });
           summary.warned += 1;
         } else {
-          cleanSweep = false;
+          videoClean = false;
         }
       }
 
       summary.swept += 1;
     } catch (error) {
-      // Transient failure on this video: keep the cursor so the next tick
-      // retries; idempotent PKs make re-processing harmless.
+      // Failure on this video: hold the watermark at its earliest vote so
+      // the next tick retries; idempotent PKs make re-processing harmless.
       console.log(`[COMMUNITY-LABELS] sweep error for ${target.eventId}: ${error?.message ?? error}`);
-      cleanSweep = false;
+      videoClean = false;
     }
+    if (!videoClean) unprocessedAt.push(target.earliestVoteAt);
   }
 
-  if (cleanSweep && deferred === 0) {
-    await setCursor(kv, now);
-    summary.cursorAdvanced = true;
-  } else if (deferred > 0) {
-    console.log(`[COMMUNITY-LABELS] batch cap deferred ${deferred} video(s) to the next tick`);
+  const watermark = unprocessedAt.length === 0
+    ? watermarkCeiling
+    : Math.min(Math.min(...unprocessedAt) - 1, watermarkCeiling);
+
+  if (watermark > cursor) {
+    await setCursor(kv, watermark);
+  }
+  summary.cursorAdvanced = unprocessedAt.length === 0 && watermarkCeiling === now;
+
+  if (unprocessedAt.length > 0) {
+    // Observability: a watermark that stays old across ticks means a video
+    // is wedging the sweep (or sustained deferral) and deserves a look.
+    console.log(`[COMMUNITY-LABELS] watermark held at ${watermark} (age ${now - watermark}s) by ${unprocessedAt.length} unprocessed video(s)`);
   }
 
   return summary;

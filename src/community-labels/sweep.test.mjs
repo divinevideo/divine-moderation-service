@@ -26,12 +26,16 @@ function makeKv(entries = {}) {
   };
 }
 
-function labelVote(author, label, { videoId = VIDEO_ID } = {}) {
+function labelVote(
+  author,
+  label,
+  { videoId = VIDEO_ID, createdAt = NOW_SECONDS - 60 } = {},
+) {
   return {
     id: `${author.slice(0, 8)}${label}`.padEnd(64, '0').slice(0, 64),
     pubkey: author,
     kind: 1985,
-    created_at: NOW_SECONDS - 60,
+    created_at: createdAt,
     tags: [
       ['L', 'content-warning'],
       ['l', label, 'content-warning'],
@@ -121,14 +125,18 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.publishLabel).not.toHaveBeenCalled();
   });
 
-  it('leaves no decision row and holds the cursor when publish fails', async () => {
+  it('leaves no decision row and holds the watermark when publish fails', async () => {
     deps = makeDeps({ publishResult: { published: false } });
 
     const result = await runCommunityLabelSweep(deps);
 
     expect(deps.db.decisions.size).toBe(0);
     expect(result.cursorAdvanced).toBe(false);
-    expect(deps.kv.store.has('community_labels_cursor')).toBe(false);
+    // The watermark persists just before the failed video's earliest vote,
+    // so a fresh deploy cannot age its votes out of the default lookback.
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 61),
+    );
   });
 
   it('records a strike when the creator did not self-label', async () => {
@@ -168,7 +176,7 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.sendWarningDm).not.toHaveBeenCalled();
   });
 
-  it('holds the cursor when fetching the video event throws', async () => {
+  it('holds the watermark when fetching the video event throws', async () => {
     // Transient relay failures must throw (throwOnTransient wiring) so the
     // sweep retries next tick instead of advancing past the votes.
     deps.fetchVideoEvent.mockRejectedValue(new Error('relay 503'));
@@ -177,7 +185,9 @@ describe('runCommunityLabelSweep', () => {
 
     expect(deps.publishLabel).not.toHaveBeenCalled();
     expect(result.cursorAdvanced).toBe(false);
-    expect(deps.kv.store.has('community_labels_cursor')).toBe(false);
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 61),
+    );
   });
 
   it('skips a video whose event cannot be fetched without wedging the sweep', async () => {
@@ -189,22 +199,56 @@ describe('runCommunityLabelSweep', () => {
     expect(result.cursorAdvanced).toBe(true);
   });
 
-  it('caps evaluated videos at the batch limit and holds the cursor', async () => {
+  it('drains deferred videos across ticks under the batch cap, oldest first', async () => {
     const videoB = 'b1'.padEnd(64, '0');
-    deps = makeDeps({
-      votes: [
-        labelVote(ALICE, 'gambling'),
-        labelVote(BOB, 'gambling'),
-        labelVote(CAROL, 'gambling'),
-        labelVote(ALICE, 'violence', { videoId: videoB }),
-      ],
-      kvEntries: { community_sweep_batch_limit: '1' },
-    });
+    const votes = [
+      labelVote(ALICE, 'gambling', { createdAt: NOW_SECONDS - 120 }),
+      labelVote(BOB, 'gambling', { createdAt: NOW_SECONDS - 110 }),
+      labelVote(CAROL, 'gambling', { createdAt: NOW_SECONDS - 100 }),
+      labelVote(ALICE, 'violence', { videoId: videoB, createdAt: NOW_SECONDS - 60 }),
+      labelVote(BOB, 'violence', { videoId: videoB, createdAt: NOW_SECONDS - 50 }),
+      labelVote(CAROL, 'violence', { videoId: videoB, createdAt: NOW_SECONDS - 40 }),
+    ];
+    deps = makeDeps({ votes, kvEntries: { community_sweep_batch_limit: '1' } });
+    deps.fetchLabelsSince.mockImplementation(
+      async (since) => votes.filter((v) => v.created_at >= since),
+    );
+    deps.fetchLabelsForVideo.mockImplementation(
+      async ({ eventId }) => votes.filter(
+        (v) => v.tags.some((t) => t[0] === 'e' && t[1] === eventId),
+      ),
+    );
+    deps.fetchVideoEvent.mockImplementation(
+      async (eventId) => ({ ...videoEvent(), id: eventId }),
+    );
 
-    const result = await runCommunityLabelSweep(deps);
+    const tick1 = await runCommunityLabelSweep(deps);
+    // Oldest video processes first; the deferred one holds the watermark
+    // just before its earliest vote instead of being starved.
+    expect(tick1.published).toBe(1);
+    expect(tick1.cursorAdvanced).toBe(false);
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 61),
+    );
 
-    expect(result.swept).toBe(1);
+    const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+    expect(tick2.published).toBe(1);
+    expect(tick2.cursorAdvanced).toBe(true);
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS + 300),
+    );
+  });
+
+  it('caps the watermark at the newest seen vote when the since-poll page is full', async () => {
+    // Default deps carry 3 votes; a limit of 3 makes the page "full" and
+    // possibly truncated, so the watermark must not pass the newest vote.
+    const result = await runCommunityLabelSweep({ ...deps, sincePollLimit: 3 });
+
+    expect(result.published).toBe(1);
     expect(result.cursorAdvanced).toBe(false);
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 60),
+    );
   });
 
   it('advances the cursor on an empty poll', async () => {

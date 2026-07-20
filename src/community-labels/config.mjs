@@ -42,6 +42,13 @@ export function getBatchLimit(kv) {
 }
 
 /**
+ * Explicit page size for the since-poll REQ. Making the relay's cap
+ * explicit lets the sweep detect a possibly-truncated page and hold the
+ * watermark at the newest vote it actually saw.
+ */
+export const SINCE_POLL_LIMIT = 1000;
+
+/**
  * Poll cursor (unix seconds). First run looks back 24h rather than
  * replaying all history.
  */
