@@ -46,6 +46,12 @@ export async function claimDecision(db, {
     `SELECT vote_count, created_at, prepared_event FROM community_label_decisions
      WHERE video_event_id = ? AND label = ?`
   ).bind(videoEventId, label).first();
+  // A claim always writes prepared_event, so a null here means a pre-column
+  // legacy row (or manual insert). Fail loudly rather than publish a null event
+  // — the caller holds the cursor and retries instead of wedging silently.
+  if (row.prepared_event == null) {
+    throw new Error(`claimDecision: missing prepared_event for ${videoEventId}/${label}`);
+  }
   return {
     createdAt: row.created_at,
     voteCount: row.vote_count,

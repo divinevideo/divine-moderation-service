@@ -74,6 +74,21 @@ describe('decisions', () => {
     expect(db.decisions.size).toBe(1);
   });
 
+  it('claimDecision throws when a claimed row has no prepared_event', async () => {
+    // A pre-column legacy row (or manual insert) with a null prepared_event
+    // must fail loudly, not resolve to a null event the caller would publish.
+    db.decisions.set(`${VIDEO_A}:gambling`, {
+      video_event_id: VIDEO_A,
+      label: 'gambling',
+      vote_count: 3,
+      published_event_id: '',
+      prepared_event: null,
+      created_at: 1700000000,
+      status: 'pending',
+    });
+    await expect(claim()).rejects.toThrow(/missing prepared_event/);
+  });
+
   it('confirmDecision records the published id once and does not rewrite it', async () => {
     await claim();
     await confirmDecision(db, { videoEventId: VIDEO_A, label: 'gambling', publishedEventId: PUBLISHED });

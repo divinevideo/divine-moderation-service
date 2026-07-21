@@ -4,12 +4,11 @@
 -- Warnings: send-once record per escalation level.
 
 -- status: 'pending' once the sweep claims (video,label) BEFORE publishing,
--- 'confirmed' after the publish lands. The claim persists prepared_event: the
--- exact signed label event, serialized, is stored BEFORE publishing and
--- replayed verbatim on every retry. The relay dedups by id, so a publish that
--- succeeds while the D1 confirm write fails can never produce a duplicate
--- authoritative label — even if the event-building code or signing key changes
--- between the first publish and a later retry.
+-- 'confirmed' after the publish lands. The claim is written first so a publish
+-- that succeeds while the D1 confirm write fails is retried and re-confirmed,
+-- never skipped; the relay dedups the re-published label by id. The exact
+-- published event is persisted for verbatim replay across retries — see the
+-- prepared_event column added in migration 011.
 CREATE TABLE IF NOT EXISTS community_label_decisions (
   video_event_id     TEXT    NOT NULL,
   label              TEXT    NOT NULL,
@@ -17,7 +16,6 @@ CREATE TABLE IF NOT EXISTS community_label_decisions (
   published_event_id TEXT    NOT NULL,
   video_sha256       TEXT,
   creator_pubkey     TEXT    NOT NULL,
-  prepared_event     TEXT,
   created_at         INTEGER NOT NULL,
   status             TEXT    NOT NULL DEFAULT 'pending',
   PRIMARY KEY (video_event_id, label)
