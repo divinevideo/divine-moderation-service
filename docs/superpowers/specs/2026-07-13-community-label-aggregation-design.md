@@ -103,9 +103,9 @@ CREATE TABLE community_strikes (
 
 CREATE TABLE community_strike_warnings (
   creator_pubkey TEXT NOT NULL,
-  strike_count   INTEGER NOT NULL,
+  warning_level  INTEGER NOT NULL,
   sent_at        INTEGER NOT NULL,
-  PRIMARY KEY (creator_pubkey, strike_count)
+  PRIMARY KEY (creator_pubkey, warning_level)
 );
 ```
 
@@ -139,9 +139,12 @@ module must therefore never grow I/O or worker-specific dependencies.
 
 - Publish failure → no decision row → retried next tick.
 - DM failure → no warning row → retried next tick.
-- Identity lookup failure → author not counted (conservative).
-- Cursor advances only on full success; sweeps are idempotent, so
-  re-processing a window is harmless (dedup by primary keys).
+- Transient identity lookup failure → throw and hold the cursor so the
+  author is retried next tick. Definitive `found:false` results do not count.
+- The cursor is persisted every tick. It advances to `now` only on a fully
+  clean tick; full pages and per-video failures hold/freeze the prior cursor.
+  Sweeps are idempotent, so re-processing a window is harmless (dedup by
+  primary keys).
 - The sweep is bounded per tick (cap on videos evaluated per run;
   KV `community_sweep_batch_limit`, default 50) to stay far inside
   Worker CPU/subrequest limits; excess work rolls to the next tick.
@@ -181,8 +184,9 @@ limitation.
 
 The watermark cursor drains correctly at the volume this feature ships
 for. Three residuals appear only under load well beyond v1 (backlog
-above the batch cap, or >1000 votes in one poll window) and are all
-observable via the held-watermark-age log:
+above the batch cap, a per-video tally at the relay's max page size, or
+>1000 votes in one poll window) and are all observable via the
+held-watermark-age log:
 
 - **Truncated poll window (>1000 votes/window).** Funnelcake truncates
   newest-first, so a full page has dropped the oldest votes. The sweep
@@ -196,6 +200,10 @@ observable via the held-watermark-age log:
   rides the newest-N page) and the wedge is observable via the
   held-watermark-age log. Scale fix: page the window backward with
   `until`. Fast-follow.
+- **Per-video tally at relay page limit.** Per-video label fetches request
+  the home relay's current max page size (5000) and fail closed if the page is
+  full, holding the cursor rather than under-counting. Scale fix: page the
+  per-video tally by timestamp/cursor if any video approaches that volume.
 - **Batch-boundary timestamp ties.** When the first deferred video shares
   its earliest-vote second with in-batch videos, those keep their slots
   and the deferred video is starved. Needs backlog above the batch cap
@@ -225,6 +233,7 @@ for the staged, kill-switched, low-volume v1 rollout.
 ## Operational notes (per AGENTS.md)
 
 This changes relay publishing behavior and moderation outcomes: the PR
-description must call that out explicitly. Rollout: deploy dark →
-verify sweep logs with kill switch off → enable in staging KV →
-observe → enable in prod KV.
+description must call that out explicitly. Rollout: apply
+`migrations/010-community-labels.sql` to the target D1 database → deploy dark
+→ verify sweep logs with kill switch off → enable in staging KV → observe →
+enable in prod KV.

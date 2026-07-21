@@ -7,6 +7,7 @@
 const BY_PUBKEY_BASE = 'https://names.divine.video/api/username/by-pubkey';
 // Matches the moderation NIP-05 resolution TTL used across Divine clients.
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_TTL_SECONDS = CACHE_TTL_MS / 1000;
 
 function transientError(normalized, detail) {
   return new Error(`[identity] transient by-pubkey lookup failure for ${normalized}: ${detail}`);
@@ -76,7 +77,9 @@ export async function isDivineIdentity(
     found = body?.found === true;
   }
 
-  await kv.put(cacheKey, JSON.stringify({ value: found, at: now }));
+  await kv.put(cacheKey, JSON.stringify({ value: found, at: now }), {
+    expirationTtl: CACHE_TTL_SECONDS,
+  });
   return found;
 }
 

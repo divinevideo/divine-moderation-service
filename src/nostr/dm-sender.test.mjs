@@ -10,6 +10,7 @@ import { bytesToHex } from '@noble/hashes/utils';
 import {
   getMessageForAction,
   getReportOutcomeMessage,
+  getCommunityStrikeWarningMessage,
   getModeratorKeys,
   checkRateLimit,
   discoverUserRelays,
@@ -104,6 +105,16 @@ describe('DM Sender - Message Templates', () => {
   it('should include sha256 link when provided', () => {
     const message = getMessageForAction('AGE_RESTRICTED', 'contain mature content', 'deadbeef1234');
     expect(message).toContain('divine.video/video/deadbeef1234');
+  });
+
+  it('should produce the community strike warning with appeal path and footer', () => {
+    const sha = 'f'.repeat(64);
+    const message = getCommunityStrikeWarningMessage(3, sha);
+
+    expect(message).toContain('3 content-warning strikes');
+    expect(message).toContain('reply to this message to appeal');
+    expect(message).toContain(`divine.video/video/${sha}`);
+    expect(message).toContain('Learn more about our content policies');
   });
 
   it('should produce correct report outcome message for removal', () => {
@@ -768,4 +779,3 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
     expect(loggedInserts[0][MESSAGE_TYPE_BIND_INDEX]).toBe('moderator_reply');
   });
 });
-

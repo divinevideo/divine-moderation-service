@@ -79,6 +79,9 @@ const TEMPLATES = {
 
   REPORT_OUTCOME_NO_ACTION: (sha256, title, publishedAt, reportedAt) =>
     `Thanks for your report. We've reviewed ${contentSubject(title, 'the reported content')}${postedDate(publishedAt)} and no action was taken at this time.${reportedAt ? ` You reported this content on ${formatDate(reportedAt)}.` : ''}\n${contentLink(sha256)}\nIf you disagree with this outcome, you can reply to this message.\n\n${FOOTER}`,
+
+  COMMUNITY_MISLABEL_WARNING: (strikeCount, sha256) =>
+    `Heads up from Divine moderation: your account has ${strikeCount} content-warning strikes. Community consensus applied warning labels to videos you posted without them. Please add content warnings when sharing sensitive content. Repeated omissions are reviewed by our moderators and can lead to account restrictions.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n${contentLink(sha256)}\n${FOOTER}`,
 };
 
 // Per-action default reasons so AGE_RESTRICTED gets its own fallback text
@@ -204,6 +207,17 @@ export function getReportOutcomeMessage(action, sha256 = null, title = null, pub
     return TEMPLATES.REPORT_OUTCOME_ACTION(outcome, sha256, title, publishedAt, reportedAt);
   }
   return TEMPLATES.REPORT_OUTCOME_NO_ACTION(sha256, title, publishedAt, reportedAt);
+}
+
+/**
+ * Get the automated creator warning for community-applied content warnings.
+ *
+ * @param {number} strikeCount - Current strike count for the creator
+ * @param {string|null} sha256 - Content hash for conversation threading/linking
+ * @returns {string}
+ */
+export function getCommunityStrikeWarningMessage(strikeCount, sha256 = null) {
+  return TEMPLATES.COMMUNITY_MISLABEL_WARNING(strikeCount, sha256);
 }
 
 // --- Manual compose templates ---

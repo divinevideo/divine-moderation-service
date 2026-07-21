@@ -44,7 +44,8 @@ export function getBatchLimit(kv) {
 /**
  * Explicit page size for the since-poll REQ. Making the relay's cap
  * explicit lets the sweep detect a possibly-truncated page and hold the
- * watermark at the newest vote it actually saw.
+ * watermark at its prior cursor. Keep below the home relay's NIP-11 max_limit
+ * (currently 5000) so a full page is a reliable backpressure/truncation signal.
  */
 export const SINCE_POLL_LIMIT = 1000;
 

@@ -27,12 +27,12 @@
 **Files:** Create `migrations/010-community-labels.sql`, `src/community-labels/d1.mjs`, `src/community-labels/d1.test.mjs`
 
 **Interfaces produced:**
-- Migration: `community_label_decisions(video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at, PK(video_event_id,label))`; `community_strikes(creator_pubkey, video_event_id, label, created_at, PK(creator_pubkey,video_event_id,label))`; `community_strike_warnings(creator_pubkey, strike_count, sent_at, PK(creator_pubkey,strike_count))`.
+- Migration: `community_label_decisions(video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at, PK(video_event_id,label))`; `community_strikes(creator_pubkey, video_event_id, label, created_at, PK(creator_pubkey,video_event_id,label))`; `community_strike_warnings(creator_pubkey, warning_level, sent_at, PK(creator_pubkey,warning_level))`.
 - `hasDecision(db, videoEventId, label) -> bool`
 - `recordDecision(db, {videoEventId, label, voteCount, publishedEventId, videoSha256, creatorPubkey, now}) -> void` (INSERT OR IGNORE)
 - `recordStrike(db, {creatorPubkey, videoEventId, label, now}) -> void` (INSERT OR IGNORE)
 - `strikeCount(db, creatorPubkey) -> int`
-- `warningSentAt(db, creatorPubkey, strikeCount) -> bool` / `recordWarning(db, {creatorPubkey, strikeCount, now})`
+- `warningSent(db, creatorPubkey, warningLevel) -> bool` / `recordWarning(db, {creatorPubkey, warningLevel, now})`
 - `listStrikeSummary(db, {limit}) -> [{creator_pubkey, strikes, last_at}]` ordered desc
 
 Steps: failing tests against a D1 test double (follow `src/creator-delete/d1.test.mjs` harness — check whether it uses miniflare D1 or a stub; mirror it) → run red → implement → green → commit `feat: community label decision/strike tables + access (#180)`.
@@ -108,7 +108,7 @@ export async function runCommunityLabelSweep({
   moderationPubkey,
 }) -> {swept, published, strikes, warned, cursorAdvanced}
 ```
-Logic: cursor → poll since (explicit page limit; a full page caps the watermark at the newest vote seen) → group by target video with earliest new vote → sort oldest-first, cap at batch limit → per video: fetch video event (skip if missing, throw on transient), fetch all its label events, decide via Task 5, skip labels with existing decisions, publish → record decision (+vote count, sha256 from video event tags) → record strike if warranted → warning check (count, once per level) → DM. The cursor is a watermark persisted every tick: it advances to just before the earliest vote of any deferred or failed video, or to now on a fully clean tick, so deferred videos drain across ticks and no vote is silently dropped (idempotency via PKs makes re-sweeps safe).
+Logic: cursor → poll since (explicit page limit; a full page holds the watermark at the prior cursor) → group by target video with earliest new vote → sort oldest-first, cap at batch limit → per video: fetch video event (skip if missing, throw on transient), fetch all its label events (explicit relay max page size; full page throws/holds), decide via Task 5, skip labels with existing decisions, publish → record decision (+vote count, sha256 from video event tags) → record strike if warranted → warning check (count, once per level) → DM. The cursor is a watermark persisted every tick: it advances to just before the earliest vote of any deferred or failed video, or to now on a fully clean tick, so deferred videos drain across ticks and no vote is silently dropped (idempotency via PKs makes re-sweeps safe).
 
 Tests (mock deps): end-to-end crossing publishes once and re-sweep publishes zero; publish failure leaves no decision row + no cursor advance; strike only when not self-labeled; DM sent exactly once per level; batch cap defers excess videos without advancing cursor; missing video event skipped without wedging the sweep; empty poll advances cursor. Red → green → commit `feat: community label sweep orchestrator (#180)`.
 
@@ -125,7 +125,7 @@ Tests: kill switch off → sweep not invoked; endpoint 401 without auth; endpoin
 
 - `npm run lint` clean, `npm test` fully green.
 - Re-read spec; confirm each requirement maps to shipped code.
-- PR (draft) to main: conventional title `feat: authoritative community content-warning aggregation (#180)`; description = summary, motivation (#180 / divine-mobile#4771), explicit callout of new relay-publishing + moderation-outcome behavior, kill-switch default-off rollout plan, manual validation plan (staging KV enable), linked issue.
+- PR (draft) to main: conventional title `feat: authoritative community content-warning aggregation (#180)`; description = summary, motivation (#180 / divine-mobile#4771), explicit callout of new relay-publishing + moderation-outcome behavior, kill-switch default-off rollout plan, manual validation plan (apply migration before staging KV enable), linked closing issue.
 
 ## Self-Review notes
 

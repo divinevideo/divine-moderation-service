@@ -13,10 +13,15 @@ const NOW = 1_700_000_000_000;
 
 function makeKv(entries = {}) {
   const store = new Map(Object.entries(entries));
+  const puts = [];
   return {
     store,
+    puts,
     async get(key) { return store.has(key) ? store.get(key) : null; },
-    async put(key, value) { store.set(key, value); },
+    async put(key, value, options) {
+      puts.push({ key, value, options });
+      store.set(key, value);
+    },
   };
 }
 
@@ -65,6 +70,14 @@ describe('isDivineIdentity', () => {
     await isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW });
     await isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW + 1_000 });
     expect(fetchImpl.calls.length).toBe(1);
+  });
+
+  it('writes cached verdicts with a KV expiration TTL', async () => {
+    const fetchImpl = fetchReturning(200, { ok: true, found: true });
+    await isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW });
+
+    expect(kv.puts).toHaveLength(1);
+    expect(kv.puts[0].options).toEqual({ expirationTtl: 24 * 60 * 60 });
   });
 
   it('refetches after the 24h TTL expires', async () => {

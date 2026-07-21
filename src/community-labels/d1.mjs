@@ -75,28 +75,33 @@ export async function recordWarning(db, { creatorPubkey, warningLevel, now }) {
  * per creator. Returns a Map<creator_pubkey, [{ video_event_id, label,
  * created_at }]>. One query for the whole page rather than N per-creator ones.
  */
+const D1_MAX_BOUND_PARAMETERS = 100;
+
 async function listStrikeDetails(db, { creatorPubkeys, perCreatorLimit }) {
   const byCreator = new Map();
   if (!Array.isArray(creatorPubkeys) || creatorPubkeys.length === 0) return byCreator;
 
-  const placeholders = creatorPubkeys.map(() => '?').join(', ');
-  const { results } = await db.prepare(
-    `SELECT creator_pubkey, video_event_id, label, created_at
-     FROM community_strikes
-     WHERE creator_pubkey IN (${placeholders})
-     ORDER BY created_at DESC`
-  ).bind(...creatorPubkeys).all();
+  for (let i = 0; i < creatorPubkeys.length; i += D1_MAX_BOUND_PARAMETERS) {
+    const chunk = creatorPubkeys.slice(i, i + D1_MAX_BOUND_PARAMETERS);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const { results } = await db.prepare(
+      `SELECT creator_pubkey, video_event_id, label, created_at
+       FROM community_strikes
+       WHERE creator_pubkey IN (${placeholders})
+       ORDER BY created_at DESC`
+    ).bind(...chunk).all();
 
-  for (const row of results ?? []) {
-    const rows = byCreator.get(row.creator_pubkey) ?? [];
-    if (rows.length < perCreatorLimit) {
-      rows.push({
-        video_event_id: row.video_event_id,
-        label: row.label,
-        created_at: row.created_at,
-      });
+    for (const row of results ?? []) {
+      const rows = byCreator.get(row.creator_pubkey) ?? [];
+      if (rows.length < perCreatorLimit) {
+        rows.push({
+          video_event_id: row.video_event_id,
+          label: row.label,
+          created_at: row.created_at,
+        });
+      }
+      byCreator.set(row.creator_pubkey, rows);
     }
-    byCreator.set(row.creator_pubkey, rows);
   }
   return byCreator;
 }

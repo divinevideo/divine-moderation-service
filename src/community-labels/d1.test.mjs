@@ -138,4 +138,21 @@ describe('strikes and warnings', () => {
     expect(creator.strikes).toBe(25);
     expect(creator.recent).toHaveLength(20);
   });
+
+  it('chunks detail lookups so high-limit admin pages stay under D1 bind limits', async () => {
+    for (let i = 0; i < 125; i += 1) {
+      const creatorPubkey = `${i.toString(16)}`.padStart(64, '0');
+      await recordStrike(db, {
+        creatorPubkey,
+        videoEventId: `${i}`.padEnd(64, 'a'),
+        label: 'gambling',
+        now: i,
+      });
+    }
+
+    const summary = await listStrikeSummary(db, { limit: 125 });
+
+    expect(summary).toHaveLength(125);
+    expect(summary.every((row) => row.recent.length === 1)).toBe(true);
+  });
 });

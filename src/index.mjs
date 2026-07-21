@@ -43,7 +43,7 @@ import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
 import { runCreatorDeleteCron } from './creator-delete/cron.mjs';
-import { sendModeratorReply as sendModeratorReplyDm, sendCommunityStrikeWarning, getModeratorKeys } from './nostr/dm-sender.mjs';
+import { sendModeratorReply, sendCommunityStrikeWarning, getCommunityStrikeWarningMessage, getModeratorKeys } from './nostr/dm-sender.mjs';
 import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
 import { isEnabled as communityLabelsEnabled, SINCE_POLL_LIMIT as COMMUNITY_SINCE_POLL_LIMIT } from './community-labels/config.mjs';
 import { isDivineIdentity } from './community-labels/identity.mjs';
@@ -3660,7 +3660,6 @@ async function runMigration() {
       if (!message) {
         return new Response(JSON.stringify({ error: 'message is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
-      const { sendModeratorReply } = await import('./nostr/dm-sender.mjs');
       // Honor the send result so the compose UI can surface real failures
       // (e.g. no relays reachable) instead of silently reporting success.
       const result = await sendModeratorReply(pubkey, message, sha256 || null, env, null);
@@ -5291,7 +5290,7 @@ async function runMigration() {
               return { published: result.published === true, eventId: result.eventId };
             },
             sendWarningDm: async ({ creatorPubkey, strikeCount, videoSha256 }) => {
-              const message = `Heads up from Divine moderation: your account has ${strikeCount} content-warning strikes. Community consensus applied warning labels to videos you posted without them. Please add content warnings when sharing sensitive content. Repeated omissions are reviewed by our moderators and can lead to account restrictions.`;
+              const message = getCommunityStrikeWarningMessage(strikeCount, videoSha256);
               return sendCommunityStrikeWarning(creatorPubkey, message, videoSha256, env, ctx);
             },
             moderationPubkey,

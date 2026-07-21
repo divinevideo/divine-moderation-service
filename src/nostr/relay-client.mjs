@@ -12,6 +12,7 @@ const DEFAULT_SHA_BATCH_CONCURRENCY = 3;
 const MAX_SHA_BATCH_CONCURRENCY = 8;
 const DEFAULT_SHA_BATCH_QUERY_LIMIT = 100;
 const MAX_SHA_BATCH_QUERY_LIMIT = 500;
+export const LABEL_EVENTS_FOR_VIDEO_LIMIT = 5000;
 
 function parseBoundedInteger(value, fallback, min, max) {
   const parsed = Number.parseInt(String(value), 10);
@@ -480,14 +481,20 @@ export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://rela
  * Fetch every kind 1985 label event targeting a video, via its #e tag and —
  * when the video is addressable — its #a tag, deduped by event id.
  */
-export async function fetchLabelEventsForVideo({ eventId, addressableId }, relayUrl = 'wss://relay.divine.video', env = {}) {
+export async function fetchLabelEventsForVideo({ eventId, addressableId }, relayUrl = 'wss://relay.divine.video', env = {}, { limit = LABEL_EVENTS_FOR_VIDEO_LIMIT } = {}) {
   const byId = new Map();
   // Strict: a truncated per-video tally must fail (and hold the cursor), not
   // silently under-count and let a below-threshold read advance the watermark.
-  const viaE = await queryRelay(relayUrl, { kinds: [1985], '#e': [eventId] }, env, { collectAll: true, rejectOnPrematureClose: true });
+  const viaE = await queryRelay(relayUrl, { kinds: [1985], '#e': [eventId], limit }, env, { collectAll: true, rejectOnPrematureClose: true });
+  if (viaE.length >= limit) {
+    throw new Error(`per-video label tally reached relay page limit (${limit}) for #e ${eventId}`);
+  }
   for (const event of viaE) byId.set(event.id, event);
   if (addressableId) {
-    const viaA = await queryRelay(relayUrl, { kinds: [1985], '#a': [addressableId] }, env, { collectAll: true, rejectOnPrematureClose: true });
+    const viaA = await queryRelay(relayUrl, { kinds: [1985], '#a': [addressableId], limit }, env, { collectAll: true, rejectOnPrematureClose: true });
+    if (viaA.length >= limit) {
+      throw new Error(`per-video label tally reached relay page limit (${limit}) for #a ${addressableId}`);
+    }
     for (const event of viaA) byId.set(event.id, event);
   }
   return [...byId.values()];

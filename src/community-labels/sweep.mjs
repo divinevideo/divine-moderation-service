@@ -26,9 +26,9 @@ import {
   warningSent,
   recordWarning,
 } from './d1.mjs';
+import { VIDEO_KINDS } from '../nostr/video-kinds.mjs';
 
 const HEX64 = /^[0-9a-f]{64}$/;
-const VIDEO_KINDS = new Set([34235, 34236]);
 
 // Touched-video detection keys on the vote's `e` (event id) target only. The
 // vote's `a` tag is deliberately ignored here: it is attacker-controlled, so

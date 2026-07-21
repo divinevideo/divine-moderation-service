@@ -7,6 +7,8 @@
 // Mirrors migrations/010-community-labels.sql: three tables keyed by their
 // primary keys. SQL is matched on shape, same approach as the
 // creator-delete makeFakeD1 helper.
+const D1_MAX_BOUND_PARAMETERS = 100;
+
 export function makeFakeCommunityD1() {
   const decisions = new Map(); // `${video_event_id}:${label}`
   const strikes = new Map(); // `${creator_pubkey}:${video_event_id}:${label}`
@@ -20,7 +22,13 @@ export function makeFakeCommunityD1() {
       return {
         _sql: sql,
         _binds: [],
-        bind(...args) { this._binds = args; return this; },
+        bind(...args) {
+          if (args.length > D1_MAX_BOUND_PARAMETERS) {
+            throw new Error(`too many SQL variables: ${args.length}`);
+          }
+          this._binds = args;
+          return this;
+        },
         async run() {
           if (this._sql.includes('INSERT') && this._sql.includes('community_label_decisions')) {
             const [video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at] = this._binds;

@@ -130,8 +130,8 @@ describe('fetchLabelEventsForVideo', () => {
 
     expect(events.map((event) => event.id).sort()).toEqual([viaE.id, viaBoth.id].sort());
     expect(Fake.sentFilters).toHaveLength(2);
-    expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], '#e': [videoId] });
-    expect(Fake.sentFilters[1]).toMatchObject({ kinds: [1985], '#a': [addressableId] });
+    expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], '#e': [videoId], limit: 5000 });
+    expect(Fake.sentFilters[1]).toMatchObject({ kinds: [1985], '#a': [addressableId], limit: 5000 });
   });
 
   it('skips the #a query when no addressable id is present', async () => {
@@ -141,7 +141,7 @@ describe('fetchLabelEventsForVideo', () => {
     await fetchLabelEventsForVideo({ eventId: videoId, addressableId: null });
 
     expect(Fake.sentFilters).toHaveLength(1);
-    expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], '#e': [videoId] });
+    expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], '#e': [videoId], limit: 5000 });
   });
 
   it('rejects when a per-video query closes before EOSE (possible truncation)', async () => {
@@ -150,5 +150,20 @@ describe('fetchLabelEventsForVideo', () => {
     await expect(
       fetchLabelEventsForVideo({ eventId: videoId, addressableId: null }),
     ).rejects.toThrow(/EOSE/i);
+  });
+
+  it('rejects when a per-video query fills the requested page', async () => {
+    const Fake = makeFakeWebSocket({
+      eventsForFilter: () => [
+        { id: '1'.repeat(64), kind: 1985, tags: [['e', videoId]] },
+        { id: '2'.repeat(64), kind: 1985, tags: [['e', videoId]] },
+      ],
+    });
+    globalThis.WebSocket = Fake;
+
+    await expect(
+      fetchLabelEventsForVideo({ eventId: videoId, addressableId: null }, 'wss://relay.divine.video', {}, { limit: 2 }),
+    ).rejects.toThrow(/page limit/);
+    expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], '#e': [videoId], limit: 2 });
   });
 });
