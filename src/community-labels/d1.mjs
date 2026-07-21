@@ -5,29 +5,58 @@
 // ABOUTME: warning send-once accounting. All inserts are idempotent via PKs.
 
 /**
- * Whether an authoritative label was already published for (video, label).
+ * Whether a CONFIRMED authoritative label was already published for
+ * (video, label). A still-pending claim (publish in flight, or a publish that
+ * landed while the confirm write failed) is deliberately NOT a decision: the
+ * publish-once guard keys on 'confirmed' so a partial failure is retried and
+ * re-confirmed, not skipped.
  */
 export async function hasDecision(db, videoEventId, label) {
   const row = await db.prepare(
     `SELECT video_event_id FROM community_label_decisions
-     WHERE video_event_id = ? AND label = ?`
+     WHERE video_event_id = ? AND label = ? AND status = 'confirmed'`
   ).bind(videoEventId, label).first();
   return row !== null;
 }
 
 /**
- * Record a published authoritative label. INSERT OR IGNORE: re-recording an
- * existing (video, label) is a no-op, preserving the original vote count.
+ * Claim (video, label) for publishing by persisting a PENDING row BEFORE the
+ * label event is sent, then return the row's frozen created_at + vote_count.
+ * Those frozen fields are what make the published event id deterministic:
+ * every retry rebuilds the identical event, so the relay dedups by id and no
+ * duplicate authoritative label can land. INSERT OR IGNORE means the first
+ * tick creates the claim and every retry reads back the same frozen values.
+ *
+ * @returns {Promise<{createdAt: number, voteCount: number}>}
  */
-export async function recordDecision(db, {
-  videoEventId, label, voteCount, publishedEventId, videoSha256, creatorPubkey, now,
+export async function claimDecision(db, {
+  videoEventId, label, voteCount, videoSha256, creatorPubkey, now,
 }) {
   await db.prepare(
     `INSERT INTO community_label_decisions
-      (video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+      (video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
      ON CONFLICT(video_event_id, label) DO NOTHING`
-  ).bind(videoEventId, label, voteCount, publishedEventId, videoSha256, creatorPubkey, now).run();
+  ).bind(videoEventId, label, voteCount, '', videoSha256, creatorPubkey, now).run();
+
+  const row = await db.prepare(
+    `SELECT vote_count, created_at FROM community_label_decisions
+     WHERE video_event_id = ? AND label = ?`
+  ).bind(videoEventId, label).first();
+  return { createdAt: row.created_at, voteCount: row.vote_count };
+}
+
+/**
+ * Mark a claimed (video, label) CONFIRMED and record the published event id
+ * for audit. Only flips a still-pending row, so a re-confirm on a later tick
+ * cannot rewrite the original published id.
+ */
+export async function confirmDecision(db, { videoEventId, label, publishedEventId }) {
+  await db.prepare(
+    `UPDATE community_label_decisions
+     SET status = 'confirmed', published_event_id = ?
+     WHERE video_event_id = ? AND label = ? AND status = 'pending'`
+  ).bind(publishedEventId, videoEventId, label).run();
 }
 
 /**
@@ -52,22 +81,65 @@ export async function strikeCount(db, creatorPubkey) {
   return row?.n ?? 0;
 }
 
-/** Whether the warning DM for this escalation level was already sent. */
-export async function warningSent(db, creatorPubkey, warningLevel) {
-  const row = await db.prepare(
-    `SELECT creator_pubkey FROM community_strike_warnings
-     WHERE creator_pubkey = ? AND warning_level = ?`
-  ).bind(creatorPubkey, warningLevel).first();
-  return row !== null;
-}
-
-/** Record that the warning DM for this escalation level was sent. Idempotent. */
-export async function recordWarning(db, { creatorPubkey, warningLevel, now }) {
-  await db.prepare(
-    `INSERT INTO community_strike_warnings (creator_pubkey, warning_level, sent_at)
-     VALUES (?, ?, ?)
+/**
+ * Claim the warning DM for this escalation level by persisting a PENDING row
+ * BEFORE the DM is sent. Returns true only when THIS call created the claim;
+ * false when a claim already exists (pending OR sent). A pending-or-sent claim
+ * must block a resend — so the caller only sends when this returns true. That
+ * trades a rare missed warning (crash between claim and send) for never
+ * double-DMing the creator.
+ */
+export async function claimWarning(db, { creatorPubkey, warningLevel, now }) {
+  const result = await db.prepare(
+    `INSERT INTO community_strike_warnings (creator_pubkey, warning_level, sent_at, status)
+     VALUES (?, ?, ?, 'pending')
      ON CONFLICT(creator_pubkey, warning_level) DO NOTHING`
   ).bind(creatorPubkey, warningLevel, now).run();
+  return (result?.meta?.changes ?? 0) > 0;
+}
+
+/**
+ * Mark a claimed warning as sent (audit). Only flips a still-pending row.
+ * Correctness of the no-duplicate guard rests on the claim, not this flip;
+ * this records that the DM actually went out.
+ */
+export async function confirmWarning(db, { creatorPubkey, warningLevel }) {
+  await db.prepare(
+    `UPDATE community_strike_warnings
+     SET status = 'sent'
+     WHERE creator_pubkey = ? AND warning_level = ? AND status = 'pending'`
+  ).bind(creatorPubkey, warningLevel).run();
+}
+
+/**
+ * Release a claimed-but-not-sent warning so a later tick can retry it. Called
+ * only on a definitive send failure ({sent:false}) where we KNOW no DM went
+ * out, so re-sending is not a duplicate. Deletes only a still-`pending` row,
+ * so a claim orphaned by a crash *after* a successful send (which is never
+ * released) still blocks a resend and preserves the no-duplicate guard.
+ */
+export async function releaseWarning(db, { creatorPubkey, warningLevel }) {
+  await db.prepare(
+    `DELETE FROM community_strike_warnings
+     WHERE creator_pubkey = ? AND warning_level = ? AND status = 'pending'`
+  ).bind(creatorPubkey, warningLevel).run();
+}
+
+/**
+ * One page of a single creator's strike rows, newest first, for the admin
+ * drill-down behind the summary's per-creator evidence cap. Pages entirely in
+ * SQL (bound LIMIT/OFFSET) so a creator with hundreds of strikes never
+ * over-fetches. Returns [{ video_event_id, label, created_at }].
+ */
+export async function listStrikesForCreator(db, { creatorPubkey, limit, offset }) {
+  const { results } = await db.prepare(
+    `SELECT video_event_id, label, created_at
+     FROM community_strikes
+     WHERE creator_pubkey = ?
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`
+  ).bind(creatorPubkey, limit, offset).all();
+  return results ?? [];
 }
 
 /**

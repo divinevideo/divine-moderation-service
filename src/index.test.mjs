@@ -14,7 +14,9 @@ const communitySweepMocks = vi.hoisted(() => ({
   runCommunityLabelSweep: vi.fn().mockResolvedValue({
     swept: 0, published: 0, strikes: 0, warned: 0, cursorAdvanced: true
   }),
-  listStrikeSummary: vi.fn().mockResolvedValue([])
+  listStrikeSummary: vi.fn().mockResolvedValue([]),
+  listStrikesForCreator: vi.fn().mockResolvedValue([]),
+  strikeCount: vi.fn().mockResolvedValue(0)
 }));
 
 vi.mock('./community-labels/sweep.mjs', () => ({
@@ -25,7 +27,9 @@ vi.mock('./community-labels/d1.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    listStrikeSummary: communitySweepMocks.listStrikeSummary
+    listStrikeSummary: communitySweepMocks.listStrikeSummary,
+    listStrikesForCreator: communitySweepMocks.listStrikesForCreator,
+    strikeCount: communitySweepMocks.strikeCount
   };
 });
 
@@ -7718,6 +7722,83 @@ describe('GET /admin/api/community-strikes (#180)', () => {
     expect(communitySweepMocks.listStrikeSummary).toHaveBeenCalledWith(
       expect.anything(),
       { limit: 10 }
+    );
+  });
+});
+
+describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
+  const CREATOR = 'c'.repeat(64);
+
+  it('requires admin auth', async () => {
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}`),
+      createEnv({ ALLOW_DEV_ACCESS: 'false' })
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it('rejects a non-hex creator pubkey', async () => {
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/community-strikes/not-a-pubkey', {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(400);
+    expect(communitySweepMocks.listStrikesForCreator).not.toHaveBeenCalled();
+  });
+
+  it('returns one SQL-paged page of strikes with paging metadata', async () => {
+    communitySweepMocks.strikeCount.mockResolvedValue(25);
+    communitySweepMocks.listStrikesForCreator.mockResolvedValue(
+      Array.from({ length: 10 }, (_, i) => ({
+        video_event_id: `${i}`.padEnd(64, 'a'),
+        label: 'gambling',
+        created_at: 1700000000 - i,
+      }))
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=1&pageSize=10`, {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    const body = await response.json();
+    expect(body).toMatchObject({
+      creator_pubkey: CREATOR,
+      page: 1,
+      page_size: 10,
+      total: 25,
+      has_more: true,
+    });
+    expect(body.strikes).toHaveLength(10);
+    expect(communitySweepMocks.listStrikesForCreator).toHaveBeenCalledWith(
+      expect.anything(),
+      { creatorPubkey: CREATOR, limit: 10, offset: 0 }
+    );
+  });
+
+  it('clamps an oversized pageSize and offsets by page', async () => {
+    communitySweepMocks.strikeCount.mockResolvedValue(500);
+    communitySweepMocks.listStrikesForCreator.mockResolvedValue([]);
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=3&pageSize=5000`, {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    expect(communitySweepMocks.listStrikesForCreator).toHaveBeenCalledWith(
+      expect.anything(),
+      { creatorPubkey: CREATOR, limit: 200, offset: 400 }
     );
   });
 });

@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { runCommunityLabelSweep } from './sweep.mjs';
-import { recordStrike } from './d1.mjs';
+import { hasDecision, recordStrike } from './d1.mjs';
 import { makeFakeCommunityD1 } from './test-helpers.mjs';
 
 const MODERATION = 'f0'.padEnd(64, '0');
@@ -102,6 +102,60 @@ function failStrikeInsertOnce(db) {
   return db;
 }
 
+// One-shot failure of the FIRST community_label_decisions write that runs
+// after a successful publish — the post-publish bookkeeping write. Pins the
+// "publish landed, decision write failed" partial failure regardless of
+// whether that write is a single insert or a claim-then-confirm pair.
+function failDecisionWriteAfterPublish(deps) {
+  let failed = false;
+  let sawPublish = false;
+  const realPublish = deps.publishLabel;
+  deps.publishLabel = vi.fn(async (args) => {
+    const result = await realPublish(args);
+    if (result?.published) sawPublish = true;
+    return result;
+  });
+  const realPrepare = deps.db.prepare.bind(deps.db);
+  deps.db.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (sql.includes('community_label_decisions') && (sql.includes('INSERT') || sql.includes('UPDATE'))) {
+      const realRun = stmt.run.bind(stmt);
+      stmt.run = async () => {
+        if (!failed && sawPublish) { failed = true; throw new Error('decision write failed'); }
+        return realRun();
+      };
+    }
+    return stmt;
+  };
+}
+
+// One-shot failure of the FIRST community_strike_warnings write that runs
+// after a warning DM is sent — the post-send bookkeeping write. Reproduces
+// the "DM sent, record failed" partial failure for both the single-insert
+// and claim-then-confirm shapes, so the test pins the invariant.
+function failWarningWriteAfterSend(deps) {
+  let failed = false;
+  let sawSend = false;
+  const realSend = deps.sendWarningDm;
+  deps.sendWarningDm = vi.fn(async (...args) => {
+    const result = await realSend(...args);
+    if (result?.sent) sawSend = true;
+    return result;
+  });
+  const realPrepare = deps.db.prepare.bind(deps.db);
+  deps.db.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (sql.includes('community_strike_warnings') && (sql.includes('INSERT') || sql.includes('UPDATE'))) {
+      const realRun = stmt.run.bind(stmt);
+      stmt.run = async () => {
+        if (!failed && sawSend) { failed = true; throw new Error('warning write failed'); }
+        return realRun();
+      };
+    }
+    return stmt;
+  };
+}
+
 describe('runCommunityLabelSweep', () => {
   let deps;
   beforeEach(() => { deps = makeDeps(); });
@@ -148,12 +202,18 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.publishLabel).not.toHaveBeenCalled();
   });
 
-  it('leaves no decision row and holds the watermark when publish fails', async () => {
+  it('leaves only a pending claim (never a confirmed decision) and holds the watermark when publish fails', async () => {
     deps = makeDeps({ publishResult: { published: false } });
 
     const result = await runCommunityLabelSweep(deps);
 
-    expect(deps.db.decisions.size).toBe(0);
+    // The pre-publish claim persists so a retry replays the same frozen event,
+    // but it is never confirmed — no authoritative label was published.
+    expect(await hasDecision(deps.db, VIDEO_ID, 'gambling')).toBe(false);
+    const decision = [...deps.db.decisions.values()][0];
+    expect(decision.status).toBe('pending');
+    expect(decision.published_event_id).toBe('');
+    expect(result.published).toBe(0);
     expect(result.cursorAdvanced).toBe(false);
     // The watermark persists just before the failed video's earliest vote,
     // so a fresh deploy cannot age its votes out of the default lookback.
@@ -200,7 +260,7 @@ describe('runCommunityLabelSweep', () => {
   });
 
   it('recovers a strike on a later tick when it failed after the decision was recorded', async () => {
-    // Partial failure: publish + recordDecision succeed, recordStrike throws.
+    // Partial failure: publish + decision confirm succeed, recordStrike throws.
     // The strike must be ensured independently on a later tick even though the
     // decision already exists, instead of being lost forever behind the
     // publish-once dedup.
@@ -465,5 +525,74 @@ describe('runCommunityLabelSweep', () => {
 
     expect(result.cursorAdvanced).toBe(true);
     expect(deps.kv.store.get('community_labels_cursor')).toBe(String(NOW_SECONDS));
+  });
+
+  it('re-publishes with a frozen created_at and confirms the decision exactly once after a partial failure', async () => {
+    // Publish lands but the post-publish decision write fails on tick 1. The
+    // cursor holds; tick 2 must re-publish with the SAME frozen created_at
+    // (so the deterministic publisher rebuilds an identical event id the relay
+    // dedups by) and confirm the decision exactly once — never a duplicate
+    // authoritative label.
+    deps = makeDeps();
+    // Deterministic id derived from the frozen inputs, mirroring the real
+    // publisher: same created_at + vote count => same event id.
+    deps.publishLabel = vi.fn(async ({ videoEventId, label, voteCount, createdAt }) => ({
+      published: true,
+      eventId: `${videoEventId.slice(0, 8)}:${label}:${voteCount}:${createdAt}`,
+    }));
+    failDecisionWriteAfterPublish(deps);
+
+    const tick1 = await runCommunityLabelSweep(deps);
+    expect(deps.publishLabel).toHaveBeenCalledTimes(1);
+    expect(tick1.published).toBe(0);
+    expect(tick1.cursorAdvanced).toBe(false);
+
+    const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+
+    expect(deps.publishLabel).toHaveBeenCalledTimes(2);
+    const [call1, call2] = deps.publishLabel.mock.calls;
+    // Frozen at the claim (tick-1 now), replayed verbatim on the tick-2 retry
+    // even though the sweep clock advanced to NOW_SECONDS + 300.
+    expect(call1[0].createdAt).toBe(NOW_SECONDS);
+    expect(call2[0].createdAt).toBe(NOW_SECONDS);
+    expect(call2[0].voteCount).toBe(3);
+
+    expect(tick2.published).toBe(1);
+    expect(deps.db.decisions.size).toBe(1);
+    const decision = [...deps.db.decisions.values()][0];
+    expect(decision.status).toBe('confirmed');
+    expect(decision.published_event_id).toBe(`${VIDEO_ID.slice(0, 8)}:gambling:3:${NOW_SECONDS}`);
+  });
+
+  it('does not re-send the warning DM after a post-send bookkeeping failure', async () => {
+    // Warning DM sends, but recording it fails on tick 1. The claim-before-send
+    // pending row must block a second DM on the retry — trading a rare missed
+    // warning for never double-DMing the creator.
+    deps = makeDeps({ kvEntries: { strike_warning_count: '1' } });
+    failWarningWriteAfterSend(deps);
+
+    await runCommunityLabelSweep(deps);
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
+
+    deps.sendWarningDm.mockClear();
+    await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+    expect(deps.sendWarningDm).not.toHaveBeenCalled();
+  });
+
+  it('retries the warning DM on a later tick after a known soft send failure', async () => {
+    // A definitive {sent:false} means no DM went out, so re-sending is not a
+    // duplicate. The claim is released and the next tick re-sends — a soft
+    // relay/rate-limit blip must not permanently skip a warning level.
+    deps = makeDeps({ kvEntries: { strike_warning_count: '1' } });
+    deps.sendWarningDm.mockResolvedValueOnce({ sent: false, reason: 'rate limited' });
+
+    const tick1 = await runCommunityLabelSweep(deps);
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
+    expect(tick1.warned).toBe(0);
+    expect(tick1.cursorAdvanced).toBe(false);
+
+    const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(2);
+    expect(tick2.warned).toBe(1);
   });
 });

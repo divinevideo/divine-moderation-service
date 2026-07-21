@@ -7,12 +7,14 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   hasDecision,
-  recordDecision,
+  claimDecision,
+  confirmDecision,
   recordStrike,
   strikeCount,
-  warningSent,
-  recordWarning,
+  claimWarning,
+  confirmWarning,
   listStrikeSummary,
+  listStrikesForCreator,
 } from './d1.mjs';
 import { makeFakeCommunityD1 } from './test-helpers.mjs';
 
@@ -27,47 +29,50 @@ describe('decisions', () => {
   let db;
   beforeEach(() => { db = makeFakeCommunityD1(); });
 
-  it('hasDecision is false before recording and true after', async () => {
+  const claim = (overrides = {}) => claimDecision(db, {
+    videoEventId: VIDEO_A,
+    label: 'gambling',
+    voteCount: 3,
+    videoSha256: SHA,
+    creatorPubkey: CREATOR_1,
+    now: 1700000000,
+    ...overrides,
+  });
+
+  it('hasDecision is false while pending and true only after confirm', async () => {
     expect(await hasDecision(db, VIDEO_A, 'gambling')).toBe(false);
-    await recordDecision(db, {
-      videoEventId: VIDEO_A,
-      label: 'gambling',
-      voteCount: 3,
-      publishedEventId: PUBLISHED,
-      videoSha256: SHA,
-      creatorPubkey: CREATOR_1,
-      now: 1700000000,
-    });
+    await claim();
+    // A pending claim is not yet a decision — the publish-once guard must not
+    // treat it as one, or a crashed-mid-publish label would never be retried.
+    expect(await hasDecision(db, VIDEO_A, 'gambling')).toBe(false);
+    await confirmDecision(db, { videoEventId: VIDEO_A, label: 'gambling', publishedEventId: PUBLISHED });
     expect(await hasDecision(db, VIDEO_A, 'gambling')).toBe(true);
   });
 
-  it('recording the same (video,label) twice is a no-op', async () => {
-    const row = {
-      videoEventId: VIDEO_A,
-      label: 'gambling',
-      voteCount: 3,
-      publishedEventId: PUBLISHED,
-      videoSha256: SHA,
-      creatorPubkey: CREATOR_1,
-      now: 1700000000,
-    };
-    await recordDecision(db, row);
-    await recordDecision(db, { ...row, voteCount: 9 });
+  it('claimDecision freezes created_at and vote count across retries', async () => {
+    const first = await claim();
+    expect(first).toEqual({ createdAt: 1700000000, voteCount: 3 });
+    // A later tick with a higher vote count and a new clock must read back the
+    // ORIGINAL frozen fields so the replayed label event id is identical.
+    const second = await claim({ voteCount: 9, now: 1700000999 });
+    expect(second).toEqual({ createdAt: 1700000000, voteCount: 3 });
     expect(db.decisions.size).toBe(1);
-    expect([...db.decisions.values()][0].vote_count).toBe(3);
+  });
+
+  it('confirmDecision records the published id once and does not rewrite it', async () => {
+    await claim();
+    await confirmDecision(db, { videoEventId: VIDEO_A, label: 'gambling', publishedEventId: PUBLISHED });
+    // A re-confirm (e.g. a spurious later tick) must not overwrite the original
+    // published id — the UPDATE only flips a still-pending row.
+    await confirmDecision(db, { videoEventId: VIDEO_A, label: 'gambling', publishedEventId: 'd'.repeat(64) });
+    const decision = [...db.decisions.values()][0];
+    expect(decision.status).toBe('confirmed');
+    expect(decision.published_event_id).toBe(PUBLISHED);
   });
 
   it('different labels on the same video are separate decisions', async () => {
-    const base = {
-      videoEventId: VIDEO_A,
-      voteCount: 3,
-      publishedEventId: PUBLISHED,
-      videoSha256: SHA,
-      creatorPubkey: CREATOR_1,
-      now: 1700000000,
-    };
-    await recordDecision(db, { ...base, label: 'gambling' });
-    await recordDecision(db, { ...base, label: 'violence' });
+    await claim({ label: 'gambling' });
+    await claim({ label: 'violence' });
     expect(db.decisions.size).toBe(2);
   });
 });
@@ -91,11 +96,18 @@ describe('strikes and warnings', () => {
     expect(await strikeCount(db, CREATOR_1)).toBe(1);
   });
 
-  it('warningSent is false until recorded, then true for that level only', async () => {
-    expect(await warningSent(db, CREATOR_1, 1)).toBe(false);
-    await recordWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 5 });
-    expect(await warningSent(db, CREATOR_1, 1)).toBe(true);
-    expect(await warningSent(db, CREATOR_1, 2)).toBe(false);
+  it('claimWarning is granted once per level and blocks resends; confirmWarning marks it sent', async () => {
+    // First claim is granted (fresh); a second claim for the same level is
+    // refused — that refusal is what blocks a duplicate DM on a retry.
+    expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 5 })).toBe(true);
+    expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 6 })).toBe(false);
+    // A different escalation level is independently claimable.
+    expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 2, now: 7 })).toBe(true);
+
+    await confirmWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1 });
+    expect(db.warnings.get(`${CREATOR_1}:1`).status).toBe('sent');
+    // A sent claim still refuses a re-send.
+    expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 8 })).toBe(false);
   });
 
   it('listStrikeSummary ranks creators by strike count desc', async () => {
@@ -120,6 +132,36 @@ describe('strikes and warnings', () => {
       expect.objectContaining({ video_event_id: VIDEO_B, label: 'violence', created_at: 20 }),
     ]));
     expect(creator.recent).toHaveLength(2);
+  });
+
+  it('listStrikesForCreator pages a single creator in SQL, newest first, covering every row', async () => {
+    for (let i = 0; i < 25; i += 1) {
+      await recordStrike(db, {
+        creatorPubkey: CREATOR_1,
+        videoEventId: `${i}`.padEnd(64, 'a'),
+        label: 'gambling',
+        now: i,
+      });
+    }
+    // A second creator's strike must never leak into the drill-down.
+    await recordStrike(db, { creatorPubkey: CREATOR_2, videoEventId: VIDEO_B, label: 'violence', now: 999 });
+
+    const page1 = await listStrikesForCreator(db, { creatorPubkey: CREATOR_1, limit: 10, offset: 0 });
+    const page2 = await listStrikesForCreator(db, { creatorPubkey: CREATOR_1, limit: 10, offset: 10 });
+    const page3 = await listStrikesForCreator(db, { creatorPubkey: CREATOR_1, limit: 10, offset: 20 });
+
+    expect(page1).toHaveLength(10);
+    expect(page2).toHaveLength(10);
+    expect(page3).toHaveLength(5);
+
+    // Newest first: created_at descending, so the highest now (24) leads.
+    expect(page1[0]).toMatchObject({ video_event_id: '24'.padEnd(64, 'a'), label: 'gambling', created_at: 24 });
+
+    // The three pages together cover all 25 of this creator's rows with no
+    // gaps, no duplicates, and no other creator's rows.
+    const all = [...page1, ...page2, ...page3];
+    expect(new Set(all.map((row) => row.video_event_id)).size).toBe(25);
+    expect(all.every((row) => row.label === 'gambling')).toBe(true);
   });
 
   it('caps the per-creator evidence rows while keeping the true total count', async () => {

@@ -315,6 +315,55 @@ describe('publishLabelEvent (automated source)', () => {
     expect(metadata.verified).toBe(true);
   });
 
+  it('uses a provided createdAt so the same crossing rebuilds the same event id', async () => {
+    // The community sweep freezes created_at in its claim row and replays it
+    // on every retry so the label event id is stable and the relay dedups by
+    // id — no duplicate authoritative label can land after a partial failure.
+    const labelData = {
+      sha256: 'a'.repeat(64),
+      category: 'nudity',
+      status: 'confirmed',
+      score: 1,
+      source: 'community',
+      voteCount: 3,
+      nostrEventId: 'd'.repeat(64),
+      createdAt: 1700000000,
+    };
+
+    const first = withMockRelay(baseEnv());
+    await publishLabelEvent(labelData, first.env, first.mockRelay);
+    const eventA = first.mockRelay.publish.mock.calls[0][0];
+
+    const second = withMockRelay(baseEnv());
+    await publishLabelEvent(labelData, second.env, second.mockRelay);
+    const eventB = second.mockRelay.publish.mock.calls[0][0];
+
+    expect(eventA.created_at).toBe(1700000000);
+    expect(eventA.id).toBe(eventB.id);
+  });
+
+  it('a different createdAt yields a different event id (created_at drives dedup)', async () => {
+    const base = {
+      sha256: 'a'.repeat(64),
+      category: 'nudity',
+      status: 'confirmed',
+      score: 1,
+      source: 'community',
+      voteCount: 3,
+      nostrEventId: 'd'.repeat(64),
+    };
+
+    const first = withMockRelay(baseEnv());
+    await publishLabelEvent({ ...base, createdAt: 1700000000 }, first.env, first.mockRelay);
+    const eventA = first.mockRelay.publish.mock.calls[0][0];
+
+    const second = withMockRelay(baseEnv());
+    await publishLabelEvent({ ...base, createdAt: 1700000300 }, second.env, second.mockRelay);
+    const eventB = second.mockRelay.publish.mock.calls[0][0];
+
+    expect(eventA.id).not.toBe(eventB.id);
+  });
+
   it('automated rejected labels are still emitted as not-{label}', async () => {
     // Mirrors the human-moderator rejection shape — keeps the existing relay path
     // for "this is NOT category X" intact when an automated source disagrees.

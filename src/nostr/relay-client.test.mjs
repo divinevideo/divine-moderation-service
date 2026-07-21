@@ -619,4 +619,53 @@ describe('fetchNostrEventById', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('throws when throwOnTransient and relay returns 401 (auth blip is retryable)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 401 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and relay returns 403 (auth blip is retryable)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 403 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and a 2xx body is invalid JSON', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('not-json', { status: 200 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and a 2xx body is missing id/pubkey (malformed)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ kind: 34236, tags: [] }), { status: 200 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

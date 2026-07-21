@@ -20,11 +20,13 @@ import {
 } from './decision.mjs';
 import {
   hasDecision,
-  recordDecision,
+  claimDecision,
+  confirmDecision,
   recordStrike,
   strikeCount,
-  warningSent,
-  recordWarning,
+  claimWarning,
+  confirmWarning,
+  releaseWarning,
 } from './d1.mjs';
 import { VIDEO_KINDS } from '../nostr/video-kinds.mjs';
 
@@ -188,30 +190,39 @@ export async function runCommunityLabelSweep({
       const sha256 = sha256Of(videoEvent);
 
       for (const crossing of crossings) {
-        // Publish once: skip when an authoritative label already exists. But
-        // the strike (and warning below) are ensured independently every sweep
-        // — a strike that failed to land after its decision was recorded must
-        // be recoverable, not lost forever behind this publish-once dedup.
+        // Publish once: skip when a CONFIRMED authoritative label already
+        // exists. But the strike (and warning below) are ensured independently
+        // every sweep — a strike that failed to land after its decision was
+        // recorded must be recoverable, not lost forever behind this dedup.
         if (!(await hasDecision(db, target.eventId, crossing.label))) {
+          // Claim before send: persist a pending row with a frozen created_at
+          // and vote count BEFORE publishing, then publish deterministically
+          // from those frozen fields. A retry after a partial failure rebuilds
+          // the SAME event id, so the relay dedups it — no duplicate label.
+          const claim = await claimDecision(db, {
+            videoEventId: target.eventId,
+            label: crossing.label,
+            voteCount: crossing.voteCount,
+            videoSha256: sha256,
+            creatorPubkey: videoEvent.pubkey,
+            now,
+          });
           const publishResult = await publishLabel({
             videoEventId: target.eventId,
             sha256,
             label: crossing.label,
-            voteCount: crossing.voteCount,
+            voteCount: claim.voteCount,
+            createdAt: claim.createdAt,
           });
           if (!publishResult?.published) {
             videoClean = false;
             continue;
           }
 
-          await recordDecision(db, {
+          await confirmDecision(db, {
             videoEventId: target.eventId,
             label: crossing.label,
-            voteCount: crossing.voteCount,
             publishedEventId: publishResult.eventId ?? '',
-            videoSha256: sha256,
-            creatorPubkey: videoEvent.pubkey,
-            now,
           });
           summary.published += 1;
         }
@@ -241,17 +252,32 @@ export async function runCommunityLabelSweep({
       // exact count — otherwise a threshold-3 creator is warned at 3,4,5,…
       // instead of 3,6,9,…
       const warningLevel = Math.floor(strikes / warningCount);
-      if (warningLevel >= 1 && !(await warningSent(db, videoEvent.pubkey, warningLevel))) {
-        const dmResult = await sendWarningDm({
+      if (warningLevel >= 1) {
+        // Claim before send: only the tick that first creates the pending
+        // claim sends the DM. A pending-or-sent claim blocks a resend, so a
+        // crash or record failure after sending never double-DMs the creator.
+        const claimed = await claimWarning(db, {
           creatorPubkey: videoEvent.pubkey,
-          strikeCount: strikes,
-          videoSha256: sha256,
+          warningLevel,
+          now,
         });
-        if (dmResult?.sent) {
-          await recordWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel, now });
-          summary.warned += 1;
-        } else {
-          videoClean = false;
+        if (claimed) {
+          const dmResult = await sendWarningDm({
+            creatorPubkey: videoEvent.pubkey,
+            strikeCount: strikes,
+            videoSha256: sha256,
+          });
+          if (dmResult?.sent) {
+            await confirmWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel });
+            summary.warned += 1;
+          } else {
+            // Known failure: no DM went out, so release the claim to retry
+            // next tick (re-sending is not a duplicate). A crash after a
+            // successful send never reaches here, so its orphaned pending
+            // claim still blocks a resend.
+            await releaseWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel });
+            videoClean = false;
+          }
         }
       }
 

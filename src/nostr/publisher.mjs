@@ -332,10 +332,17 @@ function createLabelEvent(labelData, privateKeyHex) {
       : `${subject}: This content does NOT contain ${labelName} (was ${(score * 100).toFixed(0)}%)`;
   }
 
+  // A caller-supplied created_at makes the event id deterministic across
+  // retries (the community sweep freezes it in its claim row so the relay
+  // dedups a re-published label by id). Absent one, stamp the current time.
+  const createdAt = Number.isInteger(labelData.createdAt) && labelData.createdAt > 0
+    ? labelData.createdAt
+    : Math.floor(Date.now() / 1000);
+
   // Create unsigned event
   const unsignedEvent = {
     kind: 1985,  // NIP-32 label event
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: createdAt,
     tags,
     content
   };

@@ -47,7 +47,7 @@ import { sendModeratorReply, sendCommunityStrikeWarning, getCommunityStrikeWarni
 import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
 import { isEnabled as communityLabelsEnabled, SINCE_POLL_LIMIT as COMMUNITY_SINCE_POLL_LIMIT } from './community-labels/config.mjs';
 import { isDivineIdentity } from './community-labels/identity.mjs';
-import { listStrikeSummary } from './community-labels/d1.mjs';
+import { listStrikeSummary, listStrikesForCreator, strikeCount } from './community-labels/d1.mjs';
 import { fetchKind5WithRetry } from './creator-delete/funnelcake-fetch.mjs';
 import {
   listAgeRestrictedCandidates,
@@ -1911,6 +1911,46 @@ export default {
       return new Response(JSON.stringify({ creators }), {
         headers: JSON_HEADERS
       });
+    }
+
+    // Community strike drill-down (#180): every strike row behind one creator's
+    // count, paged in SQL so the summary's per-creator evidence cap stays fully
+    // auditable — a creator with more strikes than the cap is pageable here.
+    if (url.pathname.startsWith('/admin/api/community-strikes/')) {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to ${url.pathname}`);
+        return authError;
+      }
+
+      const creatorPubkey = decodeURIComponent(
+        url.pathname.slice('/admin/api/community-strikes/'.length)
+      );
+      if (!/^[0-9a-f]{64}$/i.test(creatorPubkey)) {
+        return new Response(JSON.stringify({ error: 'Invalid creator pubkey' }), {
+          status: 400,
+          headers: JSON_HEADERS
+        });
+      }
+
+      const pageSize = Math.min(Math.max(1, parseInt(url.searchParams.get('pageSize') || '50', 10) || 50), 200);
+      const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
+      const offset = (page - 1) * pageSize;
+
+      const total = await strikeCount(env.BLOSSOM_DB, creatorPubkey);
+      const strikes = await listStrikesForCreator(env.BLOSSOM_DB, {
+        creatorPubkey,
+        limit: pageSize,
+        offset
+      });
+      return new Response(JSON.stringify({
+        creator_pubkey: creatorPubkey,
+        page,
+        page_size: pageSize,
+        total,
+        has_more: offset + strikes.length < total,
+        strikes
+      }), { headers: JSON_HEADERS });
     }
 
     // Get untriaged (unmoderated) videos from D1
@@ -5277,7 +5317,7 @@ async function runMigration() {
             fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
             fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env, { throwOnTransient: true }),
             isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV, throwOnTransient: true }),
-            publishLabel: async ({ videoEventId, sha256, label, voteCount }) => {
+            publishLabel: async ({ videoEventId, sha256, label, voteCount, createdAt }) => {
               const result = await publishLabelEvent({
                 sha256,
                 category: label,
@@ -5286,6 +5326,7 @@ async function runMigration() {
                 source: 'community',
                 voteCount,
                 nostrEventId: videoEventId,
+                createdAt,
               }, env);
               return { published: result.published === true, eventId: result.eventId };
             },

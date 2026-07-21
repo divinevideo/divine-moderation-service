@@ -521,13 +521,22 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
       }
       const response = await fetch(`${apiBaseUrl}/api/event/${eventId}`, { headers });
       if (!response.ok) {
-        const isTransient = response.status >= 500 || response.status === 429;
-        if (!isTransient) anyDefinitiveResponse = true;
+        // Only a genuine 404 is a definitive "not found". 401/403 (auth
+        // blips), 5xx, and 429 are transient and must be retried, not read
+        // as "event absent" — otherwise the sweep advances its watermark
+        // past votes it never actually resolved.
+        if (response.status === 404) anyDefinitiveResponse = true;
         continue;
       }
-      anyDefinitiveResponse = true;
+      // A 2xx counts as definitive only once we have a real event body.
+      // Invalid JSON throws into the catch below (transient); a malformed
+      // 2xx missing id/pubkey falls through to `continue` (transient).
+      // Neither is treated as "event absent".
       const event = await response.json();
-      if (event?.id && event?.pubkey) return event;
+      if (event?.id && event?.pubkey) {
+        anyDefinitiveResponse = true;
+        return event;
+      }
     } catch {
       continue;
     }

@@ -30,11 +30,30 @@ export function makeFakeCommunityD1() {
           return this;
         },
         async run() {
+          if (this._sql.includes('UPDATE') && this._sql.includes('community_label_decisions')) {
+            const [published_event_id, video_event_id, label] = this._binds;
+            const row = decisions.get(`${video_event_id}:${label}`);
+            if (row && row.status === 'pending') {
+              row.status = 'confirmed';
+              row.published_event_id = published_event_id;
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
+          }
+          if (this._sql.includes('UPDATE') && this._sql.includes('community_strike_warnings')) {
+            const [creator_pubkey, warning_level] = this._binds;
+            const row = warnings.get(`${creator_pubkey}:${warning_level}`);
+            if (row && row.status === 'pending') {
+              row.status = 'sent';
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
+          }
           if (this._sql.includes('INSERT') && this._sql.includes('community_label_decisions')) {
             const [video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at] = this._binds;
             const key = `${video_event_id}:${label}`;
             if (decisions.has(key)) return { meta: { changes: 0 } };
-            decisions.set(key, { video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at });
+            decisions.set(key, { video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at, status: 'pending' });
             return { meta: { changes: 1 } };
           }
           if (this._sql.includes('INSERT') && this._sql.includes('community_strikes')) {
@@ -48,15 +67,29 @@ export function makeFakeCommunityD1() {
             const [creator_pubkey, warning_level, sent_at] = this._binds;
             const key = `${creator_pubkey}:${warning_level}`;
             if (warnings.has(key)) return { meta: { changes: 0 } };
-            warnings.set(key, { creator_pubkey, warning_level, sent_at });
+            warnings.set(key, { creator_pubkey, warning_level, sent_at, status: 'pending' });
             return { meta: { changes: 1 } };
+          }
+          if (this._sql.includes('DELETE') && this._sql.includes('community_strike_warnings')) {
+            const [creator_pubkey, warning_level] = this._binds;
+            const key = `${creator_pubkey}:${warning_level}`;
+            const row = warnings.get(key);
+            if (row && row.status === 'pending') {
+              warnings.delete(key);
+              return { meta: { changes: 1 } };
+            }
+            return { meta: { changes: 0 } };
           }
           return { meta: { changes: 0 } };
         },
         async first() {
           if (this._sql.includes('community_label_decisions')) {
             const [video_event_id, label] = this._binds;
-            return decisions.get(`${video_event_id}:${label}`) || null;
+            const row = decisions.get(`${video_event_id}:${label}`) || null;
+            if (row && this._sql.includes("status = 'confirmed'") && row.status !== 'confirmed') {
+              return null;
+            }
+            return row;
           }
           if (this._sql.includes('COUNT(*)') && this._sql.includes('community_strikes')) {
             const [creator_pubkey] = this._binds;
@@ -73,6 +106,19 @@ export function makeFakeCommunityD1() {
           return null;
         },
         async all() {
+          if (this._sql.includes('community_strikes') && this._sql.includes('OFFSET ?')) {
+            const [creator_pubkey, limit, offset] = this._binds;
+            const results = [...strikes.values()]
+              .filter((row) => row.creator_pubkey === creator_pubkey)
+              .sort((a, b) => b.created_at - a.created_at)
+              .slice(offset, offset + limit)
+              .map((row) => ({
+                video_event_id: row.video_event_id,
+                label: row.label,
+                created_at: row.created_at,
+              }));
+            return { results };
+          }
           if (this._sql.includes('GROUP BY creator_pubkey')) {
             const [limit] = this._binds;
             const byCreator = new Map();
