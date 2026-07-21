@@ -43,7 +43,7 @@ import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
 import { runCreatorDeleteCron } from './creator-delete/cron.mjs';
-import { sendModeratorReply as sendModeratorReplyDm, getModeratorKeys } from './nostr/dm-sender.mjs';
+import { sendModeratorReply as sendModeratorReplyDm, sendCommunityStrikeWarning, getModeratorKeys } from './nostr/dm-sender.mjs';
 import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
 import { isEnabled as communityLabelsEnabled, SINCE_POLL_LIMIT as COMMUNITY_SINCE_POLL_LIMIT } from './community-labels/config.mjs';
 import { isDivineIdentity } from './community-labels/identity.mjs';
@@ -5277,7 +5277,7 @@ async function runMigration() {
             fetchLabelsSince: (since) => fetchLabelEventsSince(since, relayUrl, env, { limit: COMMUNITY_SINCE_POLL_LIMIT }),
             fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
             fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env, { throwOnTransient: true }),
-            isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV }),
+            isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV, throwOnTransient: true }),
             publishLabel: async ({ videoEventId, sha256, label, voteCount }) => {
               const result = await publishLabelEvent({
                 sha256,
@@ -5292,7 +5292,7 @@ async function runMigration() {
             },
             sendWarningDm: async ({ creatorPubkey, strikeCount, videoSha256 }) => {
               const message = `Heads up from Divine moderation: your account has ${strikeCount} content-warning strikes. Community consensus applied warning labels to videos you posted without them. Please add content warnings when sharing sensitive content. Repeated omissions are reviewed by our moderators and can lead to account restrictions.`;
-              return sendModeratorReplyDm(creatorPubkey, message, videoSha256, env, ctx);
+              return sendCommunityStrikeWarning(creatorPubkey, message, videoSha256, env, ctx);
             },
             moderationPubkey,
           });

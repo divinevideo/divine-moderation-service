@@ -92,10 +92,10 @@ describe('strikes and warnings', () => {
   });
 
   it('warningSent is false until recorded, then true for that level only', async () => {
-    expect(await warningSent(db, CREATOR_1, 3)).toBe(false);
-    await recordWarning(db, { creatorPubkey: CREATOR_1, strikeCount: 3, now: 5 });
-    expect(await warningSent(db, CREATOR_1, 3)).toBe(true);
-    expect(await warningSent(db, CREATOR_1, 6)).toBe(false);
+    expect(await warningSent(db, CREATOR_1, 1)).toBe(false);
+    await recordWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 5 });
+    expect(await warningSent(db, CREATOR_1, 1)).toBe(true);
+    expect(await warningSent(db, CREATOR_1, 2)).toBe(false);
   });
 
   it('listStrikeSummary ranks creators by strike count desc', async () => {
@@ -105,5 +105,37 @@ describe('strikes and warnings', () => {
     const summary = await listStrikeSummary(db, { limit: 10 });
     expect(summary[0]).toMatchObject({ creator_pubkey: CREATOR_2, strikes: 2 });
     expect(summary[1]).toMatchObject({ creator_pubkey: CREATOR_1, strikes: 1 });
+  });
+
+  it('listStrikeSummary attaches the strike rows behind each creator', async () => {
+    await recordStrike(db, { creatorPubkey: CREATOR_1, videoEventId: VIDEO_A, label: 'gambling', now: 10 });
+    await recordStrike(db, { creatorPubkey: CREATOR_1, videoEventId: VIDEO_B, label: 'violence', now: 20 });
+
+    const summary = await listStrikeSummary(db, { limit: 10 });
+    const creator = summary.find((row) => row.creator_pubkey === CREATOR_1);
+
+    expect(creator.strikes).toBe(2);
+    expect(creator.recent).toEqual(expect.arrayContaining([
+      expect.objectContaining({ video_event_id: VIDEO_A, label: 'gambling', created_at: 10 }),
+      expect.objectContaining({ video_event_id: VIDEO_B, label: 'violence', created_at: 20 }),
+    ]));
+    expect(creator.recent).toHaveLength(2);
+  });
+
+  it('caps the per-creator evidence rows while keeping the true total count', async () => {
+    for (let i = 0; i < 25; i += 1) {
+      await recordStrike(db, {
+        creatorPubkey: CREATOR_1,
+        videoEventId: `${i}`.padEnd(64, 'a'),
+        label: 'gambling',
+        now: i,
+      });
+    }
+
+    const summary = await listStrikeSummary(db, { limit: 10, detailPerCreator: 20 });
+    const creator = summary.find((row) => row.creator_pubkey === CREATOR_1);
+
+    expect(creator.strikes).toBe(25);
+    expect(creator.recent).toHaveLength(20);
   });
 });

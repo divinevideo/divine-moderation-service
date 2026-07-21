@@ -55,7 +55,13 @@ async function queryRelay(relayUrl, filter, env = {}, options = {}) {
     let ws;
     let settled = false;
     let subscriptionId = null;
+    let eoseReceived = false;
     const collectAll = Boolean(options.collectAll);
+    // When set (opt-in), a socket close before EOSE rejects instead of
+    // resolving with a partial result — so a truncated/dropped stream becomes
+    // a transient failure the caller can retry, not a silent below-threshold
+    // read. Only meaningful with collectAll.
+    const rejectOnPrematureClose = Boolean(options.rejectOnPrematureClose);
     const events = [];
     let firstEvent = null;
     const timeout = setTimeout(() => {
@@ -122,6 +128,7 @@ async function queryRelay(relayUrl, filter, env = {}, options = {}) {
           }
 
           if (data[0] === 'EOSE' && data[1] === subscriptionId) {
+            eoseReceived = true;
             try {
               ws.close();
             } catch {}
@@ -137,6 +144,10 @@ async function queryRelay(relayUrl, filter, env = {}, options = {}) {
       });
 
       ws.addEventListener('close', () => {
+        if (collectAll && rejectOnPrematureClose && !eoseReceived) {
+          finish(new Error('WebSocket closed before EOSE'));
+          return;
+        }
         finish(collectAll ? events : firstEvent);
       });
 
@@ -460,7 +471,9 @@ export async function fetchKind5EventsSince(sinceSeconds, relayUrl = 'wss://rela
 export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://relay.divine.video', env = {}, { limit } = {}) {
   const filter = { kinds: [1985], since: sinceSeconds };
   if (Number.isInteger(limit) && limit > 0) filter.limit = limit;
-  return queryRelay(relayUrl, filter, env, { collectAll: true });
+  // Strict: a close before EOSE is a truncated poll, not a complete window.
+  // Rejecting holds the sweep cursor rather than advancing past unseen votes.
+  return queryRelay(relayUrl, filter, env, { collectAll: true, rejectOnPrematureClose: true });
 }
 
 /**
@@ -469,10 +482,12 @@ export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://rela
  */
 export async function fetchLabelEventsForVideo({ eventId, addressableId }, relayUrl = 'wss://relay.divine.video', env = {}) {
   const byId = new Map();
-  const viaE = await queryRelay(relayUrl, { kinds: [1985], '#e': [eventId] }, env, { collectAll: true });
+  // Strict: a truncated per-video tally must fail (and hold the cursor), not
+  // silently under-count and let a below-threshold read advance the watermark.
+  const viaE = await queryRelay(relayUrl, { kinds: [1985], '#e': [eventId] }, env, { collectAll: true, rejectOnPrematureClose: true });
   for (const event of viaE) byId.set(event.id, event);
   if (addressableId) {
-    const viaA = await queryRelay(relayUrl, { kinds: [1985], '#a': [addressableId] }, env, { collectAll: true });
+    const viaA = await queryRelay(relayUrl, { kinds: [1985], '#a': [addressableId] }, env, { collectAll: true, rejectOnPrematureClose: true });
     for (const event of viaA) byId.set(event.id, event);
   }
   return [...byId.values()];

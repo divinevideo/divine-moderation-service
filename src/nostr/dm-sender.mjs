@@ -7,6 +7,7 @@
 import { wrapEvent } from 'nostr-tools/nip17';
 import { hexToBytes } from '@noble/hashes/utils';
 import { getPublicKey } from 'nostr-tools/pure';
+import { logDm, computeConversationId } from './dm-store.mjs';
 
 // Cache moderator keys per env object to avoid re-decoding
 const keyCache = new WeakMap();
@@ -820,18 +821,24 @@ export async function notifyReporters(sha256, action, env, logPrefix = '[DM]') {
 }
 
 /**
- * Send a free-form moderator reply DM to a user.
- * Used from the admin dashboard for manual responses to appeals.
- * Never throws.
+ * Send a free-form moderator DM to a user, recording it under a specific
+ * audit messageType. Shared by the manual moderator-reply and automated
+ * community-warning paths so the two are distinguishable in the DM/audit
+ * trail. Never throws.
  *
  * @param {string} recipientPubkey - Hex pubkey of the recipient
  * @param {string} message - Free-form message text
  * @param {string} sha256 - Video hash (for conversation threading)
  * @param {Object} env
  * @param {Object} ctx
+ * @param {string} messageType - Audit type persisted with the DM
+ * @param {Function} wrap - NIP-17 gift-wrap fn; injectable so tests can drive
+ *   the send deterministically without the real per-call crypto (a module-level
+ *   mock of the transport does not reliably isolate in the single-worker pool —
+ *   same rationale as publishDmInboxRelayList's `connect` seam).
  * @returns {Promise<{ sent: boolean, reason?: string }>}
  */
-export async function sendModeratorReply(recipientPubkey, message, sha256, env, ctx) {
+async function sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, messageType, wrap) {
   try {
     if (!recipientPubkey || typeof recipientPubkey !== 'string') {
       return { sent: false, reason: 'Invalid recipient pubkey' };
@@ -844,7 +851,7 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
     try {
       keys = getModeratorKeys(env);
     } catch (err) {
-      console.error('[DM] Cannot send moderator reply:', err.message);
+      console.error('[DM] Cannot send moderator message:', err.message);
       return { sent: false, reason: err.message };
     }
 
@@ -853,7 +860,7 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
       return { sent: false, reason: 'Rate limited' };
     }
 
-    const wrappedEvent = wrapEvent(
+    const wrappedEvent = wrap(
       keys.privateKey,
       { publicKey: recipientPubkey },
       message.trim()
@@ -868,9 +875,10 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
 
     await recordRateLimit(recipientPubkey, env);
 
-    // Log to DM store
+    // Audit-log the send under its messageType. Static import (not a runtime
+    // import()) so the audit path is reliable and observable; a log failure
+    // must never break the send (graceful degradation).
     try {
-      const { logDm, computeConversationId } = await import('./dm-store.mjs');
       const conversationId = computeConversationId(keys.publicKey, recipientPubkey);
       const logPromise = logDm(env.BLOSSOM_DB, {
         conversationId,
@@ -878,7 +886,7 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
         direction: 'outgoing',
         senderPubkey: keys.publicKey,
         recipientPubkey,
-        messageType: 'moderator_reply',
+        messageType,
         content: message.trim(),
         nostrEventId: wrappedEvent.id,
       }).catch((err) => console.error('[DM] Failed to log DM:', err.message));
@@ -888,13 +896,50 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
         await logPromise;
       }
     } catch (err) {
-      console.log('[DM] DM store not available, skipping log');
+      console.error('[DM] Failed to log DM:', err.message);
     }
 
-    console.log(`[DM] Sent moderator reply to ${recipientPubkey.substring(0, 16)}...${sha256 ? ` for ${sha256.substring(0, 16)}...` : ''} (${success} relays)`);
+    console.log(`[DM] Sent ${messageType} to ${recipientPubkey.substring(0, 16)}...${sha256 ? ` for ${sha256.substring(0, 16)}...` : ''} (${success} relays)`);
     return { sent: true, relaysPublished: success };
   } catch (err) {
-    console.error('[DM] Unexpected error sending moderator reply:', err.message);
+    console.error('[DM] Unexpected error sending moderator message:', err.message);
     return { sent: false, reason: err.message };
   }
+}
+
+/**
+ * Send a free-form moderator reply DM to a user.
+ * Used from the admin dashboard for manual responses to appeals.
+ * Never throws.
+ *
+ * @param {string} recipientPubkey - Hex pubkey of the recipient
+ * @param {string} message - Free-form message text
+ * @param {string} sha256 - Video hash (for conversation threading)
+ * @param {Object} env
+ * @param {Object} ctx
+ * @param {Object} [opts]
+ * @param {Function} [opts.wrap] - Gift-wrap test seam (defaults to real wrapEvent).
+ * @returns {Promise<{ sent: boolean, reason?: string }>}
+ */
+export async function sendModeratorReply(recipientPubkey, message, sha256, env, ctx, { wrap = wrapEvent } = {}) {
+  return sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 'moderator_reply', wrap);
+}
+
+/**
+ * Send an automated community-strike warning DM to a creator.
+ * Recorded under a distinct 'community_warning' audit type so the automated
+ * consensus warnings are separable from manual moderator appeal replies.
+ * Never throws.
+ *
+ * @param {string} recipientPubkey - Hex pubkey of the creator
+ * @param {string} message - Warning text
+ * @param {string} sha256 - Video hash (for conversation threading)
+ * @param {Object} env
+ * @param {Object} ctx
+ * @param {Object} [opts]
+ * @param {Function} [opts.wrap] - Gift-wrap test seam (defaults to real wrapEvent).
+ * @returns {Promise<{ sent: boolean, reason?: string }>}
+ */
+export async function sendCommunityStrikeWarning(recipientPubkey, message, sha256, env, ctx, { wrap = wrapEvent } = {}) {
+  return sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 'community_warning', wrap);
 }

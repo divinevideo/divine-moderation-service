@@ -82,7 +82,15 @@ export function decideCrossings(votesByLabel, divineByAuthor, threshold) {
 export function creatorSelfLabels(videoEvent) {
   const labels = new Set();
   for (const tag of videoEvent?.tags ?? []) {
-    if (!Array.isArray(tag) || tag.length < 2) continue;
+    if (!Array.isArray(tag) || tag.length < 1) continue;
+    // A NIP-36 content-warning tag with no reason, or a free-text reason that
+    // is not itself a known label, is the creator generically flagging the
+    // video as sensitive: credit the generic `content-warning` self-label.
+    if (tag[0] === 'content-warning' && (tag.length < 2 || normalizeLabel(tag[1]) === null)) {
+      labels.add(NAMESPACE);
+      continue;
+    }
+    if (tag.length < 2) continue;
     let value = null;
     if (tag[0] === 'l' && tag[2] === NAMESPACE) value = tag[1];
     if (tag[0] === 'content-warning') value = tag[1];

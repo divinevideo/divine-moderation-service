@@ -160,6 +160,31 @@ describe('creatorSelfLabels', () => {
     expect(creatorSelfLabels(video)).toEqual(new Set(['violence']));
   });
 
+  it('credits a bare content-warning tag as the generic content-warning self-label', () => {
+    // NIP-36 allows a reason-less ['content-warning'] tag: the creator has
+    // generically flagged the video as sensitive. The tag.length < 2 guard
+    // used to drop it silently.
+    const video = {
+      id: 'f'.repeat(64),
+      pubkey: CREATOR,
+      kind: 34236,
+      tags: [['content-warning']],
+    };
+    expect(creatorSelfLabels(video)).toEqual(new Set(['content-warning']));
+  });
+
+  it('credits generic content-warning when the reason does not map to a label', () => {
+    // ['content-warning', '<free-text reason>'] is still a generic warning, not
+    // a specific label — credit the generic content-warning.
+    const video = {
+      id: 'f'.repeat(64),
+      pubkey: CREATOR,
+      kind: 34236,
+      tags: [['content-warning', 'may be disturbing to some viewers']],
+    };
+    expect(creatorSelfLabels(video)).toEqual(new Set(['content-warning']));
+  });
+
   it('is empty for an unlabeled video', () => {
     expect(creatorSelfLabels({ tags: [] })).toEqual(new Set());
   });
@@ -183,5 +208,24 @@ describe('strikesFor', () => {
     expect(
       strikesFor([{ label: 'nudity', voteCount: 3 }], new Set(['nudity'])),
     ).toEqual([]);
+  });
+
+  it('does not strike a generic crossing when the creator bare-self-labeled', () => {
+    // Community consensus was the generic content-warning; the creator already
+    // generically flagged the video, so no strike.
+    const selfLabels = creatorSelfLabels({ tags: [['content-warning']] });
+    expect(
+      strikesFor([{ label: 'content-warning', voteCount: 3 }], selfLabels),
+    ).toEqual([]);
+  });
+
+  it('strikes an unmatched specific label even when the creator only generically self-warned', () => {
+    // A bare content-warning self-label credits only the generic label, so a
+    // specific community crossing (e.g. gambling) the creator never named still
+    // strikes.
+    const selfLabels = creatorSelfLabels({ tags: [['content-warning']] });
+    expect(
+      strikesFor([{ label: 'gambling', voteCount: 3 }], selfLabels),
+    ).toEqual([{ label: 'gambling' }]);
   });
 });

@@ -14,6 +14,8 @@ import {
   checkRateLimit,
   discoverUserRelays,
   sendModerationDM,
+  sendModeratorReply,
+  sendCommunityStrikeWarning,
   selectTemplate,
   notifyReporters,
   COMPOSE_TEMPLATES,
@@ -659,6 +661,111 @@ describe('discoverUserRelays — Workers WebSocket construction', () => {
 
     expect(ctorArgs.length).toBeGreaterThan(0);
     ctorArgs.forEach((args) => expect(args).toHaveLength(1));
+  });
+});
+
+describe('community-warning vs moderator-reply audit trail (#180)', () => {
+  const recipient = 'a'.repeat(64);
+  const originalWebSocket = globalThis.WebSocket;
+  // dm-store logDm binds message_type at position 5 (conversation_id, sha256,
+  // direction, sender_pubkey, recipient_pubkey, message_type, ...).
+  const MESSAGE_TYPE_BIND_INDEX = 5;
+  let env;
+  let loggedInserts;
+
+  // Gift-wrap seam: a plain event (real wrapEvent's per-call crypto wedges the
+  // pool). Its id is echoed back by the fake publish socket below.
+  const fakeWrap = () => ({
+    id: 'e'.repeat(64),
+    kind: 1059,
+    pubkey: 'f'.repeat(64),
+    created_at: 1,
+    tags: [['p', 'a'.repeat(64)]],
+    content: 'wrapped',
+    sig: '0'.repeat(128),
+  });
+
+  // Capture the real dm-store INSERT so we can read the audit message_type
+  // without mocking the module (a mocked dynamic import wedges the pool
+  // worker's RPC in this environment).
+  function capturingDb() {
+    return {
+      prepare(sql) {
+        return {
+          _sql: sql,
+          _binds: [],
+          bind(...args) { this._binds = args; return this; },
+          async first() { return null; },
+          async run() {
+            if (this._sql.includes('INSERT INTO dm_log')) {
+              loggedInserts.push(this._binds);
+            }
+            return { meta: { changes: 1 } };
+          },
+          async all() { return { results: [] }; },
+        };
+      },
+    };
+  }
+
+  beforeEach(() => {
+    loggedInserts = [];
+    // Seed the relay-list cache so discoverUserRelays resolves without a
+    // WebSocket, and swap in a publish socket that acknowledges the wrapped
+    // event.
+    // Use the reserved-domain relay the working publishToRelays test uses:
+    // under vitest-pool-workers, constructing a socket to the real
+    // relay.divine.video host wedges the worker's RPC even with a fake
+    // WebSocket, whereas relay.example.com resolves nowhere and stays local.
+    env = {
+      NOSTR_PRIVATE_KEY: testHex,
+      BLOSSOM_DB: capturingDb(),
+      MODERATION_KV: createMockKV({
+        [`relay-list:${recipient}`]: JSON.stringify(['wss://relay.example.com']),
+      }),
+    };
+    class FakeWS {
+      constructor() {
+        this._cbs = {};
+        queueMicrotask(() => this._cbs.open && this._cbs.open());
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send(msg) {
+        // Acknowledge synchronously within send (a queued reply wedges the
+        // pool worker for this send path).
+        const parsed = JSON.parse(msg);
+        if (parsed[0] === 'EVENT') {
+          this._cbs.message
+            && this._cbs.message({ data: JSON.stringify(['OK', parsed[1].id, true, '']) });
+        }
+      }
+      close() {}
+    }
+    globalThis.WebSocket = FakeWS;
+  });
+
+  afterEach(() => { globalThis.WebSocket = originalWebSocket; });
+
+  it('records the community strike warning with a distinct community_warning type', async () => {
+    const result = await sendCommunityStrikeWarning(
+      recipient, 'You have 3 content-warning strikes.', 'f'.repeat(64), env, null,
+      { wrap: fakeWrap },
+    );
+
+    expect(result.sent).toBe(true);
+    expect(loggedInserts).toHaveLength(1);
+    expect(loggedInserts[0][MESSAGE_TYPE_BIND_INDEX]).toBe('community_warning');
+  });
+
+  it('keeps the manual moderator reply as moderator_reply', async () => {
+    const result = await sendModeratorReply(
+      recipient, 'Manual appeal response.', 'f'.repeat(64), env, null,
+      { wrap: fakeWrap },
+    );
+
+    expect(result.sent).toBe(true);
+    expect(loggedInserts).toHaveLength(1);
+    expect(loggedInserts[0][MESSAGE_TYPE_BIND_INDEX]).toBe('moderator_reply');
   });
 });
 

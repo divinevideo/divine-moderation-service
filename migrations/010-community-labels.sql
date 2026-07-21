@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS community_strikes (
 
 CREATE TABLE IF NOT EXISTS community_strike_warnings (
   creator_pubkey  TEXT    NOT NULL,
-  strike_count    INTEGER NOT NULL,
+  warning_level   INTEGER NOT NULL,
   sent_at         INTEGER NOT NULL,
-  PRIMARY KEY (creator_pubkey, strike_count)
+  PRIMARY KEY (creator_pubkey, warning_level)
 );

@@ -28,18 +28,29 @@ import {
 } from './d1.mjs';
 
 const HEX64 = /^[0-9a-f]{64}$/;
+const VIDEO_KINDS = new Set([34235, 34236]);
 
-function targetsOf(labelEvent) {
-  let eventId = null;
-  let addressableId = null;
+// Touched-video detection keys on the vote's `e` (event id) target only. The
+// vote's `a` tag is deliberately ignored here: it is attacker-controlled, so
+// the per-video tally derives the addressable id from the fetched video event
+// itself (see addressableIdOf) rather than trusting the vote.
+function eventIdOf(labelEvent) {
   for (const tag of labelEvent.tags ?? []) {
     if (!Array.isArray(tag) || tag.length < 2) continue;
-    if (tag[0] === 'e' && HEX64.test(tag[1] ?? '')) eventId = tag[1];
-    if (tag[0] === 'a' && typeof tag[1] === 'string' && tag[1].includes(':')) {
-      addressableId = tag[1];
+    if (tag[0] === 'e' && HEX64.test(tag[1] ?? '')) return tag[1];
+  }
+  return null;
+}
+
+// The NIP-01 addressable coordinate (`kind:pubkey:dTag`) built from the fetched
+// video's own tags. Null when the video carries no usable `d` tag.
+function addressableIdOf(videoEvent) {
+  for (const tag of videoEvent.tags ?? []) {
+    if (Array.isArray(tag) && tag[0] === 'd' && typeof tag[1] === 'string' && tag[1] !== '') {
+      return `${videoEvent.kind}:${videoEvent.pubkey}:${tag[1]}`;
     }
   }
-  return { eventId, addressableId };
+  return null;
 }
 
 function sha256Of(videoEvent) {
@@ -110,23 +121,19 @@ export async function runCommunityLabelSweep({
 
   // Group new votes by target video with each video's earliest new vote;
   // the tally itself is recomputed from a full per-video fetch below so it
-  // is complete, not incremental.
-  const touched = new Map(); // eventId -> { eventId, addressableId, earliestVoteAt }
+  // is complete, not incremental. The whole downstream is event-id-keyed
+  // (fetchVideoEvent by id, decision PK on video_event_id), so a vote with no
+  // `e` has no concrete event to label; the mobile client always co-tags
+  // `e`+`a`, so real votes carry an `e`.
+  const touched = new Map(); // eventId -> { eventId, earliestVoteAt }
   for (const vote of newVotes) {
     if (vote?.pubkey === moderationPubkey) continue;
-    const target = targetsOf(vote);
-    // Touched-video detection keys on the `e` (event id) target only,
-    // though the per-video tally below fetches both `e` and `a`. The whole
-    // downstream is event-id-keyed (fetchVideoEvent by id, decision PK on
-    // video_event_id), so an `a`-only vote has no concrete event to label;
-    // the mobile client always co-tags `e`+`a`, so real votes carry an `e`.
-    if (target.eventId === null) continue;
+    const eventId = eventIdOf(vote);
+    if (eventId === null) continue;
     const createdAt = Number.isInteger(vote?.created_at) ? vote.created_at : now;
-    const existing = touched.get(target.eventId)
-      ?? { eventId: target.eventId, addressableId: null, earliestVoteAt: createdAt };
-    existing.addressableId ??= target.addressableId;
+    const existing = touched.get(eventId) ?? { eventId, earliestVoteAt: createdAt };
     existing.earliestVoteAt = Math.min(existing.earliestVoteAt, createdAt);
-    touched.set(target.eventId, existing);
+    touched.set(eventId, existing);
   }
 
   const targets = [...touched.values()].sort((a, b) => a.earliestVoteAt - b.earliestVoteAt);
@@ -145,7 +152,23 @@ export async function runCommunityLabelSweep({
         continue;
       }
 
-      const allVotes = (await fetchLabelsForVideo(target)) ?? [];
+      // Trust boundary: the vote's `e` is attacker-controlled, so confirm the
+      // fetched event is actually a Divine video before labeling it. A wrong
+      // kind is a genuine non-target (not a transient failure): sweep it
+      // without holding the cursor.
+      if (!VIDEO_KINDS.has(videoEvent.kind)) {
+        summary.swept += 1;
+        continue;
+      }
+
+      // Derive the addressable id from the fetched video's OWN tags, never the
+      // vote's attacker-controlled `a` tag — otherwise a forged vote could pair
+      // a victim's `e` with another video's already-crossed `a` and borrow its
+      // consensus into the victim's tally.
+      const allVotes = (await fetchLabelsForVideo({
+        eventId: target.eventId,
+        addressableId: addressableIdOf(videoEvent),
+      })) ?? [];
       const votesByLabel = extractVotes(allVotes, {
         moderationPubkey,
         creatorPubkey: videoEvent.pubkey,
@@ -165,50 +188,67 @@ export async function runCommunityLabelSweep({
       const sha256 = sha256Of(videoEvent);
 
       for (const crossing of crossings) {
-        if (await hasDecision(db, target.eventId, crossing.label)) continue;
+        // Publish once: skip when an authoritative label already exists. But
+        // the strike (and warning below) are ensured independently every sweep
+        // — a strike that failed to land after its decision was recorded must
+        // be recoverable, not lost forever behind this publish-once dedup.
+        if (!(await hasDecision(db, target.eventId, crossing.label))) {
+          const publishResult = await publishLabel({
+            videoEventId: target.eventId,
+            sha256,
+            label: crossing.label,
+            voteCount: crossing.voteCount,
+          });
+          if (!publishResult?.published) {
+            videoClean = false;
+            continue;
+          }
 
-        const publishResult = await publishLabel({
-          videoEventId: target.eventId,
-          sha256,
-          label: crossing.label,
-          voteCount: crossing.voteCount,
-        });
-        if (!publishResult?.published) {
-          videoClean = false;
-          continue;
-        }
-
-        await recordDecision(db, {
-          videoEventId: target.eventId,
-          label: crossing.label,
-          voteCount: crossing.voteCount,
-          publishedEventId: publishResult.eventId ?? '',
-          videoSha256: sha256,
-          creatorPubkey: videoEvent.pubkey,
-          now,
-        });
-        summary.published += 1;
-
-        if (strikesFor([crossing], selfLabels).length > 0) {
-          await recordStrike(db, {
-            creatorPubkey: videoEvent.pubkey,
+          await recordDecision(db, {
             videoEventId: target.eventId,
             label: crossing.label,
+            voteCount: crossing.voteCount,
+            publishedEventId: publishResult.eventId ?? '',
+            videoSha256: sha256,
+            creatorPubkey: videoEvent.pubkey,
             now,
           });
-          summary.strikes += 1;
+          summary.published += 1;
+        }
+
+        // Ensure the strike idempotently regardless of whether the decision was
+        // recorded this tick or a prior one. The (creator,video,label) PK makes
+        // re-insertion a no-op, so this can't double-count; a failure holds the
+        // cursor so the next tick retries.
+        if (strikesFor([crossing], selfLabels).length > 0) {
+          try {
+            const inserted = await recordStrike(db, {
+              creatorPubkey: videoEvent.pubkey,
+              videoEventId: target.eventId,
+              label: crossing.label,
+              now,
+            });
+            if (inserted) summary.strikes += 1;
+          } catch (error) {
+            console.log(`[COMMUNITY-LABELS] strike ensure failed for ${target.eventId}/${crossing.label}: ${error?.message ?? error}`);
+            videoClean = false;
+          }
         }
       }
 
       const strikes = await strikeCount(db, videoEvent.pubkey);
-      if (strikes >= warningCount && !(await warningSent(db, videoEvent.pubkey, strikes))) {
+      // Warn once per escalation LEVEL (every `warningCount` strikes), not per
+      // exact count — otherwise a threshold-3 creator is warned at 3,4,5,…
+      // instead of 3,6,9,…
+      const warningLevel = Math.floor(strikes / warningCount);
+      if (warningLevel >= 1 && !(await warningSent(db, videoEvent.pubkey, warningLevel))) {
         const dmResult = await sendWarningDm({
           creatorPubkey: videoEvent.pubkey,
           strikeCount: strikes,
           videoSha256: sha256,
         });
         if (dmResult?.sent) {
-          await recordWarning(db, { creatorPubkey: videoEvent.pubkey, strikeCount: strikes, now });
+          await recordWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel, now });
           summary.warned += 1;
         } else {
           videoClean = false;
@@ -229,18 +269,12 @@ export async function runCommunityLabelSweep({
     ? watermarkCeiling
     : Math.min(Math.min(...unprocessedAt) - 1, watermarkCeiling);
 
-  if (watermark > cursor) {
-    await setCursor(kv, watermark);
-  } else if (pageFull) {
-    // Freeze the cursor on a full-page hold. On first run the cursor is an
-    // unpersisted sliding `now - lookback`; without this, a vote near the
-    // trailing edge that never makes the truncated newest-N page falls
-    // behind the sliding window and is dropped. Persisting the current
-    // value pins the window so those older votes are retained until volume
-    // drops below the page limit and they surface. No-op in steady state
-    // (rewrites the already-persisted value).
-    await setCursor(kv, cursor);
-  }
+  // Always persist the resolved watermark. An advance moves it forward; a hold
+  // (full page OR per-video failure) freezes it at `cursor`. Persisting even a
+  // non-advancing hold is what stops a first-run failure from sliding the
+  // unpersisted `now - lookback` default past the vote that failed — a held
+  // watermark below the default cursor would otherwise be dropped on the wire.
+  await setCursor(kv, Math.max(watermark, cursor));
   summary.cursorAdvanced = unprocessedAt.length === 0 && watermarkCeiling === now;
 
   if (unprocessedAt.length > 0) {

@@ -10,7 +10,7 @@
 export function makeFakeCommunityD1() {
   const decisions = new Map(); // `${video_event_id}:${label}`
   const strikes = new Map(); // `${creator_pubkey}:${video_event_id}:${label}`
-  const warnings = new Map(); // `${creator_pubkey}:${strike_count}`
+  const warnings = new Map(); // `${creator_pubkey}:${warning_level}`
 
   return {
     decisions,
@@ -37,10 +37,10 @@ export function makeFakeCommunityD1() {
             return { meta: { changes: 1 } };
           }
           if (this._sql.includes('INSERT') && this._sql.includes('community_strike_warnings')) {
-            const [creator_pubkey, strike_count, sent_at] = this._binds;
-            const key = `${creator_pubkey}:${strike_count}`;
+            const [creator_pubkey, warning_level, sent_at] = this._binds;
+            const key = `${creator_pubkey}:${warning_level}`;
             if (warnings.has(key)) return { meta: { changes: 0 } };
-            warnings.set(key, { creator_pubkey, strike_count, sent_at });
+            warnings.set(key, { creator_pubkey, warning_level, sent_at });
             return { meta: { changes: 1 } };
           }
           return { meta: { changes: 0 } };
@@ -59,8 +59,8 @@ export function makeFakeCommunityD1() {
             return { n };
           }
           if (this._sql.includes('community_strike_warnings')) {
-            const [creator_pubkey, strike_count] = this._binds;
-            return warnings.get(`${creator_pubkey}:${strike_count}`) || null;
+            const [creator_pubkey, warning_level] = this._binds;
+            return warnings.get(`${creator_pubkey}:${warning_level}`) || null;
           }
           return null;
         },
@@ -77,6 +77,19 @@ export function makeFakeCommunityD1() {
             const results = [...byCreator.values()]
               .sort((a, b) => b.strikes - a.strikes || b.last_at - a.last_at)
               .slice(0, limit);
+            return { results };
+          }
+          if (this._sql.includes('community_strikes') && this._sql.includes(' IN (')) {
+            const wanted = new Set(this._binds);
+            const results = [...strikes.values()]
+              .filter((row) => wanted.has(row.creator_pubkey))
+              .sort((a, b) => b.created_at - a.created_at)
+              .map((row) => ({
+                creator_pubkey: row.creator_pubkey,
+                video_event_id: row.video_event_id,
+                label: row.label,
+                created_at: row.created_at,
+              }));
             return { results };
           }
           return { results: [] };

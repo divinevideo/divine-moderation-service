@@ -6,6 +6,7 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { runCommunityLabelSweep } from './sweep.mjs';
+import { recordStrike } from './d1.mjs';
 import { makeFakeCommunityD1 } from './test-helpers.mjs';
 
 const MODERATION = 'f0'.padEnd(64, '0');
@@ -77,6 +78,28 @@ function makeDeps({
     sendWarningDm: vi.fn().mockResolvedValue({ sent: true }),
     moderationPubkey: MODERATION,
   };
+}
+
+// Make the first community_strikes INSERT throw, then behave normally — the
+// "decision recorded but strike failed" partial-failure B5 must recover from.
+function failStrikeInsertOnce(db) {
+  let failed = false;
+  const realPrepare = db.prepare.bind(db);
+  db.prepare = (sql) => {
+    const stmt = realPrepare(sql);
+    if (sql.includes('INSERT') && sql.includes('community_strikes')) {
+      const realRun = stmt.run.bind(stmt);
+      stmt.run = async () => {
+        if (!failed) {
+          failed = true;
+          throw new Error('strike insert failed');
+        }
+        return realRun();
+      };
+    }
+    return stmt;
+  };
+  return db;
 }
 
 describe('runCommunityLabelSweep', () => {
@@ -176,10 +199,85 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.sendWarningDm).not.toHaveBeenCalled();
   });
 
+  it('recovers a strike on a later tick when it failed after the decision was recorded', async () => {
+    // Partial failure: publish + recordDecision succeed, recordStrike throws.
+    // The strike must be ensured independently on a later tick even though the
+    // decision already exists, instead of being lost forever behind the
+    // publish-once dedup.
+    deps = makeDeps();
+    failStrikeInsertOnce(deps.db);
+
+    const tick1 = await runCommunityLabelSweep(deps);
+    expect(deps.db.decisions.size).toBe(1);
+    expect(deps.db.strikes.size).toBe(0);
+    expect(tick1.cursorAdvanced).toBe(false);
+
+    deps.publishLabel.mockClear();
+    const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+
+    expect(deps.publishLabel).not.toHaveBeenCalled();
+    expect(deps.db.strikes.size).toBe(1);
+    expect(tick2.strikes).toBe(1);
+  });
+
+  it('warns once per escalation level, not per raw strike count', async () => {
+    // Self-labeled video: the crossing publishes but produces no strike, so
+    // the creator's strike total is exactly what we seed — isolating the
+    // warning-level gate from the sweep's own strike creation.
+    deps = makeDeps({
+      votes: [labelVote(ALICE, 'nudity'), labelVote(BOB, 'nudity'), labelVote(CAROL, 'nudity')],
+      video: videoEvent({ selfLabels: ['nudity'] }),
+    });
+
+    // warningCount defaults to 3, so level = floor(strikes / 3).
+    async function seedStrikes(count) {
+      deps.db.strikes.clear();
+      for (let i = 0; i < count; i += 1) {
+        await recordStrike(deps.db, {
+          creatorPubkey: CREATOR,
+          videoEventId: `${i}`.padEnd(64, 'd'),
+          label: 'seed',
+          now: 1,
+        });
+      }
+    }
+
+    await seedStrikes(3); // level 1 — first warning
+    await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS });
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
+
+    await seedStrikes(4); // still level 1 — no new warning
+    await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
+
+    await seedStrikes(5); // still level 1 — no new warning
+    await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 600 });
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
+
+    await seedStrikes(6); // level 2 — second warning
+    await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 900 });
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(2);
+  });
+
   it('holds the watermark when fetching the video event throws', async () => {
     // Transient relay failures must throw (throwOnTransient wiring) so the
     // sweep retries next tick instead of advancing past the votes.
     deps.fetchVideoEvent.mockRejectedValue(new Error('relay 503'));
+
+    const result = await runCommunityLabelSweep(deps);
+
+    expect(deps.publishLabel).not.toHaveBeenCalled();
+    expect(result.cursorAdvanced).toBe(false);
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(
+      String(NOW_SECONDS - 61),
+    );
+  });
+
+  it('holds the watermark when a Divine-identity lookup throws (transient)', async () => {
+    // isDivine is wired with throwOnTransient: true, so a transient name-server
+    // failure throws into the per-video try/catch and holds the cursor for
+    // retry rather than silently counting the author as not-Divine.
+    deps.isDivine.mockRejectedValue(new Error('names 503'));
 
     const result = await runCommunityLabelSweep(deps);
 
@@ -197,6 +295,76 @@ describe('runCommunityLabelSweep', () => {
 
     expect(deps.publishLabel).not.toHaveBeenCalled();
     expect(result.cursorAdvanced).toBe(true);
+  });
+
+  it('skips a fetched event that is not a Divine video (wrong kind) without holding the cursor', async () => {
+    // A forged vote's `e` can point at a non-video event (e.g. a kind 1 note).
+    // That is a genuine non-target, not a transient failure, so sweep it and
+    // let the cursor advance rather than labeling arbitrary events.
+    deps.fetchVideoEvent.mockResolvedValue({
+      id: VIDEO_ID,
+      pubkey: CREATOR,
+      kind: 1,
+      tags: [],
+    });
+
+    const result = await runCommunityLabelSweep(deps);
+
+    expect(deps.publishLabel).not.toHaveBeenCalled();
+    expect(deps.fetchLabelsForVideo).not.toHaveBeenCalled();
+    expect(result.cursorAdvanced).toBe(true);
+  });
+
+  it('tallies via the addressable id derived from the fetched video, not the vote a tag', async () => {
+    // Attack: a forged vote pairs the victim's `e` with another video's
+    // already-crossed `a` to borrow its consensus. The tally must query the
+    // address DERIVED from the fetched victim video's own `d` tag, never the
+    // attacker-controlled `a`.
+    const attackerAddress = `34236:${'e'.repeat(64)}:borrowed-consensus`;
+    const forgedVotes = [ALICE, BOB, CAROL].map((author) => ({
+      id: `${author.slice(0, 8)}gam`.padEnd(64, '0').slice(0, 64),
+      pubkey: author,
+      kind: 1985,
+      created_at: NOW_SECONDS - 60,
+      tags: [
+        ['L', 'content-warning'],
+        ['l', 'gambling', 'content-warning'],
+        ['e', VIDEO_ID],
+        ['a', attackerAddress],
+      ],
+    }));
+    const videoWithDTag = {
+      id: VIDEO_ID,
+      pubkey: CREATOR,
+      kind: 34236,
+      tags: [['d', 'real-vine-id'], ['x', SHA]],
+    };
+    deps = makeDeps({ votes: forgedVotes, video: videoWithDTag });
+
+    await runCommunityLabelSweep(deps);
+
+    expect(deps.fetchLabelsForVideo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: VIDEO_ID,
+        addressableId: `34236:${CREATOR}:real-vine-id`,
+      }),
+    );
+    const passedAddresses = deps.fetchLabelsForVideo.mock.calls.map((call) => call[0].addressableId);
+    expect(passedAddresses).not.toContain(attackerAddress);
+  });
+
+  it('tallies with a null address when the fetched video has no d tag', async () => {
+    // A non-addressable / d-less video yields no derived address; the tally
+    // then queries by `e` alone (fetchLabelsForVideo skips the #a query).
+    deps = makeDeps({
+      video: { id: VIDEO_ID, pubkey: CREATOR, kind: 34236, tags: [['x', SHA]] },
+    });
+
+    await runCommunityLabelSweep(deps);
+
+    expect(deps.fetchLabelsForVideo).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: VIDEO_ID, addressableId: null }),
+    );
   });
 
   it('drains deferred videos across ticks under the batch cap, oldest first', async () => {
@@ -267,6 +435,27 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.kv.store.get('community_labels_cursor')).toBe(
       String(NOW_SECONDS - 24 * 60 * 60),
     );
+  });
+
+  it('persists the cold-start cursor when the earliest failing vote sits at the lookback boundary', async () => {
+    // First-run cursor is now-24h (unpersisted). A vote exactly at that
+    // boundary that fails to publish yields a held watermark <= cursor, which
+    // the old write logic left unpersisted — so the next tick's fresh now-24h
+    // slide aged the failed vote out. The held value must be persisted instead.
+    const boundary = NOW_SECONDS - 24 * 60 * 60;
+    deps = makeDeps({
+      votes: [
+        labelVote(ALICE, 'gambling', { createdAt: boundary }),
+        labelVote(BOB, 'gambling', { createdAt: boundary }),
+        labelVote(CAROL, 'gambling', { createdAt: boundary }),
+      ],
+      publishResult: { published: false },
+    });
+
+    const result = await runCommunityLabelSweep(deps);
+
+    expect(result.cursorAdvanced).toBe(false);
+    expect(deps.kv.store.get('community_labels_cursor')).toBe(String(boundary));
   });
 
   it('advances the cursor on an empty poll', async () => {

@@ -81,6 +81,79 @@ describe('isDivineIdentity', () => {
   });
 });
 
+describe('isDivineIdentity with throwOnTransient', () => {
+  let kv;
+  beforeEach(() => { kv = makeKv(); });
+
+  it('returns and caches false on a definitive 200 found:false', async () => {
+    const fetchImpl = fetchReturning(200, { ok: true, found: false });
+    expect(
+      await isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW, throwOnTransient: true }),
+    ).toBe(false);
+    expect(kv.store.size).toBe(1);
+  });
+
+  it('returns and caches true on a definitive 200 found:true', async () => {
+    const fetchImpl = fetchReturning(200, { ok: true, found: true });
+    expect(
+      await isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW, throwOnTransient: true }),
+    ).toBe(true);
+    expect(kv.store.size).toBe(1);
+  });
+
+  it('throws and does not cache on any non-200 (401/403/5xx)', async () => {
+    for (const status of [401, 403, 500, 503]) {
+      const local = makeKv();
+      const fetchImpl = fetchReturning(status, { ok: false });
+      await expect(
+        isDivineIdentity(PUBKEY, { kv: local, fetchImpl, now: NOW, throwOnTransient: true }),
+      ).rejects.toThrow();
+      expect(local.store.size).toBe(0);
+    }
+  });
+
+  it('throws and does not cache on a network error', async () => {
+    const throwing = async () => { throw new Error('network down'); };
+    await expect(
+      isDivineIdentity(PUBKEY, { kv, fetchImpl: throwing, now: NOW, throwOnTransient: true }),
+    ).rejects.toThrow();
+    expect(kv.store.size).toBe(0);
+  });
+
+  it('throws and does not cache on a malformed 200 body (no boolean found)', async () => {
+    const fetchImpl = fetchReturning(200, { ok: true });
+    await expect(
+      isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW, throwOnTransient: true }),
+    ).rejects.toThrow();
+    expect(kv.store.size).toBe(0);
+  });
+
+  it('throws when the 200 body cannot be parsed', async () => {
+    const fetchImpl = async () => ({
+      status: 200,
+      ok: true,
+      json: async () => { throw new Error('unexpected end of JSON input'); },
+    });
+    await expect(
+      isDivineIdentity(PUBKEY, { kv, fetchImpl, now: NOW, throwOnTransient: true }),
+    ).rejects.toThrow();
+    expect(kv.store.size).toBe(0);
+  });
+
+  it('serves a genuine cached verdict without refetching (so no transient throw)', async () => {
+    const ok = fetchReturning(200, { ok: true, found: true });
+    expect(
+      await isDivineIdentity(PUBKEY, { kv, fetchImpl: ok, now: NOW, throwOnTransient: true }),
+    ).toBe(true);
+
+    const failing = fetchReturning(500, { ok: false });
+    expect(
+      await isDivineIdentity(PUBKEY, { kv, fetchImpl: failing, now: NOW + 1_000, throwOnTransient: true }),
+    ).toBe(true);
+    expect(failing.calls.length).toBe(0);
+  });
+});
+
 describe('resolveDivineAuthors', () => {
   it('maps each pubkey to its identity result', async () => {
     const kv = makeKv();

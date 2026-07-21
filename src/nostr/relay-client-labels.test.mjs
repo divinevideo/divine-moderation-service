@@ -50,6 +50,46 @@ function makeFakeWebSocket({ eventsForFilter }) {
   return FakeWebSocket;
 }
 
+// A socket that delivers any events for the filter and then drops WITHOUT
+// ever sending EOSE — the mid-stream truncation the strict fetchers must
+// treat as a transient failure rather than a complete result.
+function makeClosingBeforeEoseWebSocket({ eventsForFilter }) {
+  class FakeWebSocket {
+    constructor() {
+      this.listeners = {};
+      this.readyState = 0;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit('open');
+      });
+    }
+
+    addEventListener(type, handler) {
+      (this.listeners[type] ||= []).push(handler);
+    }
+
+    send(message) {
+      const [, subscriptionId, filter] = JSON.parse(message);
+      queueMicrotask(() => {
+        for (const event of eventsForFilter(filter)) {
+          this.emit('message', { data: JSON.stringify(['EVENT', subscriptionId, event]) });
+        }
+        this.readyState = 3;
+        this.emit('close');
+      });
+    }
+
+    close() {
+      this.readyState = 3;
+    }
+
+    emit(type, event = {}) {
+      for (const handler of this.listeners[type] || []) handler(event);
+    }
+  }
+  return FakeWebSocket;
+}
+
 describe('fetchLabelEventsSince', () => {
   it('requests kind 1985 since the cursor and returns all events', async () => {
     const label = { id: 'a'.repeat(64), kind: 1985, tags: [['L', 'content-warning']] };
@@ -60,6 +100,13 @@ describe('fetchLabelEventsSince', () => {
 
     expect(events).toEqual([label]);
     expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], since: 1_700_000_000 });
+  });
+
+  it('rejects when the stream closes before EOSE (possible truncation)', async () => {
+    const label = { id: 'a'.repeat(64), kind: 1985, tags: [['L', 'content-warning']] };
+    globalThis.WebSocket = makeClosingBeforeEoseWebSocket({ eventsForFilter: () => [label] });
+
+    await expect(fetchLabelEventsSince(1_700_000_000)).rejects.toThrow(/EOSE/i);
   });
 });
 
@@ -95,5 +142,13 @@ describe('fetchLabelEventsForVideo', () => {
 
     expect(Fake.sentFilters).toHaveLength(1);
     expect(Fake.sentFilters[0]).toMatchObject({ kinds: [1985], '#e': [videoId] });
+  });
+
+  it('rejects when a per-video query closes before EOSE (possible truncation)', async () => {
+    globalThis.WebSocket = makeClosingBeforeEoseWebSocket({ eventsForFilter: () => [] });
+
+    await expect(
+      fetchLabelEventsForVideo({ eventId: videoId, addressableId: null }),
+    ).rejects.toThrow(/EOSE/i);
   });
 });
