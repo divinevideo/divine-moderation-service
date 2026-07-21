@@ -7784,6 +7784,30 @@ describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
     );
   });
 
+  it('reports has_more false on the last page', async () => {
+    communitySweepMocks.strikeCount.mockResolvedValue(25);
+    // Last page: offset 20 + 5 rows == total 25, so nothing remains.
+    communitySweepMocks.listStrikesForCreator.mockResolvedValue(
+      Array.from({ length: 5 }, (_, i) => ({
+        video_event_id: 'e'.repeat(64),
+        label: 'gambling',
+        created_at: 1700000000 - i,
+      }))
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=3&pageSize=10`, {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ page: 3, total: 25, has_more: false });
+    expect(body.strikes).toHaveLength(5);
+  });
+
   it('clamps an oversized pageSize and offsets by page', async () => {
     communitySweepMocks.strikeCount.mockResolvedValue(500);
     communitySweepMocks.listStrikesForCreator.mockResolvedValue([]);

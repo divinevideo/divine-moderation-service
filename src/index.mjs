@@ -1923,10 +1923,12 @@ export default {
         return authError;
       }
 
+      // Normalize to lowercase: strikes are stored lowercase, so an uppercase
+      // pubkey in the URL would otherwise validate but return zero rows.
       const creatorPubkey = decodeURIComponent(
         url.pathname.slice('/admin/api/community-strikes/'.length)
-      );
-      if (!/^[0-9a-f]{64}$/i.test(creatorPubkey)) {
+      ).toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(creatorPubkey)) {
         return new Response(JSON.stringify({ error: 'Invalid creator pubkey' }), {
           status: 400,
           headers: JSON_HEADERS
