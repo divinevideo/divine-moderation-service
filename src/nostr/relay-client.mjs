@@ -4,7 +4,32 @@
 // ABOUTME: Nostr relay WebSocket client for fetching event context
 // ABOUTME: Connects to relay.divine.video to get kind 34236 video events by SHA256
 
+import { verifyEvent } from 'nostr-tools/pure';
 import { extractMediaShaFromEvent } from '../validation.mjs';
+
+const HEX64_RE = /^[0-9a-f]{64}$/;
+
+// A 2xx body is only the definitive answer if it is the exact signed event we
+// asked for: the id must match the requested id, every field the sweep
+// consumes must be well-shaped, and the id/signature must be canonically
+// valid. Anything else (wrong event, tampered, malformed) is routed through
+// the transient path so the sweep holds rather than acting on unverified data
+// — never labeling/striking one event based on another.
+function isRequestedSignedEvent(event, eventId) {
+  return (
+    event &&
+    typeof event === 'object' &&
+    event.id === eventId &&
+    typeof event.pubkey === 'string' &&
+    HEX64_RE.test(event.pubkey) &&
+    typeof event.kind === 'number' &&
+    Number.isInteger(event.created_at) &&
+    Array.isArray(event.tags) &&
+    typeof event.content === 'string' &&
+    typeof event.sig === 'string' &&
+    verifyEvent(event)
+  );
+}
 
 const DEFAULT_SHA_BATCH_CHUNK_SIZE = 25;
 const MAX_SHA_BATCH_CHUNK_SIZE = 100;
@@ -528,12 +553,13 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
         if (response.status === 404) anyDefinitiveResponse = true;
         continue;
       }
-      // A 2xx counts as definitive only once we have a real event body.
-      // Invalid JSON throws into the catch below (transient); a malformed
-      // 2xx missing id/pubkey falls through to `continue` (transient).
-      // Neither is treated as "event absent".
+      // A 2xx counts as definitive only once we have the exact requested
+      // signed event. Invalid JSON throws into the catch below (transient);
+      // a wrong-id, malformed, or signature-invalid body fails the validator
+      // and falls through to `continue` (transient). Neither is treated as
+      // "event absent" — the sweep must not act on an event it didn't ask for.
       const event = await response.json();
-      if (event?.id && event?.pubkey) {
+      if (isRequestedSignedEvent(event, eventId)) {
         anyDefinitiveResponse = true;
         return event;
       }
