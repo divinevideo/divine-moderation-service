@@ -579,20 +579,21 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.sendWarningDm).not.toHaveBeenCalled();
   });
 
-  it('retries the warning DM on a later tick after a known soft send failure', async () => {
-    // A definitive {sent:false} means no DM went out, so re-sending is not a
-    // duplicate. The claim is released and the next tick re-sends — a soft
-    // relay/rate-limit blip must not permanently skip a warning level.
+  it('does not re-send the warning DM after an unconfirmed send', async () => {
+    // {sent:false} is ambiguous — a relay can accept the gift-wrap while its
+    // OK is lost, so we can't prove no DM went out. The claim is retained and
+    // the next tick does NOT re-send, so a possibly-delivered warning is never
+    // duplicated (gift-wraps have random ids, so the relay can't dedup for us).
     deps = makeDeps({ kvEntries: { strike_warning_count: '1' } });
     deps.sendWarningDm.mockResolvedValueOnce({ sent: false, reason: 'rate limited' });
 
     const tick1 = await runCommunityLabelSweep(deps);
     expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
     expect(tick1.warned).toBe(0);
-    expect(tick1.cursorAdvanced).toBe(false);
 
+    deps.sendWarningDm.mockClear();
     const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
-    expect(deps.sendWarningDm).toHaveBeenCalledTimes(2);
-    expect(tick2.warned).toBe(1);
+    expect(deps.sendWarningDm).not.toHaveBeenCalled();
+    expect(tick2.warned).toBe(0);
   });
 });

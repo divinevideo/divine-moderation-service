@@ -70,16 +70,6 @@ export function makeFakeCommunityD1() {
             warnings.set(key, { creator_pubkey, warning_level, sent_at, status: 'pending' });
             return { meta: { changes: 1 } };
           }
-          if (this._sql.includes('DELETE') && this._sql.includes('community_strike_warnings')) {
-            const [creator_pubkey, warning_level] = this._binds;
-            const key = `${creator_pubkey}:${warning_level}`;
-            const row = warnings.get(key);
-            if (row && row.status === 'pending') {
-              warnings.delete(key);
-              return { meta: { changes: 1 } };
-            }
-            return { meta: { changes: 0 } };
-          }
           return { meta: { changes: 0 } };
         },
         async first() {

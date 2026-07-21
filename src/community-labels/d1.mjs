@@ -112,20 +112,6 @@ export async function confirmWarning(db, { creatorPubkey, warningLevel }) {
 }
 
 /**
- * Release a claimed-but-not-sent warning so a later tick can retry it. Called
- * only on a definitive send failure ({sent:false}) where we KNOW no DM went
- * out, so re-sending is not a duplicate. Deletes only a still-`pending` row,
- * so a claim orphaned by a crash *after* a successful send (which is never
- * released) still blocks a resend and preserves the no-duplicate guard.
- */
-export async function releaseWarning(db, { creatorPubkey, warningLevel }) {
-  await db.prepare(
-    `DELETE FROM community_strike_warnings
-     WHERE creator_pubkey = ? AND warning_level = ? AND status = 'pending'`
-  ).bind(creatorPubkey, warningLevel).run();
-}
-
-/**
  * One page of a single creator's strike rows, newest first, for the admin
  * drill-down behind the summary's per-creator evidence cap. Pages entirely in
  * SQL (bound LIMIT/OFFSET) so a creator with hundreds of strikes never

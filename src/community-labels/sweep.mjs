@@ -26,7 +26,6 @@ import {
   strikeCount,
   claimWarning,
   confirmWarning,
-  releaseWarning,
 } from './d1.mjs';
 import { VIDEO_KINDS } from '../nostr/video-kinds.mjs';
 
@@ -271,12 +270,13 @@ export async function runCommunityLabelSweep({
             await confirmWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel });
             summary.warned += 1;
           } else {
-            // Known failure: no DM went out, so release the claim to retry
-            // next tick (re-sending is not a duplicate). A crash after a
-            // successful send never reaches here, so its orphaned pending
-            // claim still blocks a resend.
-            await releaseWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel });
-            videoClean = false;
+            // {sent:false} is ambiguous: a relay can accept the gift-wrap
+            // while its OK is lost, so we cannot prove no DM went out. Retain
+            // the claim (do not resend) so a possibly-delivered warning is
+            // never duplicated; a genuinely-missed one is caught by the
+            // human ban-review backstop. (Gift-wraps have random ids, so —
+            // unlike the label — the relay can't dedup a resend for us.)
+            console.log(`[COMMUNITY-LABELS] warning DM unconfirmed for ${videoEvent.pubkey} level ${warningLevel}; claim retained, no resend`);
           }
         }
       }
