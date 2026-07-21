@@ -10,11 +10,13 @@ import { extractMediaShaFromEvent } from '../validation.mjs';
 const HEX64_RE = /^[0-9a-f]{64}$/;
 
 // A 2xx body is only the definitive answer if it is the exact signed event we
-// asked for: the id must match the requested id, every field the sweep
-// consumes must be well-shaped, and the id/signature must be canonically
-// valid. Anything else (wrong event, tampered, malformed) is routed through
-// the transient path so the sweep holds rather than acting on unverified data
-// — never labeling/striking one event based on another.
+// asked for. The relay's claimed `id` field is untrusted, so verifyEvent()
+// recomputes the canonical hash and, together with the requested-id match,
+// cryptographically binds the returned pubkey/tags/content to eventId — plus
+// it validates the signature (authentic author). Anything else (wrong event,
+// tampered, malformed, bad signature) is routed through the transient path so
+// callers hold rather than act on an event they didn't ask for — never
+// labeling/striking/reporting one event based on another.
 function isRequestedSignedEvent(event, eventId) {
   return (
     event &&
@@ -557,7 +559,7 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
       // signed event. Invalid JSON throws into the catch below (transient);
       // a wrong-id, malformed, or signature-invalid body fails the validator
       // and falls through to `continue` (transient). Neither is treated as
-      // "event absent" — the sweep must not act on an event it didn't ask for.
+      // "event absent" — the caller must not act on an event it didn't ask for.
       const event = await response.json();
       if (isRequestedSignedEvent(event, eventId)) {
         anyDefinitiveResponse = true;

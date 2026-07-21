@@ -704,6 +704,9 @@ describe('fetchNostrEventById', () => {
   });
 
   it('throws when the 2xx event id matches but the signature is invalid', async () => {
+    // The relay's claimed id is untrusted: a body whose id string matches but
+    // whose signature (and thus canonical hash) is invalid must be rejected, or
+    // the id match is meaningless. verifyEvent binds pubkey/tags/content to id.
     const signed = finalizeEvent(
       { kind: 34236, created_at: 1700000000, tags: [], content: '' },
       generateSecretKey()

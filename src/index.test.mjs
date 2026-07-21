@@ -5,6 +5,7 @@
 // ABOUTME: Verifies public API exposure, admin isolation, and workers.dev disablement
 
 import { describe, expect, it, vi } from 'vitest';
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 
 const publisherMocks = vi.hoisted(() => ({
   publishDmInboxRelayList: vi.fn()
@@ -3504,6 +3505,22 @@ describe('RD auto-escalation cron integration', () => {
 });
 
 describe('Report polling cron integration', () => {
+  // A real signed kind-34236 video event. fetchNostrEventById verifies the
+  // canonical id + signature (like a real relay target), so the fixture is
+  // signed with the uploader's key rather than hand-stamped with a fake id —
+  // its .id is the real hash and its pubkey is the uploader.
+  function buildSignedTarget(sha256) {
+    const uploaderSk = generateSecretKey();
+    const uploaderPubkey = getPublicKey(uploaderSk);
+    const targetEvent = finalizeEvent({
+      kind: 34236,
+      created_at: 1778692000,
+      tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
+      content: '',
+    }, uploaderSk);
+    return { targetEvent, targetEventId: targetEvent.id, uploaderPubkey };
+  }
+
   it('allows admins to read report polling status', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
@@ -3599,11 +3616,10 @@ describe('Report polling cron integration', () => {
   });
 
   it('runs inbound report polling and records kind 1984 reports for review', async () => {
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const moderationWrites = [];
     const kvStore = new Map();
     const websocketRequests = [];
@@ -3637,15 +3653,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -3840,11 +3851,10 @@ describe('Report polling cron integration', () => {
   });
 
   it('advances report checkpoint to terminal report timestamp instead of Date.now', async () => {
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const reportCreatedAt = 1778692782;
     const nowSeconds = 1778729000;
     const kvStore = new Map();
@@ -3879,15 +3889,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -3958,11 +3963,10 @@ describe('Report polling cron integration', () => {
   });
 
   it('does not advance report checkpoint when the report page is saturated', async () => {
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const reportCreatedAt = 1778692782;
     const previousCheckpoint = 1778600000;
     const kvStore = new Map([[
@@ -4005,15 +4009,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -4164,11 +4163,10 @@ describe('Report polling cron integration', () => {
   it('clears stale saturated resume boundaries after a successful resume checkpoint', async () => {
     const previousCheckpoint = 1778600000;
     const resumeUntil = 1778692781;
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const kvStore = new Map([
       ['report-poller:last-poll', JSON.stringify({ timestamp: previousCheckpoint, lastPollAt: '2026-05-12T00:00:00.000Z' })],
       ['report-poller:last-run', JSON.stringify({ saturated: true, safeCheckpoint: null, resumeUntil })],
@@ -4205,14 +4203,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -4279,10 +4273,9 @@ describe('Report polling cron integration', () => {
   });
 
   it('advances report checkpoint when bounded drain resolves saturation', async () => {
-    const targetEventId = '1'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const kvStore = new Map();
     const checkpointWrites = [];
     const websocketRequests = [];
@@ -4318,15 +4311,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
