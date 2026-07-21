@@ -7,7 +7,7 @@
 import { validateQueueMessage } from './schemas/queue-message.mjs';
 import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
 import { applyForceProvider, shouldQueueHiveRecheck } from './moderation/report-trigger.mjs';
-import { publishToFaro, publishToContentRelay, publishLabelEvent, publishDmInboxRelayList } from './nostr/publisher.mjs';
+import { publishToFaro, publishToContentRelay, publishLabelEvent, buildLabelEvent, publishPreparedLabelEvent, publishDmInboxRelayList } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
@@ -5319,8 +5319,8 @@ async function runMigration() {
             fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
             fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env, { throwOnTransient: true }),
             isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV, throwOnTransient: true }),
-            publishLabel: async ({ videoEventId, sha256, label, voteCount, createdAt }) => {
-              const result = await publishLabelEvent({
+            buildLabelEvent: async ({ videoEventId, sha256, label, voteCount, createdAt }) =>
+              buildLabelEvent({
                 sha256,
                 category: label,
                 status: 'confirmed',
@@ -5329,7 +5329,9 @@ async function runMigration() {
                 voteCount,
                 nostrEventId: videoEventId,
                 createdAt,
-              }, env);
+              }, env),
+            publishLabel: async ({ event }) => {
+              const result = await publishPreparedLabelEvent(event, env);
               return { published: result.published === true, eventId: result.eventId };
             },
             sendWarningDm: async ({ creatorPubkey, strikeCount, videoSha256 }) => {

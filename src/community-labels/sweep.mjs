@@ -92,6 +92,7 @@ export async function runCommunityLabelSweep({
   fetchLabelsForVideo,
   fetchVideoEvent,
   isDivine,
+  buildLabelEvent,
   publishLabel,
   sendWarningDm,
   moderationPubkey,
@@ -194,25 +195,36 @@ export async function runCommunityLabelSweep({
         // every sweep — a strike that failed to land after its decision was
         // recorded must be recoverable, not lost forever behind this dedup.
         if (!(await hasDecision(db, target.eventId, crossing.label))) {
-          // Claim before send: persist a pending row with a frozen created_at
-          // and vote count BEFORE publishing, then publish deterministically
-          // from those frozen fields. A retry after a partial failure rebuilds
-          // the SAME event id, so the relay dedups it — no duplicate label.
+          // Build the exact signed label event, then claim-before-send: the
+          // claim persists these precise bytes BEFORE publishing. On a retry
+          // the claim returns tick-1's stored event verbatim, so we always
+          // publish byte-identical bytes — the relay dedups by id and no
+          // duplicate label can land even if this code or the signing key
+          // changed between the first publish and the retry.
+          const freshEvent = await buildLabelEvent({
+            videoEventId: target.eventId,
+            sha256,
+            label: crossing.label,
+            voteCount: crossing.voteCount,
+            createdAt: now,
+          });
+          if (!freshEvent) {
+            // No signing key (or build failed): hold the cursor and retry.
+            videoClean = false;
+            continue;
+          }
           const claim = await claimDecision(db, {
             videoEventId: target.eventId,
             label: crossing.label,
             voteCount: crossing.voteCount,
             videoSha256: sha256,
             creatorPubkey: videoEvent.pubkey,
+            preparedEvent: freshEvent,
             now,
           });
-          const publishResult = await publishLabel({
-            videoEventId: target.eventId,
-            sha256,
-            label: crossing.label,
-            voteCount: claim.voteCount,
-            createdAt: claim.createdAt,
-          });
+          // Publish the STORED event (tick-1's on every retry), never the
+          // fresh rebuild, so the published id is stable across retries.
+          const publishResult = await publishLabel({ event: claim.preparedEvent });
           if (!publishResult?.published) {
             videoClean = false;
             continue;

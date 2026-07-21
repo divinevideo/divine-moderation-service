@@ -50,10 +50,10 @@ export function makeFakeCommunityD1() {
             return { meta: { changes: 0 } };
           }
           if (this._sql.includes('INSERT') && this._sql.includes('community_label_decisions')) {
-            const [video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at] = this._binds;
+            const [video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, prepared_event, created_at] = this._binds;
             const key = `${video_event_id}:${label}`;
             if (decisions.has(key)) return { meta: { changes: 0 } };
-            decisions.set(key, { video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at, status: 'pending' });
+            decisions.set(key, { video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, prepared_event, created_at, status: 'pending' });
             return { meta: { changes: 1 } };
           }
           if (this._sql.includes('INSERT') && this._sql.includes('community_strikes')) {

@@ -35,6 +35,7 @@ describe('decisions', () => {
     voteCount: 3,
     videoSha256: SHA,
     creatorPubkey: CREATOR_1,
+    preparedEvent: { id: 'evt-first', kind: 1985 },
     now: 1700000000,
     ...overrides,
   });
@@ -49,13 +50,27 @@ describe('decisions', () => {
     expect(await hasDecision(db, VIDEO_A, 'gambling')).toBe(true);
   });
 
-  it('claimDecision freezes created_at and vote count across retries', async () => {
+  it('claimDecision freezes the stored event and vote count across retries', async () => {
     const first = await claim();
-    expect(first).toEqual({ createdAt: 1700000000, voteCount: 3 });
-    // A later tick with a higher vote count and a new clock must read back the
-    // ORIGINAL frozen fields so the replayed label event id is identical.
-    const second = await claim({ voteCount: 9, now: 1700000999 });
-    expect(second).toEqual({ createdAt: 1700000000, voteCount: 3 });
+    expect(first).toEqual({
+      createdAt: 1700000000,
+      voteCount: 3,
+      preparedEvent: { id: 'evt-first', kind: 1985 },
+    });
+    // A later tick with a higher vote count, a new clock, AND a differently-
+    // built event must read back the ORIGINAL stored event so the replayed
+    // label id is identical — a redeploy or key rotation between publishes
+    // cannot mint a second authoritative label.
+    const second = await claim({
+      voteCount: 9,
+      now: 1700000999,
+      preparedEvent: { id: 'evt-second', kind: 1985 },
+    });
+    expect(second).toEqual({
+      createdAt: 1700000000,
+      voteCount: 3,
+      preparedEvent: { id: 'evt-first', kind: 1985 },
+    });
     expect(db.decisions.size).toBe(1);
   });
 

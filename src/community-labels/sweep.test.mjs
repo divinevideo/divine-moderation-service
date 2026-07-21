@@ -57,11 +57,32 @@ function videoEvent({ selfLabels = [] } = {}) {
   };
 }
 
+// Mirrors the real publisher: a deterministic id derived from the frozen
+// inputs, so a rebuild with the SAME inputs yields the SAME id and a rebuild
+// after the clock advances yields a different one — letting tests prove the
+// STORED event is replayed, not a fresh rebuild.
+function fakeLabelEvent({ videoEventId, sha256, label, voteCount, createdAt }) {
+  return {
+    id: `${videoEventId.slice(0, 8)}:${label}:${voteCount}:${createdAt}`,
+    pubkey: MODERATION,
+    kind: 1985,
+    created_at: createdAt,
+    tags: [
+      ['L', 'content-warning'],
+      ['l', label, 'content-warning'],
+      ['e', videoEventId],
+      ['x', sha256],
+    ],
+    content: `Community consensus flagged: ${label} (${voteCount})`,
+    sig: 's'.repeat(128),
+  };
+}
+
 function makeDeps({
   votes = [labelVote(ALICE, 'gambling'), labelVote(BOB, 'gambling'), labelVote(CAROL, 'gambling')],
   video = videoEvent(),
   divine = true,
-  publishResult = { published: true, eventId: 'e'.repeat(64) },
+  publishResult = { published: true },
   kvEntries = {},
 } = {}) {
   const db = makeFakeCommunityD1();
@@ -74,7 +95,11 @@ function makeDeps({
     fetchLabelsForVideo: vi.fn().mockResolvedValue(votes),
     fetchVideoEvent: vi.fn().mockResolvedValue(video),
     isDivine: vi.fn().mockResolvedValue(divine),
-    publishLabel: vi.fn().mockResolvedValue(publishResult),
+    buildLabelEvent: vi.fn(async (args) => fakeLabelEvent(args)),
+    publishLabel: vi.fn(async ({ event }) => ({
+      published: publishResult.published,
+      eventId: publishResult.published ? event.id : undefined,
+    })),
     sendWarningDm: vi.fn().mockResolvedValue({ sent: true }),
     moderationPubkey: MODERATION,
   };
@@ -163,13 +188,21 @@ describe('runCommunityLabelSweep', () => {
   it('publishes once when a label crosses the threshold and records the decision', async () => {
     const result = await runCommunityLabelSweep(deps);
 
-    expect(deps.publishLabel).toHaveBeenCalledTimes(1);
-    expect(deps.publishLabel).toHaveBeenCalledWith(expect.objectContaining({
+    expect(deps.buildLabelEvent).toHaveBeenCalledTimes(1);
+    expect(deps.buildLabelEvent).toHaveBeenCalledWith(expect.objectContaining({
       videoEventId: VIDEO_ID,
       sha256: SHA,
       label: 'gambling',
       voteCount: 3,
+      createdAt: NOW_SECONDS,
     }));
+    expect(deps.publishLabel).toHaveBeenCalledTimes(1);
+    expect(deps.publishLabel).toHaveBeenCalledWith({
+      event: expect.objectContaining({
+        id: `${VIDEO_ID.slice(0, 8)}:gambling:3:${NOW_SECONDS}`,
+        kind: 1985,
+      }),
+    });
     expect(deps.db.decisions.size).toBe(1);
     expect(result.published).toBe(1);
     expect(result.cursorAdvanced).toBe(true);
@@ -527,19 +560,14 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.kv.store.get('community_labels_cursor')).toBe(String(NOW_SECONDS));
   });
 
-  it('re-publishes with a frozen created_at and confirms the decision exactly once after a partial failure', async () => {
-    // Publish lands but the post-publish decision write fails on tick 1. The
-    // cursor holds; tick 2 must re-publish with the SAME frozen created_at
-    // (so the deterministic publisher rebuilds an identical event id the relay
-    // dedups by) and confirm the decision exactly once — never a duplicate
-    // authoritative label.
+  it('replays the exact stored event on retry after a partial failure, confirming exactly once', async () => {
+    // Publish lands but the post-publish confirm write fails on tick 1. The
+    // cursor holds; tick 2 must republish the SAME stored event the relay
+    // dedups by id, and confirm the decision exactly once — never a duplicate
+    // authoritative label. The tick-2 rebuild would use the advanced clock
+    // (NOW_SECONDS + 300) and produce a different id, so replaying the stored
+    // event, not the rebuild, is what keeps the id stable.
     deps = makeDeps();
-    // Deterministic id derived from the frozen inputs, mirroring the real
-    // publisher: same created_at + vote count => same event id.
-    deps.publishLabel = vi.fn(async ({ videoEventId, label, voteCount, createdAt }) => ({
-      published: true,
-      eventId: `${videoEventId.slice(0, 8)}:${label}:${voteCount}:${createdAt}`,
-    }));
     failDecisionWriteAfterPublish(deps);
 
     const tick1 = await runCommunityLabelSweep(deps);
@@ -551,17 +579,52 @@ describe('runCommunityLabelSweep', () => {
 
     expect(deps.publishLabel).toHaveBeenCalledTimes(2);
     const [call1, call2] = deps.publishLabel.mock.calls;
-    // Frozen at the claim (tick-1 now), replayed verbatim on the tick-2 retry
-    // even though the sweep clock advanced to NOW_SECONDS + 300.
-    expect(call1[0].createdAt).toBe(NOW_SECONDS);
-    expect(call2[0].createdAt).toBe(NOW_SECONDS);
-    expect(call2[0].voteCount).toBe(3);
+    const expectedId = `${VIDEO_ID.slice(0, 8)}:gambling:3:${NOW_SECONDS}`;
+    expect(call1[0].event.id).toBe(expectedId);
+    expect(call2[0].event.id).toBe(expectedId);
+    expect(call2[0].event.created_at).toBe(NOW_SECONDS);
 
     expect(tick2.published).toBe(1);
     expect(deps.db.decisions.size).toBe(1);
     const decision = [...deps.db.decisions.values()][0];
     expect(decision.status).toBe('confirmed');
-    expect(decision.published_event_id).toBe(`${VIDEO_ID.slice(0, 8)}:gambling:3:${NOW_SECONDS}`);
+    expect(decision.published_event_id).toBe(expectedId);
+  });
+
+  it('republishes the stored event, not a fresh rebuild, after a code or key change', async () => {
+    // A publish/confirm split can straddle a redeploy or key rotation, so the
+    // tick-2 rebuild can differ from the tick-1 event even with identical
+    // inputs. The claim persists the exact tick-1 bytes, so both publishes use
+    // that stored event — the relay dedups it and no second label id is minted.
+    deps = makeDeps();
+    let build = 0;
+    deps.buildLabelEvent = vi.fn(async ({ videoEventId, label }) => {
+      build += 1;
+      return {
+        id: `${label}-build-${build}`,
+        pubkey: MODERATION,
+        kind: 1985,
+        created_at: NOW_SECONDS,
+        tags: [['e', videoEventId]],
+        content: '',
+        sig: 's'.repeat(128),
+      };
+    });
+    failDecisionWriteAfterPublish(deps);
+
+    await runCommunityLabelSweep(deps);
+    const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+
+    // Fresh build each tick (tick 1 -> build-1, tick 2 -> build-2)...
+    expect(deps.buildLabelEvent).toHaveBeenCalledTimes(2);
+    // ...but both publishes replay tick-1's stored event, never build-2.
+    const [call1, call2] = deps.publishLabel.mock.calls;
+    expect(call1[0].event.id).toBe('gambling-build-1');
+    expect(call2[0].event.id).toBe('gambling-build-1');
+
+    expect(tick2.published).toBe(1);
+    const decision = [...deps.db.decisions.values()][0];
+    expect(decision.published_event_id).toBe('gambling-build-1');
   });
 
   it('does not re-send the warning DM after a post-send bookkeeping failure', async () => {

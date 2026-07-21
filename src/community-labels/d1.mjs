@@ -21,29 +21,36 @@ export async function hasDecision(db, videoEventId, label) {
 
 /**
  * Claim (video, label) for publishing by persisting a PENDING row BEFORE the
- * label event is sent, then return the row's frozen created_at + vote_count.
- * Those frozen fields are what make the published event id deterministic:
- * every retry rebuilds the identical event, so the relay dedups by id and no
- * duplicate authoritative label can land. INSERT OR IGNORE means the first
- * tick creates the claim and every retry reads back the same frozen values.
+ * label event is sent, storing the EXACT signed event bytes in the claim.
+ * INSERT OR IGNORE means the first tick creates the claim and every retry reads
+ * back the SAME stored event — so the caller republishes byte-identical event
+ * bytes, the relay dedups by id, and no duplicate authoritative label can land
+ * even if the event-building code or signing key changed between publishes.
  *
- * @returns {Promise<{createdAt: number, voteCount: number}>}
+ * `preparedEvent` is the signed event object; it is serialized on write and
+ * returned parsed. `createdAt`/`voteCount` are still returned for audit.
+ *
+ * @returns {Promise<{createdAt: number, voteCount: number, preparedEvent: Object}>}
  */
 export async function claimDecision(db, {
-  videoEventId, label, voteCount, videoSha256, creatorPubkey, now,
+  videoEventId, label, voteCount, videoSha256, creatorPubkey, preparedEvent, now,
 }) {
   await db.prepare(
     `INSERT INTO community_label_decisions
-      (video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, created_at, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+      (video_event_id, label, vote_count, published_event_id, video_sha256, creator_pubkey, prepared_event, created_at, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
      ON CONFLICT(video_event_id, label) DO NOTHING`
-  ).bind(videoEventId, label, voteCount, '', videoSha256, creatorPubkey, now).run();
+  ).bind(videoEventId, label, voteCount, '', videoSha256, creatorPubkey, JSON.stringify(preparedEvent), now).run();
 
   const row = await db.prepare(
-    `SELECT vote_count, created_at FROM community_label_decisions
+    `SELECT vote_count, created_at, prepared_event FROM community_label_decisions
      WHERE video_event_id = ? AND label = ?`
   ).bind(videoEventId, label).first();
-  return { createdAt: row.created_at, voteCount: row.vote_count };
+  return {
+    createdAt: row.created_at,
+    voteCount: row.vote_count,
+    preparedEvent: JSON.parse(row.prepared_event),
+  };
 }
 
 /**
