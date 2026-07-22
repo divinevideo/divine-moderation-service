@@ -26,6 +26,7 @@ import {
   strikeCount,
   claimWarning,
   confirmWarning,
+  releaseWarning,
 } from './d1.mjs';
 import { VIDEO_KINDS } from '../nostr/video-kinds.mjs';
 
@@ -281,13 +282,22 @@ export async function runCommunityLabelSweep({
           if (dmResult?.sent) {
             await confirmWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel });
             summary.warned += 1;
+          } else if (dmResult?.definitive) {
+            // Definitive pre-send failure (rate limit, bad input, no relay
+            // reached): no gift-wrap was published, so release the claim.
+            // Re-sending is not a duplicate. Retry is opportunistic, not
+            // guaranteed: the watermark still advances (a persistent definitive
+            // failure like a bad pubkey must never wedge the sweep), so the
+            // warning is only re-attempted when a later sweep re-processes a
+            // vote for this creator. A residual miss falls to human ban-review.
+            await releaseWarning(db, { creatorPubkey: videoEvent.pubkey, warningLevel });
           } else {
-            // {sent:false} is ambiguous: a relay can accept the gift-wrap
-            // while its OK is lost, so we cannot prove no DM went out. Retain
-            // the claim (do not resend) so a possibly-delivered warning is
-            // never duplicated; a genuinely-missed one is caught by the
-            // human ban-review backstop. (Gift-wraps have random ids, so —
-            // unlike the label — the relay can't dedup a resend for us.)
+            // Ambiguous: a relay may have accepted the gift-wrap while its OK
+            // was lost, so we cannot prove no DM went out. Retain the claim (do
+            // not resend) so a possibly-delivered warning is never duplicated;
+            // a genuinely-missed one is caught by the human ban-review backstop.
+            // Gift-wraps have random ids, so — unlike the label — the relay
+            // can't dedup a resend for us.
             console.log(`[COMMUNITY-LABELS] warning DM unconfirmed for ${videoEvent.pubkey} level ${warningLevel}; claim retained, no resend`);
           }
         }

@@ -850,15 +850,22 @@ export async function notifyReporters(sha256, action, env, logPrefix = '[DM]') {
  *   the send deterministically without the real per-call crypto (a module-level
  *   mock of the transport does not reliably isolate in the single-worker pool —
  *   same rationale as publishDmInboxRelayList's `connect` seam).
- * @returns {Promise<{ sent: boolean, reason?: string }>}
+ * @returns {Promise<{ sent: boolean, definitive?: boolean, reason?: string }>}
+ *   On failure, `definitive` is `true` when the send failed BEFORE any relay
+ *   publish was attempted (rate limit, bad input, key/relay-discovery failure):
+ *   nothing went out, so a caller may safely retry. It is `false` once a publish
+ *   was attempted, because a relay can accept the gift-wrap while its OK is lost;
+ *   such a warning must not be resent. Gift-wraps carry random ids, so the relay
+ *   cannot dedup a resend for us.
  */
 async function sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, messageType, wrap) {
+  let publishAttempted = false;
   try {
     if (!recipientPubkey || typeof recipientPubkey !== 'string') {
-      return { sent: false, reason: 'Invalid recipient pubkey' };
+      return { sent: false, definitive: true, reason: 'Invalid recipient pubkey' };
     }
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
-      return { sent: false, reason: 'Empty message' };
+      return { sent: false, definitive: true, reason: 'Empty message' };
     }
 
     let keys;
@@ -866,12 +873,12 @@ async function sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 
       keys = getModeratorKeys(env);
     } catch (err) {
       console.error('[DM] Cannot send moderator message:', err.message);
-      return { sent: false, reason: err.message };
+      return { sent: false, definitive: true, reason: err.message };
     }
 
     const withinLimit = await checkRateLimit(recipientPubkey, env);
     if (!withinLimit) {
-      return { sent: false, reason: 'Rate limited' };
+      return { sent: false, definitive: true, reason: 'Rate limited' };
     }
 
     const wrappedEvent = wrap(
@@ -881,10 +888,13 @@ async function sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 
     );
 
     const relayUrls = await discoverUserRelays(recipientPubkey, env);
+    // From here a relay may accept the event even if we never see the OK, so
+    // any failure at or after this point is ambiguous (definitive: false).
+    publishAttempted = true;
     const { success } = await publishToRelays(wrappedEvent, relayUrls, env);
 
     if (success === 0) {
-      return { sent: false, reason: 'All relay publishes failed' };
+      return { sent: false, definitive: false, reason: 'All relay publishes failed' };
     }
 
     await recordRateLimit(recipientPubkey, env);
@@ -917,7 +927,9 @@ async function sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 
     return { sent: true, relaysPublished: success };
   } catch (err) {
     console.error('[DM] Unexpected error sending moderator message:', err.message);
-    return { sent: false, reason: err.message };
+    // A throw before the publish was attempted (wrap/discovery) is a definitive
+    // no-send; a throw at or after publish is ambiguous and must not be resent.
+    return { sent: false, definitive: !publishAttempted, reason: err.message };
   }
 }
 

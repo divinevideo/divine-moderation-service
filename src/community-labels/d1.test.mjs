@@ -13,6 +13,7 @@ import {
   strikeCount,
   claimWarning,
   confirmWarning,
+  releaseWarning,
   listStrikeSummary,
   listStrikesForCreator,
 } from './d1.mjs';
@@ -138,6 +139,21 @@ describe('strikes and warnings', () => {
     expect(db.warnings.get(`${CREATOR_1}:1`).status).toBe('sent');
     // A sent claim still refuses a re-send.
     expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 8 })).toBe(false);
+  });
+
+  it('releaseWarning frees a pending claim to retry but never a sent one', async () => {
+    // A definitive pre-send failure releases the pending claim so a later tick
+    // can re-claim and retry.
+    expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 5 })).toBe(true);
+    await releaseWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1 });
+    expect(db.warnings.has(`${CREATOR_1}:1`)).toBe(false);
+    expect(await claimWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1, now: 6 })).toBe(true);
+
+    // A SENT claim must never be released — that would re-open a delivered
+    // warning to a duplicate resend.
+    await confirmWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1 });
+    await releaseWarning(db, { creatorPubkey: CREATOR_1, warningLevel: 1 });
+    expect(db.warnings.get(`${CREATOR_1}:1`).status).toBe('sent');
   });
 
   it('listStrikeSummary ranks creators by strike count desc', async () => {

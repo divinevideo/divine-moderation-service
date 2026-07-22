@@ -778,4 +778,57 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
     expect(loggedInserts).toHaveLength(1);
     expect(loggedInserts[0][MESSAGE_TYPE_BIND_INDEX]).toBe('moderator_reply');
   });
+
+  it('reports a rate-limited warning as a definitive pre-send failure', async () => {
+    // checkRateLimit fails before any gift-wrap is created or published, so the
+    // caller learns nothing went out and may safely retry (definitive: true).
+    const now = Math.floor(Date.now() / 1000);
+    const rateLimitedEnv = {
+      NOSTR_PRIVATE_KEY: testHex,
+      BLOSSOM_DB: capturingDb(),
+      MODERATION_KV: createMockKV({
+        [`dm-ratelimit:${recipient}`]: JSON.stringify([now - 5, now - 10, now - 15, now - 20, now - 25]),
+      }),
+    };
+
+    const result = await sendCommunityStrikeWarning(
+      recipient, 'You have 3 content-warning strikes.', 'f'.repeat(64), rateLimitedEnv, null,
+      { wrap: fakeWrap },
+    );
+
+    expect(result.sent).toBe(false);
+    expect(result.definitive).toBe(true);
+    expect(loggedInserts).toHaveLength(0);
+  });
+
+  it('reports an all-relays-rejected warning as an ambiguous failure', async () => {
+    // The event is published but every relay rejects the OK; a relay could
+    // still have stored it while the OK was lost, so this is ambiguous
+    // (definitive: false) and must not be resent.
+    class RejectWS {
+      constructor() {
+        this._cbs = {};
+        queueMicrotask(() => this._cbs.open && this._cbs.open());
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send(msg) {
+        const parsed = JSON.parse(msg);
+        if (parsed[0] === 'EVENT') {
+          this._cbs.message
+            && this._cbs.message({ data: JSON.stringify(['OK', parsed[1].id, false, 'blocked']) });
+        }
+      }
+      close() {}
+    }
+    globalThis.WebSocket = RejectWS;
+
+    const result = await sendCommunityStrikeWarning(
+      recipient, 'You have 3 content-warning strikes.', 'f'.repeat(64), env, null,
+      { wrap: fakeWrap },
+    );
+
+    expect(result.sent).toBe(false);
+    expect(result.definitive).toBe(false);
+    expect(result.reason).toContain('All relay publishes failed');
+  });
 });

@@ -642,13 +642,18 @@ describe('runCommunityLabelSweep', () => {
     expect(deps.sendWarningDm).not.toHaveBeenCalled();
   });
 
-  it('does not re-send the warning DM after an unconfirmed send', async () => {
-    // {sent:false} is ambiguous — a relay can accept the gift-wrap while its
-    // OK is lost, so we can't prove no DM went out. The claim is retained and
-    // the next tick does NOT re-send, so a possibly-delivered warning is never
-    // duplicated (gift-wraps have random ids, so the relay can't dedup for us).
+  it('retains the claim and never resends the warning after an ambiguous send failure', async () => {
+    // {sent:false, definitive:false} — a relay may have accepted the gift-wrap
+    // while its OK was lost, so we can't prove no DM went out. The claim is
+    // retained and the next tick does NOT re-send, so a possibly-delivered
+    // warning is never duplicated (gift-wraps have random ids, so the relay
+    // can't dedup a resend for us).
     deps = makeDeps({ kvEntries: { strike_warning_count: '1' } });
-    deps.sendWarningDm.mockResolvedValueOnce({ sent: false, reason: 'rate limited' });
+    deps.sendWarningDm.mockResolvedValueOnce({
+      sent: false,
+      definitive: false,
+      reason: 'All relay publishes failed',
+    });
 
     const tick1 = await runCommunityLabelSweep(deps);
     expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
@@ -658,5 +663,29 @@ describe('runCommunityLabelSweep', () => {
     const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
     expect(deps.sendWarningDm).not.toHaveBeenCalled();
     expect(tick2.warned).toBe(0);
+  });
+
+  it('releases the claim and retries the warning after a definitive pre-send failure', async () => {
+    // {sent:false, definitive:true} — the DM failed before any publish (e.g.
+    // rate limited), so no gift-wrap went out. Exercises the claim state
+    // machine: the claim is released, so a later sweep re-claims and re-sends
+    // (here the fake fetch re-surfaces the same votes); on success the warning
+    // is confirmed exactly once. (Production retry is opportunistic — it needs a
+    // fresh vote to re-enter the window — but that watermark flow is out of
+    // scope for this unit test.)
+    deps = makeDeps({ kvEntries: { strike_warning_count: '1' } });
+    deps.sendWarningDm.mockResolvedValueOnce({
+      sent: false,
+      definitive: true,
+      reason: 'Rate limited',
+    });
+
+    const tick1 = await runCommunityLabelSweep(deps);
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(1);
+    expect(tick1.warned).toBe(0);
+
+    const tick2 = await runCommunityLabelSweep({ ...deps, now: NOW_SECONDS + 300 });
+    expect(deps.sendWarningDm).toHaveBeenCalledTimes(2);
+    expect(tick2.warned).toBe(1);
   });
 });
