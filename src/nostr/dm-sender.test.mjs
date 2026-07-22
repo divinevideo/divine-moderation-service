@@ -330,6 +330,19 @@ describe('DM Sender - discoverUserRelays', () => {
 
     expect(relays.length).toBeGreaterThan(0);
   });
+
+  it('never returns an empty list when the cache holds "[]"', async () => {
+    // A poisoned/empty cached list must not yield zero relays: publishing to
+    // zero relays is read downstream as success===0 and misclassified as an
+    // ambiguous send. Fall through to discovery, which always includes the
+    // divine relay.
+    mockKV.get.mockResolvedValue('[]');
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays.length).toBeGreaterThan(0);
+    expect(relays).toContain('wss://relay.divine.video');
+  });
 });
 
 describe('DM Sender - Error Handling', () => {
@@ -644,7 +657,7 @@ describe('publishToRelays — Workers WebSocket construction', () => {
 
     const res = await publishToRelays({ id: 'evt1' }, ['wss://relay.example.com'], {});
 
-    expect(res).toEqual({ success: 1, failed: 0 });
+    expect(res).toEqual({ success: 1, failed: 0, rejected: 0 });
     expect(ctorArgs).toHaveLength(1);
     expect(ctorArgs[0]).toHaveLength(1); // URL only — the regression guard
     expect(ctorArgs[0][0]).toBe('wss://relay.example.com');
@@ -801,10 +814,10 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
     expect(loggedInserts).toHaveLength(0);
   });
 
-  it('reports an all-relays-rejected warning as an ambiguous failure', async () => {
-    // The event is published but every relay rejects the OK; a relay could
-    // still have stored it while the OK was lost, so this is ambiguous
-    // (definitive: false) and must not be resent.
+  it('reports an all-relays-EXPLICITLY-rejected warning as a definitive failure', async () => {
+    // Every relay returned OK=false: the event was received and refused
+    // everywhere, so nothing was stored and a retry cannot duplicate. That is a
+    // definitive non-delivery (definitive: true), so the claim may be released.
     class RejectWS {
       constructor() {
         this._cbs = {};
@@ -828,7 +841,83 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
     );
 
     expect(result.sent).toBe(false);
+    expect(result.definitive).toBe(true);
+    expect(result.reason).toContain('All relay publishes failed');
+  });
+
+  it('reports a warning with no relay acknowledgement as an ambiguous failure', async () => {
+    // The relay opened and received the EVENT but closed without ever sending
+    // an OK. A relay can store an event and lose (or never send) its OK, so
+    // delivery is unknown (definitive: false) and the warning must not be
+    // resent — unlike an explicit OK=false, we cannot prove nothing was stored.
+    class NoAckWS {
+      constructor() {
+        this._cbs = {};
+        queueMicrotask(() => this._cbs.open && this._cbs.open());
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send(msg) {
+        const parsed = JSON.parse(msg);
+        if (parsed[0] === 'EVENT') {
+          // Close without an OK response.
+          this._cbs.close && this._cbs.close();
+        }
+      }
+      close() { this._cbs.close && this._cbs.close(); }
+    }
+    globalThis.WebSocket = NoAckWS;
+
+    const result = await sendCommunityStrikeWarning(
+      recipient, 'You have 3 content-warning strikes.', 'f'.repeat(64), env, null,
+      { wrap: fakeWrap },
+    );
+
+    expect(result.sent).toBe(false);
     expect(result.definitive).toBe(false);
     expect(result.reason).toContain('All relay publishes failed');
+  });
+
+  it('stays ambiguous when relays are split between explicit rejection and no-ack', async () => {
+    // One relay explicitly rejects (OK=false), another closes without an OK.
+    // Only ALL-explicit-rejection is definitive; the lone missing ack could be
+    // a stored-but-lost-OK, so the mixed outcome is ambiguous (definitive:false)
+    // and the warning must not be resent. Pins the `rejected === failed`
+    // boundary. (A seeded relay cache is returned verbatim, so exactly these two
+    // relays are contacted.)
+    const mixedEnv = {
+      NOSTR_PRIVATE_KEY: testHex,
+      BLOSSOM_DB: capturingDb(),
+      MODERATION_KV: createMockKV({
+        [`relay-list:${recipient}`]: JSON.stringify(['wss://reject.example.com', 'wss://noack.example.com']),
+      }),
+    };
+    class MixedWS {
+      constructor(url) {
+        this._url = url;
+        this._cbs = {};
+        queueMicrotask(() => this._cbs.open && this._cbs.open());
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send(msg) {
+        const parsed = JSON.parse(msg);
+        if (parsed[0] !== 'EVENT') return;
+        if (this._url.includes('reject')) {
+          this._cbs.message
+            && this._cbs.message({ data: JSON.stringify(['OK', parsed[1].id, false, 'blocked']) });
+        } else {
+          this._cbs.close && this._cbs.close();
+        }
+      }
+      close() { this._cbs.close && this._cbs.close(); }
+    }
+    globalThis.WebSocket = MixedWS;
+
+    const result = await sendCommunityStrikeWarning(
+      recipient, 'You have 3 content-warning strikes.', 'f'.repeat(64), mixedEnv, null,
+      { wrap: fakeWrap },
+    );
+
+    expect(result.sent).toBe(false);
+    expect(result.definitive).toBe(false);
   });
 });
