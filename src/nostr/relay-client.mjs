@@ -4,7 +4,34 @@
 // ABOUTME: Nostr relay WebSocket client for fetching event context
 // ABOUTME: Connects to relay.divine.video to get kind 34236 video events by SHA256
 
+import { verifyEvent } from 'nostr-tools/pure';
 import { extractMediaShaFromEvent } from '../validation.mjs';
+
+const HEX64_RE = /^[0-9a-f]{64}$/;
+
+// A 2xx body is only the definitive answer if it is the exact signed event we
+// asked for. The relay's claimed `id` field is untrusted, so verifyEvent()
+// recomputes the canonical hash and, together with the requested-id match,
+// cryptographically binds the returned pubkey/tags/content to eventId — plus
+// it validates the signature (authentic author). Anything else (wrong event,
+// tampered, malformed, bad signature) is routed through the transient path so
+// callers hold rather than act on an event they didn't ask for — never
+// labeling/striking/reporting one event based on another.
+function isRequestedSignedEvent(event, eventId) {
+  return (
+    event &&
+    typeof event === 'object' &&
+    event.id === eventId &&
+    typeof event.pubkey === 'string' &&
+    HEX64_RE.test(event.pubkey) &&
+    typeof event.kind === 'number' &&
+    Number.isInteger(event.created_at) &&
+    Array.isArray(event.tags) &&
+    typeof event.content === 'string' &&
+    typeof event.sig === 'string' &&
+    verifyEvent(event)
+  );
+}
 
 const DEFAULT_SHA_BATCH_CHUNK_SIZE = 25;
 const MAX_SHA_BATCH_CHUNK_SIZE = 100;
@@ -12,6 +39,7 @@ const DEFAULT_SHA_BATCH_CONCURRENCY = 3;
 const MAX_SHA_BATCH_CONCURRENCY = 8;
 const DEFAULT_SHA_BATCH_QUERY_LIMIT = 100;
 const MAX_SHA_BATCH_QUERY_LIMIT = 500;
+export const LABEL_EVENTS_FOR_VIDEO_LIMIT = 5000;
 
 function parseBoundedInteger(value, fallback, min, max) {
   const parsed = Number.parseInt(String(value), 10);
@@ -55,7 +83,13 @@ async function queryRelay(relayUrl, filter, env = {}, options = {}) {
     let ws;
     let settled = false;
     let subscriptionId = null;
+    let eoseReceived = false;
     const collectAll = Boolean(options.collectAll);
+    // When set (opt-in), a socket close before EOSE rejects instead of
+    // resolving with a partial result — so a truncated/dropped stream becomes
+    // a transient failure the caller can retry, not a silent below-threshold
+    // read. Only meaningful with collectAll.
+    const rejectOnPrematureClose = Boolean(options.rejectOnPrematureClose);
     const events = [];
     let firstEvent = null;
     const timeout = setTimeout(() => {
@@ -122,6 +156,7 @@ async function queryRelay(relayUrl, filter, env = {}, options = {}) {
           }
 
           if (data[0] === 'EOSE' && data[1] === subscriptionId) {
+            eoseReceived = true;
             try {
               ws.close();
             } catch {}
@@ -137,6 +172,10 @@ async function queryRelay(relayUrl, filter, env = {}, options = {}) {
       });
 
       ws.addEventListener('close', () => {
+        if (collectAll && rejectOnPrematureClose && !eoseReceived) {
+          finish(new Error('WebSocket closed before EOSE'));
+          return;
+        }
         finish(collectAll ? events : firstEvent);
       });
 
@@ -453,6 +492,41 @@ export async function fetchKind5EventsSince(sinceSeconds, relayUrl = 'wss://rela
   return queryRelay(relayUrl, { kinds: [5], since: sinceSeconds }, env, { collectAll: true });
 }
 
+/**
+ * Fetch kind 1985 (NIP-32 label) events created since a cursor. Callers
+ * filter by namespace in code; relays are not assumed to index #L.
+ */
+export async function fetchLabelEventsSince(sinceSeconds, relayUrl = 'wss://relay.divine.video', env = {}, { limit } = {}) {
+  const filter = { kinds: [1985], since: sinceSeconds };
+  if (Number.isInteger(limit) && limit > 0) filter.limit = limit;
+  // Strict: a close before EOSE is a truncated poll, not a complete window.
+  // Rejecting holds the sweep cursor rather than advancing past unseen votes.
+  return queryRelay(relayUrl, filter, env, { collectAll: true, rejectOnPrematureClose: true });
+}
+
+/**
+ * Fetch every kind 1985 label event targeting a video, via its #e tag and —
+ * when the video is addressable — its #a tag, deduped by event id.
+ */
+export async function fetchLabelEventsForVideo({ eventId, addressableId }, relayUrl = 'wss://relay.divine.video', env = {}, { limit = LABEL_EVENTS_FOR_VIDEO_LIMIT } = {}) {
+  const byId = new Map();
+  // Strict: a truncated per-video tally must fail (and hold the cursor), not
+  // silently under-count and let a below-threshold read advance the watermark.
+  const viaE = await queryRelay(relayUrl, { kinds: [1985], '#e': [eventId], limit }, env, { collectAll: true, rejectOnPrematureClose: true });
+  if (viaE.length >= limit) {
+    throw new Error(`per-video label tally reached relay page limit (${limit}) for #e ${eventId}`);
+  }
+  for (const event of viaE) byId.set(event.id, event);
+  if (addressableId) {
+    const viaA = await queryRelay(relayUrl, { kinds: [1985], '#a': [addressableId], limit }, env, { collectAll: true, rejectOnPrematureClose: true });
+    if (viaA.length >= limit) {
+      throw new Error(`per-video label tally reached relay page limit (${limit}) for #a ${addressableId}`);
+    }
+    for (const event of viaA) byId.set(event.id, event);
+  }
+  return [...byId.values()];
+}
+
 export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine.video'], env = {}, options = {}) {
   // Reject non-hex IDs to prevent path-traversal via attacker-controlled kind 5 e-tags
   if (!eventId || !/^[a-f0-9]{64}$/i.test(eventId)) return null;
@@ -474,13 +548,23 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
       }
       const response = await fetch(`${apiBaseUrl}/api/event/${eventId}`, { headers });
       if (!response.ok) {
-        const isTransient = response.status >= 500 || response.status === 429;
-        if (!isTransient) anyDefinitiveResponse = true;
+        // Only a genuine 404 is a definitive "not found". 401/403 (auth
+        // blips), 5xx, and 429 are transient and must be retried, not read
+        // as "event absent" — otherwise the sweep advances its watermark
+        // past votes it never actually resolved.
+        if (response.status === 404) anyDefinitiveResponse = true;
         continue;
       }
-      anyDefinitiveResponse = true;
+      // A 2xx counts as definitive only once we have the exact requested
+      // signed event. Invalid JSON throws into the catch below (transient);
+      // a wrong-id, malformed, or signature-invalid body fails the validator
+      // and falls through to `continue` (transient). Neither is treated as
+      // "event absent" — the caller must not act on an event it didn't ask for.
       const event = await response.json();
-      if (event?.id && event?.pubkey) return event;
+      if (isRequestedSignedEvent(event, eventId)) {
+        anyDefinitiveResponse = true;
+        return event;
+      }
     } catch {
       continue;
     }

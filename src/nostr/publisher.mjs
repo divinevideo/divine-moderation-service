@@ -198,26 +198,55 @@ function createReportEvent(report, privateKeyHex) {
  * @returns {Promise<Object>} Published event details
  */
 export async function publishLabelEvent(labelData, env, mockRelay = null) {
-  const { sha256, category, status, score, cdnUrl, nostrEventId } = labelData;
+  const { sha256, category, status, nostrEventId } = labelData;
 
-  // Validate configuration
-  if (!env.NOSTR_PRIVATE_KEY) {
-    console.log('[LABEL] No NOSTR_PRIVATE_KEY configured, skipping label publish');
+  const event = buildLabelEvent(labelData, env);
+  if (!event) {
     return { published: false, reason: 'No signing key configured' };
   }
 
+  console.log(`[LABEL] Publishing kind 1985 label: ${category}=${status} for ${sha256 ?? `event ${nostrEventId}`}`);
+  return publishPreparedLabelEvent(event, env, mockRelay);
+}
+
+/**
+ * Build (but do not publish) a signed NIP-32 kind 1985 label event.
+ *
+ * Split out from {@link publishLabelEvent} so callers that must persist the
+ * exact event bytes BEFORE publishing (the community sweep's claim-before-send)
+ * can store this event and replay it verbatim on retry — a code or key change
+ * between publish and confirm then cannot mint a second label id.
+ *
+ * @param {Object} labelData - Same shape as {@link publishLabelEvent}.
+ * @param {Object} env - Environment with Nostr credentials.
+ * @returns {Object|null} Signed event, or null when no signing key is configured.
+ */
+export function buildLabelEvent(labelData, env) {
+  if (!env.NOSTR_PRIVATE_KEY) {
+    console.log('[LABEL] No NOSTR_PRIVATE_KEY configured, skipping label build');
+    return null;
+  }
+  return createLabelEvent(labelData, env.NOSTR_PRIVATE_KEY);
+}
+
+/**
+ * Publish an already-signed label event verbatim.
+ *
+ * The event is published exactly as given — no rebuild, no re-sign — so a
+ * caller replaying a stored event across retries gets a byte-identical event
+ * the relay dedups by id.
+ *
+ * @param {Object} event - A signed kind 1985 event (from {@link buildLabelEvent}).
+ * @param {Object} env - Environment with relay config.
+ * @param {Object} [mockRelay] - Mock relay for testing.
+ * @returns {Promise<Object>} Publish result ({ published, eventId, ... }).
+ */
+export async function publishPreparedLabelEvent(event, env, mockRelay = null) {
   const relayUrl = env.NOSTR_RELAY_URL || env.FARO_RELAY_URL;
   if (!relayUrl) {
     console.log('[LABEL] No relay URL configured, skipping label publish');
     return { published: false, reason: 'No relay URL configured' };
   }
-
-  const privateKeyHex = env.NOSTR_PRIVATE_KEY;
-
-  // Create the label event
-  const event = createLabelEvent(labelData, privateKeyHex);
-
-  console.log(`[LABEL] Publishing kind 1985 label: ${category}=${status} for ${sha256.substring(0, 16)}...`);
 
   try {
     if (mockRelay) {
@@ -265,8 +294,10 @@ export async function publishLabelEvent(labelData, env, mockRelay = null) {
  * @returns {Object} Signed Nostr event
  */
 function createLabelEvent(labelData, privateKeyHex) {
-  const { sha256, category, status, score, cdnUrl, nostrEventId } = labelData;
-  const source = labelData.source === 'automated' ? 'automated' : 'human-moderator';
+  const { sha256, category, status, score, cdnUrl, nostrEventId, voteCount } = labelData;
+  const source = ['automated', 'community'].includes(labelData.source)
+    ? labelData.source
+    : 'human-moderator';
   const verified = source === 'human-moderator';
 
   // Get the standard label name
@@ -313,19 +344,34 @@ function createLabelEvent(labelData, privateKeyHex) {
     tags.push(['r', cdnUrl]);
   }
 
-  // Always include the sha256 as an identifier
-  tags.push(['x', sha256]);  // Content hash reference
+  // Include the sha256 identifier when the video carries one; videos with
+  // no x/imeta-x tag stay targetable via the e tag alone.
+  if (sha256) {
+    tags.push(['x', sha256]);  // Content hash reference
+  }
 
   // Build content (human-readable summary)
-  const subject = source === 'automated' ? 'Automated moderator flagged' : 'Human moderator verified';
-  const content = status === 'confirmed'
-    ? `${subject}: This content contains ${labelName} (confidence: ${(score * 100).toFixed(0)}%)`
-    : `${subject}: This content does NOT contain ${labelName} (was ${(score * 100).toFixed(0)}%)`;
+  let content;
+  if (source === 'community') {
+    content = `Community consensus flagged: This content contains ${labelName} (${voteCount} distinct reporters)`;
+  } else {
+    const subject = source === 'automated' ? 'Automated moderator flagged' : 'Human moderator verified';
+    content = status === 'confirmed'
+      ? `${subject}: This content contains ${labelName} (confidence: ${(score * 100).toFixed(0)}%)`
+      : `${subject}: This content does NOT contain ${labelName} (was ${(score * 100).toFixed(0)}%)`;
+  }
+
+  // A caller-supplied created_at makes the event id deterministic across
+  // retries (the community sweep freezes it in its claim row so the relay
+  // dedups a re-published label by id). Absent one, stamp the current time.
+  const createdAt = Number.isInteger(labelData.createdAt) && labelData.createdAt > 0
+    ? labelData.createdAt
+    : Math.floor(Date.now() / 1000);
 
   // Create unsigned event
   const unsignedEvent = {
     kind: 1985,  // NIP-32 label event
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: createdAt,
     tags,
     content
   };

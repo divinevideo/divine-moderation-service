@@ -7,11 +7,11 @@
 import { validateQueueMessage } from './schemas/queue-message.mjs';
 import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
 import { applyForceProvider, shouldQueueHiveRecheck } from './moderation/report-trigger.mjs';
-import { publishToFaro, publishToContentRelay, publishLabelEvent, publishDmInboxRelayList } from './nostr/publisher.mjs';
+import { publishToFaro, publishToContentRelay, publishLabelEvent, buildLabelEvent, publishPreparedLabelEvent, publishDmInboxRelayList } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
 import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
-import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById } from './nostr/relay-client.mjs';
+import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById, fetchLabelEventsSince, fetchLabelEventsForVideo } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
 import { getLastReportPollTimestamp, getReportLastRun, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
 import { getPublicKey } from 'nostr-tools/pure';
@@ -43,6 +43,11 @@ import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
 import { runCreatorDeleteCron } from './creator-delete/cron.mjs';
+import { sendModeratorReply, sendCommunityStrikeWarning, getCommunityStrikeWarningMessage, getModeratorKeys } from './nostr/dm-sender.mjs';
+import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
+import { isEnabled as communityLabelsEnabled, SINCE_POLL_LIMIT as COMMUNITY_SINCE_POLL_LIMIT } from './community-labels/config.mjs';
+import { isDivineIdentity } from './community-labels/identity.mjs';
+import { listStrikeSummary, listStrikesForCreator, strikeCount } from './community-labels/d1.mjs';
 import { fetchKind5WithRetry } from './creator-delete/funnelcake-fetch.mjs';
 import {
   listAgeRestrictedCandidates,
@@ -1892,6 +1897,64 @@ export default {
       }
     }
 
+    // Community strike review feed (#180): creators ranked by strikes for
+    // human ban decisions — the pipeline itself never bans.
+    if (url.pathname === '/admin/api/community-strikes') {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to /admin/api/community-strikes`);
+        return authError;
+      }
+
+      const limit = Math.min(Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10) || 100), 500);
+      const creators = await listStrikeSummary(env.BLOSSOM_DB, { limit });
+      return new Response(JSON.stringify({ creators }), {
+        headers: JSON_HEADERS
+      });
+    }
+
+    // Community strike drill-down (#180): every strike row behind one creator's
+    // count, paged in SQL so the summary's per-creator evidence cap stays fully
+    // auditable — a creator with more strikes than the cap is pageable here.
+    if (url.pathname.startsWith('/admin/api/community-strikes/')) {
+      const authError = await requireAuth(request, env);
+      if (authError) {
+        console.log(`[${requestId}] Unauthorized access to ${url.pathname}`);
+        return authError;
+      }
+
+      // Normalize to lowercase: strikes are stored lowercase, so an uppercase
+      // pubkey in the URL would otherwise validate but return zero rows.
+      const creatorPubkey = decodeURIComponent(
+        url.pathname.slice('/admin/api/community-strikes/'.length)
+      ).toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(creatorPubkey)) {
+        return new Response(JSON.stringify({ error: 'Invalid creator pubkey' }), {
+          status: 400,
+          headers: JSON_HEADERS
+        });
+      }
+
+      const pageSize = Math.min(Math.max(1, parseInt(url.searchParams.get('pageSize') || '50', 10) || 50), 200);
+      const page = Math.max(1, parseInt(url.searchParams.get('page') || '1', 10) || 1);
+      const offset = (page - 1) * pageSize;
+
+      const total = await strikeCount(env.BLOSSOM_DB, creatorPubkey);
+      const strikes = await listStrikesForCreator(env.BLOSSOM_DB, {
+        creatorPubkey,
+        limit: pageSize,
+        offset
+      });
+      return new Response(JSON.stringify({
+        creator_pubkey: creatorPubkey,
+        page,
+        page_size: pageSize,
+        total,
+        has_more: offset + strikes.length < total,
+        strikes
+      }), { headers: JSON_HEADERS });
+    }
+
     // Get untriaged (unmoderated) videos from D1
     if (url.pathname === '/admin/api/untriaged') {
       const authError = await requireAuth(request, env);
@@ -3639,7 +3702,6 @@ async function runMigration() {
       if (!message) {
         return new Response(JSON.stringify({ error: 'message is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
       }
-      const { sendModeratorReply } = await import('./nostr/dm-sender.mjs');
       // Honor the send result so the compose UI can surface real failures
       // (e.g. no relays reachable) instead of silently reporting success.
       const result = await sendModeratorReply(pubkey, message, sha256 || null, env, null);
@@ -5238,6 +5300,50 @@ async function runMigration() {
         } catch (err) {
           console.error('[CRON] Reality Defender polling failed:', err);
         }
+      }
+
+      // Community content-warning aggregation (#180, divine-mobile #4771).
+      // Behind the KV kill switch community_labels_enabled ('true' to run) —
+      // deploying this code does not activate it. Isolated try/catch so a
+      // sweep failure cannot break the other */5 jobs.
+      try {
+        if (env.MODERATION_KV && env.BLOSSOM_DB && env.NOSTR_PRIVATE_KEY && await communityLabelsEnabled(env.MODERATION_KV)) {
+          const relayUrl = env.NOSTR_RELAY_URL || 'wss://relay.divine.video';
+          const moderationPubkey = getModeratorKeys(env).publicKey;
+
+          const summary = await runCommunityLabelSweep({
+            db: env.BLOSSOM_DB,
+            kv: env.MODERATION_KV,
+            now: Math.floor(Date.now() / 1000),
+            fetchLabelsSince: (since) => fetchLabelEventsSince(since, relayUrl, env, { limit: COMMUNITY_SINCE_POLL_LIMIT }),
+            fetchLabelsForVideo: (target) => fetchLabelEventsForVideo(target, relayUrl, env),
+            fetchVideoEvent: (eventId) => fetchNostrEventById(eventId, [relayUrl], env, { throwOnTransient: true }),
+            isDivine: (pubkey) => isDivineIdentity(pubkey, { kv: env.MODERATION_KV, throwOnTransient: true }),
+            buildLabelEvent: async ({ videoEventId, sha256, label, voteCount, createdAt }) =>
+              buildLabelEvent({
+                sha256,
+                category: label,
+                status: 'confirmed',
+                score: 1,
+                source: 'community',
+                voteCount,
+                nostrEventId: videoEventId,
+                createdAt,
+              }, env),
+            publishLabel: async ({ event }) => {
+              const result = await publishPreparedLabelEvent(event, env);
+              return { published: result.published === true, eventId: result.eventId };
+            },
+            sendWarningDm: async ({ creatorPubkey, strikeCount, videoSha256 }) => {
+              const message = getCommunityStrikeWarningMessage(strikeCount, videoSha256);
+              return sendCommunityStrikeWarning(creatorPubkey, message, videoSha256, env, ctx);
+            },
+            moderationPubkey,
+          });
+          console.log(`[COMMUNITY-LABELS] Sweep complete: ${JSON.stringify(summary)}`);
+        }
+      } catch (error) {
+        console.error('[COMMUNITY-LABELS] Sweep failed:', error?.message || String(error));
       }
     }
   }

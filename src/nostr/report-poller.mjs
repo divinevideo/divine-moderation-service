@@ -7,8 +7,8 @@
 import { extractMediaShaFromEvent, getEventTagValue } from '../validation.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { fetchNostrEventById } from './relay-client.mjs';
+import { VIDEO_KINDS } from './video-kinds.mjs';
 
-const VIDEO_KINDS = new Set([34235, 34236]);
 const PROCESSED_PREFIX = 'report-poller:processed:';
 const TERMINAL_SKIP_TTL_SECONDS = 60 * 60 * 24 * 90;
 const RECORDED_TTL_SECONDS = 60 * 60 * 24 * 180;

@@ -5,10 +5,34 @@
 // ABOUTME: Verifies public API exposure, admin isolation, and workers.dev disablement
 
 import { describe, expect, it, vi } from 'vitest';
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 
 const publisherMocks = vi.hoisted(() => ({
   publishDmInboxRelayList: vi.fn()
 }));
+
+const communitySweepMocks = vi.hoisted(() => ({
+  runCommunityLabelSweep: vi.fn().mockResolvedValue({
+    swept: 0, published: 0, strikes: 0, warned: 0, cursorAdvanced: true
+  }),
+  listStrikeSummary: vi.fn().mockResolvedValue([]),
+  listStrikesForCreator: vi.fn().mockResolvedValue([]),
+  strikeCount: vi.fn().mockResolvedValue(0)
+}));
+
+vi.mock('./community-labels/sweep.mjs', () => ({
+  runCommunityLabelSweep: communitySweepMocks.runCommunityLabelSweep
+}));
+
+vi.mock('./community-labels/d1.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    listStrikeSummary: communitySweepMocks.listStrikeSummary,
+    listStrikesForCreator: communitySweepMocks.listStrikesForCreator,
+    strikeCount: communitySweepMocks.strikeCount
+  };
+});
 
 vi.mock('./nostr/publisher.mjs', async (importOriginal) => {
   const actual = await importOriginal();
@@ -3481,6 +3505,22 @@ describe('RD auto-escalation cron integration', () => {
 });
 
 describe('Report polling cron integration', () => {
+  // A real signed kind-34236 video event. fetchNostrEventById verifies the
+  // canonical id + signature (like a real relay target), so the fixture is
+  // signed with the uploader's key rather than hand-stamped with a fake id —
+  // its .id is the real hash and its pubkey is the uploader.
+  function buildSignedTarget(sha256) {
+    const uploaderSk = generateSecretKey();
+    const uploaderPubkey = getPublicKey(uploaderSk);
+    const targetEvent = finalizeEvent({
+      kind: 34236,
+      created_at: 1778692000,
+      tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
+      content: '',
+    }, uploaderSk);
+    return { targetEvent, targetEventId: targetEvent.id, uploaderPubkey };
+  }
+
   it('allows admins to read report polling status', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
@@ -3576,11 +3616,10 @@ describe('Report polling cron integration', () => {
   });
 
   it('runs inbound report polling and records kind 1984 reports for review', async () => {
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const moderationWrites = [];
     const kvStore = new Map();
     const websocketRequests = [];
@@ -3614,15 +3653,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -3817,11 +3851,10 @@ describe('Report polling cron integration', () => {
   });
 
   it('advances report checkpoint to terminal report timestamp instead of Date.now', async () => {
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const reportCreatedAt = 1778692782;
     const nowSeconds = 1778729000;
     const kvStore = new Map();
@@ -3856,15 +3889,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -3935,11 +3963,10 @@ describe('Report polling cron integration', () => {
   });
 
   it('does not advance report checkpoint when the report page is saturated', async () => {
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const reportCreatedAt = 1778692782;
     const previousCheckpoint = 1778600000;
     const kvStore = new Map([[
@@ -3982,15 +4009,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -4141,11 +4163,10 @@ describe('Report polling cron integration', () => {
   it('clears stale saturated resume boundaries after a successful resume checkpoint', async () => {
     const previousCheckpoint = 1778600000;
     const resumeUntil = 1778692781;
-    const targetEventId = '1'.repeat(64);
     const reportEventId = '2'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const kvStore = new Map([
       ['report-poller:last-poll', JSON.stringify({ timestamp: previousCheckpoint, lastPollAt: '2026-05-12T00:00:00.000Z' })],
       ['report-poller:last-run', JSON.stringify({ saturated: true, safeCheckpoint: null, resumeUntil })],
@@ -4182,14 +4203,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -4256,10 +4273,9 @@ describe('Report polling cron integration', () => {
   });
 
   it('advances report checkpoint when bounded drain resolves saturation', async () => {
-    const targetEventId = '1'.repeat(64);
     const reporterPubkey = '3'.repeat(64);
-    const uploaderPubkey = '4'.repeat(64);
     const sha256 = '5'.repeat(64);
+    const { targetEvent, targetEventId, uploaderPubkey } = buildSignedTarget(sha256);
     const kvStore = new Map();
     const checkpointWrites = [];
     const websocketRequests = [];
@@ -4295,15 +4311,10 @@ describe('Report polling cron integration', () => {
 
     globalThis.fetch = async (url) => {
       if (url === `https://reports.example.test/api/event/${targetEventId}`) {
-        return new Response(JSON.stringify({
-          id: targetEventId,
-          kind: 34236,
-          pubkey: uploaderPubkey,
-          created_at: 1778692000,
-          tags: [['d', sha256], ['imeta', `x ${sha256}`, 'm video/mp4']],
-          content: '',
-          sig: '6'.repeat(128),
-        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify(targetEvent), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
       return new Response('{}', { status: 404 });
     };
@@ -7619,5 +7630,187 @@ describe('GET /admin/api/dm-templates', () => {
     const templates = await res.json();
     const ban = templates.find(t => t.key === 'PERMANENT_BAN');
     expect(ban.body).toContain('divine.video/video/' + sha);
+  });
+});
+
+describe('community label sweep cron (#180)', () => {
+  function createCommunityCronEnv({ enabled } = {}) {
+    const kvStore = new Map();
+    if (enabled) kvStore.set('community_labels_enabled', 'true');
+    const env = createEnv({
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_ENABLED: 'false',
+      MODERATION_KV: {
+        async get(key) { return kvStore.has(key) ? kvStore.get(key) : null; },
+        async put(key, value) { kvStore.set(key, value); },
+        async delete(key) { kvStore.delete(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      }
+    });
+    return { env, kvStore };
+  }
+
+  it('does not run the sweep when the kill switch is off', async () => {
+    communitySweepMocks.runCommunityLabelSweep.mockClear();
+    const { env } = createCommunityCronEnv({ enabled: false });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(communitySweepMocks.runCommunityLabelSweep).not.toHaveBeenCalled();
+  });
+
+  it('runs the sweep when community_labels_enabled is true', async () => {
+    communitySweepMocks.runCommunityLabelSweep.mockClear();
+    const { env } = createCommunityCronEnv({ enabled: true });
+
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+
+    expect(communitySweepMocks.runCommunityLabelSweep).toHaveBeenCalledTimes(1);
+    const deps = communitySweepMocks.runCommunityLabelSweep.mock.calls[0][0];
+    expect(deps.moderationPubkey).toMatch(/^[0-9a-f]{64}$/);
+    expect(typeof deps.publishLabel).toBe('function');
+    expect(typeof deps.sendWarningDm).toBe('function');
+  });
+});
+
+describe('GET /admin/api/community-strikes (#180)', () => {
+  it('requires admin auth', async () => {
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/community-strikes'),
+      createEnv({ ALLOW_DEV_ACCESS: 'false' })
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it('returns the ranked strike summary for authenticated admins', async () => {
+    communitySweepMocks.listStrikeSummary.mockResolvedValue([
+      { creator_pubkey: 'c'.repeat(64), strikes: 4, last_at: 1700000000 }
+    ]);
+
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/community-strikes?limit=10', {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      creators: [{ creator_pubkey: 'c'.repeat(64), strikes: 4, last_at: 1700000000 }]
+    });
+    expect(communitySweepMocks.listStrikeSummary).toHaveBeenCalledWith(
+      expect.anything(),
+      { limit: 10 }
+    );
+  });
+});
+
+describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
+  const CREATOR = 'c'.repeat(64);
+
+  it('requires admin auth', async () => {
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}`),
+      createEnv({ ALLOW_DEV_ACCESS: 'false' })
+    );
+
+    expect(response.status).toBe(401);
+  });
+
+  it('rejects a non-hex creator pubkey', async () => {
+    const response = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/community-strikes/not-a-pubkey', {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(400);
+    expect(communitySweepMocks.listStrikesForCreator).not.toHaveBeenCalled();
+  });
+
+  it('returns one SQL-paged page of strikes with paging metadata', async () => {
+    communitySweepMocks.strikeCount.mockResolvedValue(25);
+    communitySweepMocks.listStrikesForCreator.mockResolvedValue(
+      Array.from({ length: 10 }, (_, i) => ({
+        video_event_id: `${i}`.padEnd(64, 'a'),
+        label: 'gambling',
+        created_at: 1700000000 - i,
+      }))
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=1&pageSize=10`, {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    const body = await response.json();
+    expect(body).toMatchObject({
+      creator_pubkey: CREATOR,
+      page: 1,
+      page_size: 10,
+      total: 25,
+      has_more: true,
+    });
+    expect(body.strikes).toHaveLength(10);
+    expect(communitySweepMocks.listStrikesForCreator).toHaveBeenCalledWith(
+      expect.anything(),
+      { creatorPubkey: CREATOR, limit: 10, offset: 0 }
+    );
+  });
+
+  it('reports has_more false on the last page', async () => {
+    communitySweepMocks.strikeCount.mockResolvedValue(25);
+    // Last page: offset 20 + 5 rows == total 25, so nothing remains.
+    communitySweepMocks.listStrikesForCreator.mockResolvedValue(
+      Array.from({ length: 5 }, (_, i) => ({
+        video_event_id: 'e'.repeat(64),
+        label: 'gambling',
+        created_at: 1700000000 - i,
+      }))
+    );
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=3&pageSize=10`, {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ page: 3, total: 25, has_more: false });
+    expect(body.strikes).toHaveLength(5);
+  });
+
+  it('clamps an oversized pageSize and offsets by page', async () => {
+    communitySweepMocks.strikeCount.mockResolvedValue(500);
+    communitySweepMocks.listStrikesForCreator.mockResolvedValue([]);
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=3&pageSize=5000`, {
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    expect(communitySweepMocks.listStrikesForCreator).toHaveBeenCalledWith(
+      expect.anything(),
+      { creatorPubkey: CREATOR, limit: 200, offset: 400 }
+    );
   });
 });

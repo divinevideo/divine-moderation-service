@@ -2,6 +2,7 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { afterEach, describe, it, expect } from 'vitest';
+import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
 import {
   fetchNostrEventBySha256,
   fetchNostrEventsBySha256Batch,
@@ -615,6 +616,108 @@ describe('fetchNostrEventById', () => {
       await expect(
         fetchNostrEventById(VALID_ID, ['wss://r1.test'])
       ).resolves.toBeNull();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and relay returns 401 (auth blip is retryable)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 401 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and relay returns 403 (auth blip is retryable)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('', { status: 403 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and a 2xx body is invalid JSON', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response('not-json', { status: 200 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when throwOnTransient and a 2xx body is missing id/pubkey (malformed)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ kind: 34236, tags: [] }), { status: 200 });
+    try {
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('returns the event when the 2xx body is the requested, validly-signed event', async () => {
+    const signed = finalizeEvent(
+      { kind: 34236, created_at: 1700000000, tags: [], content: '' },
+      generateSecretKey()
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify(signed), { status: 200 });
+    try {
+      await expect(
+        fetchNostrEventById(signed.id, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).resolves.toEqual(signed);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when a valid 2xx event is not the requested id', async () => {
+    const signed = finalizeEvent(
+      { kind: 34236, created_at: 1700000000, tags: [], content: '' },
+      generateSecretKey()
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify(signed), { status: 200 });
+    try {
+      // Ask for a different id than the returned body carries.
+      await expect(
+        fetchNostrEventById(VALID_ID, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('throws when the 2xx event id matches but the signature is invalid', async () => {
+    // The relay's claimed id is untrusted: a body whose id string matches but
+    // whose signature (and thus canonical hash) is invalid must be rejected, or
+    // the id match is meaningless. verifyEvent binds pubkey/tags/content to id.
+    const signed = finalizeEvent(
+      { kind: 34236, created_at: 1700000000, tags: [], content: '' },
+      generateSecretKey()
+    );
+    const tampered = { ...signed, sig: 'f'.repeat(128) };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response(JSON.stringify(tampered), { status: 200 });
+    try {
+      await expect(
+        fetchNostrEventById(tampered.id, ['wss://r1.test'], {}, { throwOnTransient: true })
+      ).rejects.toThrow(/transient/i);
     } finally {
       globalThis.fetch = originalFetch;
     }

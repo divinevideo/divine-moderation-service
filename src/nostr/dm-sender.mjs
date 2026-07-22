@@ -7,6 +7,7 @@
 import { wrapEvent } from 'nostr-tools/nip17';
 import { hexToBytes } from '@noble/hashes/utils';
 import { getPublicKey } from 'nostr-tools/pure';
+import { logDm, computeConversationId } from './dm-store.mjs';
 
 // Cache moderator keys per env object to avoid re-decoding
 const keyCache = new WeakMap();
@@ -78,6 +79,9 @@ const TEMPLATES = {
 
   REPORT_OUTCOME_NO_ACTION: (sha256, title, publishedAt, reportedAt) =>
     `Thanks for your report. We've reviewed ${contentSubject(title, 'the reported content')}${postedDate(publishedAt)} and no action was taken at this time.${reportedAt ? ` You reported this content on ${formatDate(reportedAt)}.` : ''}\n${contentLink(sha256)}\nIf you disagree with this outcome, you can reply to this message.\n\n${FOOTER}`,
+
+  COMMUNITY_MISLABEL_WARNING: (strikeCount, sha256) =>
+    `Heads up from Divine moderation: your account has ${strikeCount} content-warning strikes. Community consensus applied warning labels to videos you posted without them. Please add content warnings when sharing sensitive content. Repeated omissions are reviewed by our moderators and can lead to account restrictions.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n${contentLink(sha256)}\n${FOOTER}`,
 };
 
 // Per-action default reasons so AGE_RESTRICTED gets its own fallback text
@@ -203,6 +207,17 @@ export function getReportOutcomeMessage(action, sha256 = null, title = null, pub
     return TEMPLATES.REPORT_OUTCOME_ACTION(outcome, sha256, title, publishedAt, reportedAt);
   }
   return TEMPLATES.REPORT_OUTCOME_NO_ACTION(sha256, title, publishedAt, reportedAt);
+}
+
+/**
+ * Get the automated creator warning for community-applied content warnings.
+ *
+ * @param {number} strikeCount - Current strike count for the creator
+ * @param {string|null} sha256 - Content hash for conversation threading/linking
+ * @returns {string}
+ */
+export function getCommunityStrikeWarningMessage(strikeCount, sha256 = null) {
+  return TEMPLATES.COMMUNITY_MISLABEL_WARNING(strikeCount, sha256);
 }
 
 // --- Manual compose templates ---
@@ -333,8 +348,14 @@ export async function discoverUserRelays(pubkey, env) {
       const cached = await env.MODERATION_KV.get(`relay-list:${pubkey}`);
       if (cached) {
         const relays = JSON.parse(cached).slice(0, MAX_RELAYS);
-        console.log(`[DM] Using cached relay list for ${pubkey.substring(0, 16)}... (${relays.length} relays)`);
-        return relays;
+        // An empty cached list would mean publishing to zero relays, which the
+        // send path reads as success===0 and (with no rejections) misclassifies
+        // as an ambiguous outcome. Fall through to discovery, which always
+        // includes the divine relay, rather than ever returning [].
+        if (relays.length > 0) {
+          console.log(`[DM] Using cached relay list for ${pubkey.substring(0, 16)}... (${relays.length} relays)`);
+          return relays;
+        }
       }
     } catch (err) {
       console.error('[DM] Failed to read relay cache:', err.message);
@@ -477,21 +498,35 @@ export async function publishToRelays(event, relayUrls, env) {
 
   let success = 0;
   let failed = 0;
+  let rejected = 0;
   for (const r of results) {
-    if (r.status === 'fulfilled' && r.value) {
+    // publishToSingleRelay never rejects; a rejected settle is treated as an
+    // unknown outcome (ambiguous), same as 'no_ack'.
+    const outcome = r.status === 'fulfilled' ? r.value : 'no_ack';
+    if (outcome === 'accepted') {
       success++;
     } else {
       failed++;
+      if (outcome === 'rejected') rejected++;
     }
   }
 
   console.log(`[DM] Published to ${success}/${success + failed} relays`);
-  return { success, failed };
+  // `rejected` counts explicit OK=false responses; `failed - rejected` are
+  // missing acks (timeout/error/close). All-rejected is a definitive
+  // non-delivery; any missing ack keeps the outcome ambiguous.
+  return { success, failed, rejected };
 }
 
 /**
- * Publish event to a single relay via WebSocket.
- * Returns true on success, false on failure.
+ * Publish event to a single relay via WebSocket. Resolves an outcome string,
+ * never rejects:
+ *   'accepted' - relay returned OK=true (stored).
+ *   'rejected' - relay returned OK=false (explicitly refused; NOT stored).
+ *   'no_ack'   - timeout, socket error, or close before any OK (delivery
+ *                unknown: the relay may have stored it with a lost ack).
+ * The rejected/no_ack split lets callers treat an all-rejected result as a
+ * definitive non-delivery while keeping missing acks ambiguous.
  */
 function publishToSingleRelay(event, relayUrl, env) {
   return new Promise((resolve) => {
@@ -499,7 +534,7 @@ function publishToSingleRelay(event, relayUrl, env) {
     const timeout = setTimeout(() => {
       try { if (ws) ws.close(); } catch (_) { /* ignore */ }
       console.warn(`[DM] Timeout publishing to ${relayUrl}`);
-      resolve(false);
+      resolve('no_ack');
     }, RELAY_TIMEOUT_MS);
 
     try {
@@ -525,10 +560,10 @@ function publishToSingleRelay(event, relayUrl, env) {
             resolved = true;
             try { ws.close(); } catch (_) { /* ignore */ }
             if (data[2]) {
-              resolve(true);
+              resolve('accepted');
             } else {
               console.warn(`[DM] Relay ${relayUrl} rejected event: ${data[3] || 'unknown reason'}`);
-              resolve(false);
+              resolve('rejected');
             }
           }
         } catch (err) {
@@ -541,7 +576,7 @@ function publishToSingleRelay(event, relayUrl, env) {
         if (!resolved) {
           resolved = true;
           console.warn(`[DM] WebSocket error for ${relayUrl}`);
-          resolve(false);
+          resolve('no_ack');
         }
       });
 
@@ -549,13 +584,13 @@ function publishToSingleRelay(event, relayUrl, env) {
         clearTimeout(timeout);
         if (!resolved) {
           resolved = true;
-          resolve(false);
+          resolve('no_ack');
         }
       });
     } catch (error) {
       clearTimeout(timeout);
       console.error(`[DM] Failed to connect to ${relayUrl}:`, error.message);
-      resolve(false);
+      resolve('no_ack');
     }
   });
 }
@@ -820,57 +855,83 @@ export async function notifyReporters(sha256, action, env, logPrefix = '[DM]') {
 }
 
 /**
- * Send a free-form moderator reply DM to a user.
- * Used from the admin dashboard for manual responses to appeals.
- * Never throws.
+ * Send a free-form moderator DM to a user, recording it under a specific
+ * audit messageType. Shared by the manual moderator-reply and automated
+ * community-warning paths so the two are distinguishable in the DM/audit
+ * trail. Never throws.
  *
  * @param {string} recipientPubkey - Hex pubkey of the recipient
  * @param {string} message - Free-form message text
  * @param {string} sha256 - Video hash (for conversation threading)
  * @param {Object} env
  * @param {Object} ctx
- * @returns {Promise<{ sent: boolean, reason?: string }>}
+ * @param {string} messageType - Audit type persisted with the DM
+ * @param {Function} wrap - NIP-17 gift-wrap fn; injectable so tests can drive
+ *   the send deterministically without the real per-call crypto (a module-level
+ *   mock of the transport does not reliably isolate in the single-worker pool —
+ *   same rationale as publishDmInboxRelayList's `connect` seam).
+ * @returns {Promise<{ sent: boolean, definitive?: boolean, reason?: string }>}
+ *   On failure, `definitive` is `true` when the send failed BEFORE any relay
+ *   publish was attempted (rate limit, bad input, key/relay-discovery failure):
+ *   nothing went out, so a caller may safely retry. It is `false` once a publish
+ *   was attempted, because a relay can accept the gift-wrap while its OK is lost;
+ *   such a warning must not be resent. Gift-wraps carry random ids, so the relay
+ *   cannot dedup a resend for us.
  */
-export async function sendModeratorReply(recipientPubkey, message, sha256, env, ctx) {
+async function sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, messageType, wrap) {
+  let publishAttempted = false;
   try {
     if (!recipientPubkey || typeof recipientPubkey !== 'string') {
-      return { sent: false, reason: 'Invalid recipient pubkey' };
+      return { sent: false, definitive: true, reason: 'Invalid recipient pubkey' };
     }
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
-      return { sent: false, reason: 'Empty message' };
+      return { sent: false, definitive: true, reason: 'Empty message' };
     }
 
     let keys;
     try {
       keys = getModeratorKeys(env);
     } catch (err) {
-      console.error('[DM] Cannot send moderator reply:', err.message);
-      return { sent: false, reason: err.message };
+      console.error('[DM] Cannot send moderator message:', err.message);
+      return { sent: false, definitive: true, reason: err.message };
     }
 
     const withinLimit = await checkRateLimit(recipientPubkey, env);
     if (!withinLimit) {
-      return { sent: false, reason: 'Rate limited' };
+      return { sent: false, definitive: true, reason: 'Rate limited' };
     }
 
-    const wrappedEvent = wrapEvent(
+    const wrappedEvent = wrap(
       keys.privateKey,
       { publicKey: recipientPubkey },
       message.trim()
     );
 
     const relayUrls = await discoverUserRelays(recipientPubkey, env);
-    const { success } = await publishToRelays(wrappedEvent, relayUrls, env);
+    // From here a relay may accept the event even if we never see the OK, so a
+    // throw (or a missing ack) at or after this point is ambiguous. A publish
+    // that ends in explicit OK=false from EVERY relay is the exception: the
+    // event was received and refused everywhere, so nothing was stored.
+    publishAttempted = true;
+    const { success, failed, rejected } = await publishToRelays(wrappedEvent, relayUrls, env);
 
     if (success === 0) {
-      return { sent: false, reason: 'All relay publishes failed' };
+      // Definitive only when every failure was an explicit rejection (OK=false);
+      // a missing ack (timeout/error/close) could be a stored-but-lost-OK.
+      const allExplicitlyRejected = failed > 0 && rejected === failed;
+      return {
+        sent: false,
+        definitive: allExplicitlyRejected,
+        reason: 'All relay publishes failed',
+      };
     }
 
     await recordRateLimit(recipientPubkey, env);
 
-    // Log to DM store
+    // Audit-log the send under its messageType. Static import (not a runtime
+    // import()) so the audit path is reliable and observable; a log failure
+    // must never break the send (graceful degradation).
     try {
-      const { logDm, computeConversationId } = await import('./dm-store.mjs');
       const conversationId = computeConversationId(keys.publicKey, recipientPubkey);
       const logPromise = logDm(env.BLOSSOM_DB, {
         conversationId,
@@ -878,7 +939,7 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
         direction: 'outgoing',
         senderPubkey: keys.publicKey,
         recipientPubkey,
-        messageType: 'moderator_reply',
+        messageType,
         content: message.trim(),
         nostrEventId: wrappedEvent.id,
       }).catch((err) => console.error('[DM] Failed to log DM:', err.message));
@@ -888,13 +949,52 @@ export async function sendModeratorReply(recipientPubkey, message, sha256, env, 
         await logPromise;
       }
     } catch (err) {
-      console.log('[DM] DM store not available, skipping log');
+      console.error('[DM] Failed to log DM:', err.message);
     }
 
-    console.log(`[DM] Sent moderator reply to ${recipientPubkey.substring(0, 16)}...${sha256 ? ` for ${sha256.substring(0, 16)}...` : ''} (${success} relays)`);
+    console.log(`[DM] Sent ${messageType} to ${recipientPubkey.substring(0, 16)}...${sha256 ? ` for ${sha256.substring(0, 16)}...` : ''} (${success} relays)`);
     return { sent: true, relaysPublished: success };
   } catch (err) {
-    console.error('[DM] Unexpected error sending moderator reply:', err.message);
-    return { sent: false, reason: err.message };
+    console.error('[DM] Unexpected error sending moderator message:', err.message);
+    // A throw before the publish was attempted (wrap/discovery) is a definitive
+    // no-send; a throw at or after publish is ambiguous and must not be resent.
+    return { sent: false, definitive: !publishAttempted, reason: err.message };
   }
+}
+
+/**
+ * Send a free-form moderator reply DM to a user.
+ * Used from the admin dashboard for manual responses to appeals.
+ * Never throws.
+ *
+ * @param {string} recipientPubkey - Hex pubkey of the recipient
+ * @param {string} message - Free-form message text
+ * @param {string} sha256 - Video hash (for conversation threading)
+ * @param {Object} env
+ * @param {Object} ctx
+ * @param {Object} [opts]
+ * @param {Function} [opts.wrap] - Gift-wrap test seam (defaults to real wrapEvent).
+ * @returns {Promise<{ sent: boolean, reason?: string }>}
+ */
+export async function sendModeratorReply(recipientPubkey, message, sha256, env, ctx, { wrap = wrapEvent } = {}) {
+  return sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 'moderator_reply', wrap);
+}
+
+/**
+ * Send an automated community-strike warning DM to a creator.
+ * Recorded under a distinct 'community_warning' audit type so the automated
+ * consensus warnings are separable from manual moderator appeal replies.
+ * Never throws.
+ *
+ * @param {string} recipientPubkey - Hex pubkey of the creator
+ * @param {string} message - Warning text
+ * @param {string} sha256 - Video hash (for conversation threading)
+ * @param {Object} env
+ * @param {Object} ctx
+ * @param {Object} [opts]
+ * @param {Function} [opts.wrap] - Gift-wrap test seam (defaults to real wrapEvent).
+ * @returns {Promise<{ sent: boolean, reason?: string }>}
+ */
+export async function sendCommunityStrikeWarning(recipientPubkey, message, sha256, env, ctx, { wrap = wrapEvent } = {}) {
+  return sendModeratorMessage(recipientPubkey, message, sha256, env, ctx, 'community_warning', wrap);
 }
