@@ -5,7 +5,7 @@
 // ABOUTME: Uses makeFakeD1/makeFakeKV; seeds transient rows via rows.set() (fake INSERT is 4-arg only).
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { runCreatorDeleteCron } from './cron.mjs';
+import { POLL_OVERLAP_SECONDS, runCreatorDeleteCron } from './cron.mjs';
 import { MAX_RETRY_COUNT } from './d1.mjs';
 import { makeFakeD1, makeFakeKV } from './test-helpers.mjs';
 
@@ -76,7 +76,7 @@ describe('runCreatorDeleteCron', () => {
       secondPoll.processed,
       recoveryPoll.processed,
       replayPoll.processed
-    ]).toEqual([0, 0, 1, 1]);
+    ]).toEqual([0, 0, 1, 0]);
     expect(deps.db.rows.get('delayed-k5:t1')).toMatchObject({
       status: 'success',
       blob_sha256: SHA_C
@@ -85,9 +85,9 @@ describe('runCreatorDeleteCron', () => {
     expect(deps.callBlossomDelete).toHaveBeenCalledTimes(1);
     expect(deps.queryKind5Since.mock.calls.map(([sinceSeconds]) => sinceSeconds)).toEqual([
       1699996400,
-      1699999700,
-      1699999760,
-      1699999820
+      1700000000 - POLL_OVERLAP_SECONDS,
+      1700000060 - POLL_OVERLAP_SECONDS,
+      1700000120 - POLL_OVERLAP_SECONDS
     ]);
   });
 
@@ -137,6 +137,51 @@ describe('runCreatorDeleteCron', () => {
     });
     expect(deps.fetchTargetEvent).toHaveBeenCalledTimes(2);
     expect(deps.callBlossomDelete).toHaveBeenCalledTimes(2);
+  });
+
+  it('processes non-transient sibling targets when another target is still in backoff', async () => {
+    let nowMs = 1700000000000;
+    const kind5 = {
+      id: 'partial-k5',
+      pubkey: 'pub1',
+      created_at: 1699999970,
+      tags: [['e', 't1'], ['e', 't2']]
+    };
+    deps.db.rows.set('partial-k5:t1', {
+      kind5_id: 'partial-k5',
+      target_event_id: 't1',
+      creator_pubkey: 'pub1',
+      status: 'failed:transient:blossom_5xx',
+      accepted_at: new Date(nowMs - 30_000).toISOString(),
+      blob_sha256: null,
+      retry_count: 1,
+      last_error: 'HTTP 503: prior attempt',
+      completed_at: null
+    });
+
+    deps.now = () => nowMs;
+    deps.queryKind5Since.mockResolvedValueOnce([kind5]);
+    deps.fetchTargetEvent.mockResolvedValueOnce({
+      id: 't2',
+      pubkey: 'pub1',
+      tags: [['imeta', `x ${SHA_C}`]]
+    });
+    deps.callBlossomDelete.mockResolvedValueOnce({ success: true, status: 200 });
+
+    const result = await runCreatorDeleteCron(deps);
+
+    expect(result.processed).toBe(1);
+    expect(deps.fetchTargetEvent).toHaveBeenCalledTimes(1);
+    expect(deps.fetchTargetEvent).toHaveBeenCalledWith('t2');
+    expect(deps.callBlossomDelete).toHaveBeenCalledTimes(1);
+    expect(deps.db.rows.get('partial-k5:t1')).toMatchObject({
+      status: 'failed:transient:blossom_5xx',
+      retry_count: 1
+    });
+    expect(deps.db.rows.get('partial-k5:t2')).toMatchObject({
+      status: 'success',
+      blob_sha256: SHA_C
+    });
   });
 
   it('retries failed:transient rows with retry_count below MAX_RETRY_COUNT', async () => {

@@ -489,7 +489,7 @@ export function hasStrongOriginalVineEvidence(nostrContext) {
 }
 
 export async function fetchKind5EventsSince(sinceSeconds, relayUrl = 'wss://relay.divine.video', env = {}) {
-  return queryRelay(relayUrl, { kinds: [5], since: sinceSeconds }, env, { collectAll: true });
+  return queryRelay(relayUrl, { kinds: [5], since: sinceSeconds }, env, { collectAll: true, rejectOnPrematureClose: true });
 }
 
 /**

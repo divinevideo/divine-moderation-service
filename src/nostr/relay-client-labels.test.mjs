@@ -1,11 +1,11 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// ABOUTME: Tests for kind 1985 label fetchers — since-cursor poll filter shape
-// ABOUTME: and per-video #e/#a queries deduped by event id.
+// ABOUTME: Tests for relay-client collect-all fetchers — since-cursor poll filter shape,
+// ABOUTME: strict EOSE handling, and per-video #e/#a queries deduped by event id.
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { fetchLabelEventsSince, fetchLabelEventsForVideo } from './relay-client.mjs';
+import { fetchKind5EventsSince, fetchLabelEventsSince, fetchLabelEventsForVideo } from './relay-client.mjs';
 
 const originalWebSocket = globalThis.WebSocket;
 afterEach(() => { globalThis.WebSocket = originalWebSocket; });
@@ -107,6 +107,15 @@ describe('fetchLabelEventsSince', () => {
     globalThis.WebSocket = makeClosingBeforeEoseWebSocket({ eventsForFilter: () => [label] });
 
     await expect(fetchLabelEventsSince(1_700_000_000)).rejects.toThrow(/EOSE/i);
+  });
+});
+
+describe('fetchKind5EventsSince', () => {
+  it('rejects when the stream closes before EOSE (possible truncation)', async () => {
+    const kind5 = { id: 'f'.repeat(64), kind: 5, tags: [['e', 'target']] };
+    globalThis.WebSocket = makeClosingBeforeEoseWebSocket({ eventsForFilter: () => [kind5] });
+
+    await expect(fetchKind5EventsSince(1_700_000_000)).rejects.toThrow(/EOSE/i);
   });
 });
 

@@ -116,6 +116,7 @@ describe('processKind5', () => {
     });
     const result = await processKind5(kind5, { db, fetchTargetEvent, callBlossomDelete });
     expect(result.targets[0].status).toBe('success');
+    expect(result.targets[0].skipped).toBe(true);
     expect(callBlossomDelete).not.toHaveBeenCalled();
     expect(fetchTargetEvent).not.toHaveBeenCalled();
   });
