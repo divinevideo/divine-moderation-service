@@ -39,6 +39,106 @@ describe('runCreatorDeleteCron', () => {
     expect(Number(lastPoll)).toBe(1700000000000);
   });
 
+  it('recovers a delayed kind 5 within the poll overlap without repeating Blossom DELETE', async () => {
+    let nowMs = 1700000000000;
+    let visible = false;
+    const kind5 = {
+      id: 'delayed-k5',
+      pubkey: 'pub1',
+      created_at: 1699999970,
+      tags: [['e', 't1']]
+    };
+
+    deps.now = () => nowMs;
+    deps.queryKind5Since.mockImplementation(async (sinceSeconds) => (
+      visible && kind5.created_at >= sinceSeconds ? [kind5] : []
+    ));
+    deps.fetchTargetEvent.mockResolvedValue({
+      id: 't1',
+      pubkey: 'pub1',
+      tags: [['imeta', `x ${SHA_C}`]]
+    });
+    deps.callBlossomDelete.mockResolvedValue({ success: true, status: 200 });
+
+    const firstPoll = await runCreatorDeleteCron(deps);
+    nowMs += 60_000;
+    const secondPoll = await runCreatorDeleteCron(deps);
+
+    visible = true;
+    nowMs += 60_000;
+    const recoveryPoll = await runCreatorDeleteCron(deps);
+
+    nowMs += 60_000;
+    const replayPoll = await runCreatorDeleteCron(deps);
+
+    expect([
+      firstPoll.processed,
+      secondPoll.processed,
+      recoveryPoll.processed,
+      replayPoll.processed
+    ]).toEqual([0, 0, 1, 1]);
+    expect(deps.db.rows.get('delayed-k5:t1')).toMatchObject({
+      status: 'success',
+      blob_sha256: SHA_C
+    });
+    expect(deps.fetchTargetEvent).toHaveBeenCalledTimes(1);
+    expect(deps.callBlossomDelete).toHaveBeenCalledTimes(1);
+    expect(deps.queryKind5Since.mock.calls.map(([sinceSeconds]) => sinceSeconds)).toEqual([
+      1699996400,
+      1699999700,
+      1699999760,
+      1699999820
+    ]);
+  });
+
+  it('keeps overlap replays from bypassing transient retry backoff', async () => {
+    let nowMs = 1700000000000;
+    const kind5 = {
+      id: 'retry-k5',
+      pubkey: 'pub1',
+      created_at: 1699999970,
+      tags: [['e', 't1']]
+    };
+
+    deps.now = () => nowMs;
+    deps.queryKind5Since.mockImplementation(async (sinceSeconds) => (
+      kind5.created_at >= sinceSeconds ? [kind5] : []
+    ));
+    deps.fetchTargetEvent.mockResolvedValue({
+      id: 't1',
+      pubkey: 'pub1',
+      tags: [['imeta', `x ${SHA_C}`]]
+    });
+    deps.callBlossomDelete
+      .mockResolvedValueOnce({ success: false, status: 503, error: 'HTTP 503: unavailable' })
+      .mockResolvedValueOnce({ success: true, status: 200 });
+
+    const firstPoll = await runCreatorDeleteCron(deps);
+    expect(firstPoll.processed).toBe(1);
+    expect(deps.db.rows.get('retry-k5:t1')).toMatchObject({
+      status: 'failed:transient:blossom_5xx',
+      retry_count: 1
+    });
+    expect(deps.fetchTargetEvent).toHaveBeenCalledTimes(1);
+    expect(deps.callBlossomDelete).toHaveBeenCalledTimes(1);
+
+    nowMs += 30_000;
+    const earlyReplay = await runCreatorDeleteCron(deps);
+    expect(earlyReplay.processed).toBe(0);
+    expect(deps.fetchTargetEvent).toHaveBeenCalledTimes(1);
+    expect(deps.callBlossomDelete).toHaveBeenCalledTimes(1);
+
+    nowMs += 30_000;
+    const dueRetry = await runCreatorDeleteCron(deps);
+    expect(dueRetry.processed).toBe(1);
+    expect(deps.db.rows.get('retry-k5:t1')).toMatchObject({
+      status: 'success',
+      retry_count: 1
+    });
+    expect(deps.fetchTargetEvent).toHaveBeenCalledTimes(2);
+    expect(deps.callBlossomDelete).toHaveBeenCalledTimes(2);
+  });
+
   it('retries failed:transient rows with retry_count below MAX_RETRY_COUNT', async () => {
     // Seed D1 directly — the fake's INSERT path is tailored to claimRow's
     // 4-arg bind with 'accepted' status literal, so it can't represent a
