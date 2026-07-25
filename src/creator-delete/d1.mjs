@@ -5,6 +5,8 @@
 // ABOUTME: claimRow implements INSERT ... ON CONFLICT DO NOTHING then SELECT to read canonical state.
 
 const MAX_RETRY_COUNT = 5;
+const TRANSIENT_RETRY_BASE_MS = 30_000;
+const TRANSIENT_RETRY_MAX_MS = 300_000;
 // Must exceed the sync endpoint's waitUntil work window. A stale accepted row
 // may be re-claimed after this; Blossom DELETE must remain idempotent.
 const IN_PROGRESS_TIMEOUT_MS = 120_000;
@@ -85,10 +87,13 @@ export function decideAction(existing, { now = Date.now() } = {}) {
     return 'proceed';
   }
   if (existing.status.startsWith('failed:transient:')) {
-    if (existing.retry_count < MAX_RETRY_COUNT) return 'proceed';
-    return 'skip_permanent_failure';
+    if (existing.retry_count >= MAX_RETRY_COUNT) return 'skip_permanent_failure';
+    const acceptedMs = Date.parse(existing.accepted_at);
+    const backoffMs = Math.min(TRANSIENT_RETRY_BASE_MS * Math.pow(2, existing.retry_count), TRANSIENT_RETRY_MAX_MS);
+    if (now - acceptedMs < backoffMs) return 'skip_in_progress';
+    return 'proceed';
   }
   return 'proceed';
 }
 
-export { MAX_RETRY_COUNT, IN_PROGRESS_TIMEOUT_MS };
+export { MAX_RETRY_COUNT, IN_PROGRESS_TIMEOUT_MS, TRANSIENT_RETRY_BASE_MS, TRANSIENT_RETRY_MAX_MS };

@@ -63,15 +63,15 @@ export async function processKind5(kind5, { db, fetchTargetEvent, callBlossomDel
     const action = claim.claimed ? 'proceed' : decideAction(claim.existing, { now: now() });
 
     if (action === 'skip_success') {
-      resultTargets.push({ target_event_id, status: 'success', blob_sha256: claim.existing.blob_sha256 });
+      resultTargets.push({ target_event_id, status: 'success', blob_sha256: claim.existing.blob_sha256, skipped: true });
       continue;
     }
     if (action === 'skip_permanent_failure') {
-      resultTargets.push({ target_event_id, status: claim.existing.status, last_error: claim.existing.last_error });
+      resultTargets.push({ target_event_id, status: claim.existing.status, last_error: claim.existing.last_error, skipped: true });
       continue;
     }
     if (action === 'skip_in_progress') {
-      resultTargets.push({ target_event_id, status: 'in_progress' });
+      resultTargets.push({ target_event_id, status: 'in_progress', skipped: true });
       continue;
     }
 
@@ -87,7 +87,7 @@ export async function processKind5(kind5, { db, fetchTargetEvent, callBlossomDel
       const reclaimed = reclaim.meta.changes === 1 || reclaim.meta.rows_written === 1;
       if (!reclaimed) {
         // Another worker won the re-claim race. Report in_progress and let them finish.
-        resultTargets.push({ target_event_id, status: 'in_progress' });
+        resultTargets.push({ target_event_id, status: 'in_progress', skipped: true });
         continue;
       }
     }

@@ -64,8 +64,24 @@ describe('decideAction', () => {
     expect(decideAction(existing, { now })).toBe('proceed');
   });
 
-  it('proceed when failed:transient and retries remain', () => {
-    expect(decideAction({ status: 'failed:transient:blossom_5xx', retry_count: 2 })).toBe('proceed');
+  it('skip_in_progress when failed:transient retry backoff has not elapsed', () => {
+    const now = Date.now();
+    const existing = {
+      status: 'failed:transient:blossom_5xx',
+      retry_count: 2,
+      accepted_at: new Date(now - 119_000).toISOString()
+    };
+    expect(decideAction(existing, { now })).toBe('skip_in_progress');
+  });
+
+  it('proceed when failed:transient retry backoff has elapsed', () => {
+    const now = Date.now();
+    const existing = {
+      status: 'failed:transient:blossom_5xx',
+      retry_count: 2,
+      accepted_at: new Date(now - 120_001).toISOString()
+    };
+    expect(decideAction(existing, { now })).toBe('proceed');
   });
 
   it('skip when failed:transient and retries exhausted', () => {

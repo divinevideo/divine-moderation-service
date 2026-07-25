@@ -37,11 +37,28 @@ export function makeFakeD1() {
               rows.set(target_key, { ...existing, accepted_at: newAccepted, status: 'accepted' });
               return { meta: { changes: 1, rows_written: 1 } };
             }
-            // Other UPDATEs: kind5_id and target_event_id are the last two binds.
+            // State-transition UPDATEs: kind5_id and target_event_id are the last two binds.
             const target_key = `${this._binds[this._binds.length - 2]}:${this._binds[this._binds.length - 1]}`;
             const existing = rows.get(target_key);
             if (existing) {
-              rows.set(target_key, { ...existing, _updated: true });
+              if (this._sql.includes("SET status = 'success'")) {
+                const [blob_sha256, completed_at] = this._binds;
+                rows.set(target_key, {
+                  ...existing,
+                  status: 'success',
+                  blob_sha256,
+                  completed_at,
+                  last_error: null
+                });
+              } else {
+                const [status, last_error] = this._binds;
+                rows.set(target_key, {
+                  ...existing,
+                  status,
+                  last_error,
+                  retry_count: existing.retry_count + (this._sql.includes('retry_count = retry_count + 1') ? 1 : 0)
+                });
+              }
               return { meta: { changes: 1 } };
             }
             return { meta: { changes: 0 } };
