@@ -3480,8 +3480,8 @@
         // makes the enforcement hold actionable rather than looking broken.
         // Only follow an https link: this arrives over the wire and is handed
         // to window.open, so a javascript:/data: scheme must never be openable.
-        // Anything else falls through to the plain toast, which still carries
-        // the refusal and the case id.
+        // Anything else falls through to the plain toast below, which carries
+        // the refusal message but not the case id.
         const caseUrl = typeof error.caseUrl === 'string' && error.caseUrl.startsWith('https://')
           ? error.caseUrl
           : null;
