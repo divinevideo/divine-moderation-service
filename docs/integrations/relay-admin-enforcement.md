@@ -39,9 +39,9 @@ Only `allow_pubkey` can be refused by the age-review guard, so it is the only ac
 
 ## Consumers
 
-The only caller is `POST /admin/api/uploader/:pubkey/enforcement`, reached from the dashboard's Ban/Unban User button. A refusal returns before `setUploaderEnforcement` runs, so no local row records an enforcement the relay never applied — including any `approvalRequired`/`notes` submitted in the same request.
+The only caller that can be refused is `POST /admin/api/uploader/:pubkey/enforcement`, reached from the dashboard's Ban/Unban User button. (`deleteRelayEventIds` calls `callRelayAdminAction` too, but only with `delete_event`, which is unguarded.) A refusal returns before `setUploaderEnforcement` runs, so no local row records an enforcement the relay never applied — including any `approvalRequired`/`notes` submitted in the same request.
 
-On a `409` the dashboard shows the refusal with an **Open case** action that opens `caseUrl`. On a `503` it shows relay-admin's own retry-flavoured message. Nothing here retries automatically.
+On a `409` the dashboard shows the refusal with an **Open case** action that opens `caseUrl` — but only when `caseUrl` is `https:`, since it is handed to `window.open`. A non-https `RELAY_ADMIN_UI_URL` therefore drops both the action and the case id, leaving the plain message. On a `503` it shows relay-admin's own retry-flavoured message. Nothing here retries automatically.
 
 ## What this doc does not cover
 
