@@ -204,6 +204,9 @@ crons = ["* * * * *", "*/5 * * * *"]
 # Only used for the public-edge fallback; the RELAY_ADMIN service binding is preferred.
 # RELAY_ADMIN_API_KEY is NOT a per-worker secret — it is the Secrets Store binding
 # defined above (secret MODERATION_TO_RELAY_ADMIN_KEY), sent as the X-Admin-Key header.
+# RELAY_ADMIN_UI_URL - moderator-facing relay-admin UI, a DIFFERENT host from the API
+# above. Default in src/index.mjs is relay.admin.divine.video. Only used to build the
+# age-review case link handed back when relay-admin refuses an un-ban; never called.
 # REALITY_DEFENDER_API_KEY - Reality Defender API key for secondary AI verification (api.prd.realitydefender.xyz)
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
 # ATPROTO_LABELER_WEBHOOK_URL - URL of the divine-labeler webhook endpoint (https://labels.divine.video/webhook/moderation-result)
