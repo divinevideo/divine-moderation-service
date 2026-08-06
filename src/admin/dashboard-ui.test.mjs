@@ -54,9 +54,8 @@ describe('dashboard provenance UI hooks', () => {
 
   it('routes an age-review refusal of an un-ban to the case instead of a dead-end toast', () => {
     // The enforcement endpoint answers a refused un-ban with a 409 carrying
-    // code/caseId/caseUrl (#191). The handler must carry those past the throw
+    // caseId/caseUrl (#191). The handler must carry those past the throw
     // and offer the case, rather than showing the message and stopping.
-    expect(dashboardHTML).toContain('failure.code = data.code || null;');
     expect(dashboardHTML).toContain('failure.caseId = data.caseId || null;');
     expect(dashboardHTML).toContain('failure.caseUrl = data.caseUrl || null;');
     // The link is followed with window.open, so only https is actionable.

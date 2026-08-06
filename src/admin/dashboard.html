@@ -3446,7 +3446,6 @@
           // Carry the structured refusal through the throw. An un-ban of an
           // account under age review comes back as a 409 naming the case that
           // has to be resolved first, and the catch below routes to it.
-          failure.code = data.code || null;
           failure.caseId = data.caseId || null;
           failure.caseUrl = data.caseUrl || null;
           throw failure;
