@@ -3442,7 +3442,14 @@
 
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(data.error || `HTTP ${response.status}`);
+          const failure = new Error(data.error || `HTTP ${response.status}`);
+          // Carry the structured refusal through the throw. An un-ban of an
+          // account under age review comes back as a 409 naming the case that
+          // has to be resolved first, and the catch below routes to it.
+          failure.code = data.code || null;
+          failure.caseId = data.caseId || null;
+          failure.caseUrl = data.caseUrl || null;
+          throw failure;
         }
 
         // Confirm success immediately (before the slower list refresh) so the
@@ -3467,6 +3474,20 @@
       } catch (error) {
         button.innerHTML = originalText;
         button.disabled = false;
+
+        // An age-review block is a refusal that names where to go next, not a
+        // dead end. Offer the case instead of a bare red toast, which is what
+        // makes the enforcement hold actionable rather than looking broken.
+        if (error.caseUrl) {
+          const caseUrl = error.caseUrl;
+          const blockedMessage = error.caseId
+            ? `${error.message} (case ${error.caseId})`
+            : error.message;
+          showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
+          setLookupStatus(blockedMessage, true);
+          return;
+        }
+
         showToast(`User action failed: ${error.message}`, null, 5000);
         setLookupStatus(`User action failed: ${error.message}`, true);
       }
@@ -4989,7 +5010,10 @@
     }
 
     // Toast notification system
-    function showToast(message, onUndo = null, duration = 5000) {
+    // The action button started life as Undo and is still Undo by default;
+    // actionLabel lets a caller reuse it for a different follow-up, such as
+    // opening the age-review case that blocked an un-ban.
+    function showToast(message, onAction = null, duration = 5000, actionLabel = 'Undo') {
       // Remove existing toast
       if (currentToast) {
         currentToast.remove();
@@ -5003,15 +5027,15 @@
       messageEl.textContent = message;
       toast.appendChild(messageEl);
 
-      if (onUndo) {
-        const undoBtn = document.createElement('button');
-        undoBtn.className = 'toast-undo';
-        undoBtn.textContent = 'Undo';
-        undoBtn.onclick = () => {
-          onUndo();
+      if (onAction) {
+        const actionBtn = document.createElement('button');
+        actionBtn.className = 'toast-undo';
+        actionBtn.textContent = actionLabel;
+        actionBtn.onclick = () => {
+          onAction();
           hideToast(toast);
         };
-        toast.appendChild(undoBtn);
+        toast.appendChild(actionBtn);
       }
 
       const closeBtn = document.createElement('button');
