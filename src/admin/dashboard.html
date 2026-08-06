@@ -3478,8 +3478,14 @@
         // An age-review block is a refusal that names where to go next, not a
         // dead end. Offer the case instead of a bare red toast, which is what
         // makes the enforcement hold actionable rather than looking broken.
-        if (error.caseUrl) {
-          const caseUrl = error.caseUrl;
+        // Only follow an https link: this arrives over the wire and is handed
+        // to window.open, so a javascript:/data: scheme must never be openable.
+        // Anything else falls through to the plain toast, which still carries
+        // the refusal and the case id.
+        const caseUrl = typeof error.caseUrl === 'string' && error.caseUrl.startsWith('https://')
+          ? error.caseUrl
+          : null;
+        if (caseUrl) {
           const blockedMessage = error.caseId
             ? `${error.message} (case ${error.caseId})`
             : error.message;

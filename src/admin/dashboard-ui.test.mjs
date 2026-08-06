@@ -59,7 +59,9 @@ describe('dashboard provenance UI hooks', () => {
     expect(dashboardHTML).toContain('failure.code = data.code || null;');
     expect(dashboardHTML).toContain('failure.caseId = data.caseId || null;');
     expect(dashboardHTML).toContain('failure.caseUrl = data.caseUrl || null;');
-    expect(dashboardHTML).toContain('if (error.caseUrl) {');
+    // The link is followed with window.open, so only https is actionable.
+    expect(dashboardHTML).toContain("typeof error.caseUrl === 'string' && error.caseUrl.startsWith('https://')");
+    expect(dashboardHTML).toContain('if (caseUrl) {');
     expect(dashboardHTML).toContain("showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');");
   });
 
