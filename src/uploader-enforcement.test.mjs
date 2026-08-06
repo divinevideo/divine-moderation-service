@@ -608,6 +608,7 @@ describe('admin uploader enforcement routes', () => {
 // generic 502 with no case to open (#191).
 describe('age-review refusals on un-ban', () => {
   const CASE_ID = '2f3a1c48-9d5e-4b17-9c0a-6e8b1d7f4a20';
+  const BLOCK_MESSAGE = 'This account is under age review. Restrict or clear it from the Age Review flow.';
 
   function bannedUploaderRows() {
     return new Map([[PUBKEY, {
@@ -764,6 +765,99 @@ describe('age-review refusals on un-ban', () => {
       await expect(response.json()).resolves.toEqual({
         success: false,
         error: 'Invalid pubkey'
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
+  it('treats a non-string caseId or state as absent rather than linking to it', async () => {
+    // The refusal body is another service's output, so it is only trusted as
+    // far as its types go. A caseId that is not a string cannot identify a case,
+    // and interpolating it anyway would hand the moderator a link to nothing.
+    const relay = stubRelayAdmin(409, {
+      success: false,
+      error: BLOCK_MESSAGE,
+      code: 'age_review_active',
+      caseId: 12345,
+      state: { name: 'restricted' }
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://api-relay-prod.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      // Still a refusal, still a 409 — just without a case to point at.
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({
+        success: false,
+        error: BLOCK_MESSAGE,
+        code: 'age_review_active',
+        caseId: null,
+        state: null,
+        caseUrl: null
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
+  it('treats a blank caseId as absent rather than linking to it', async () => {
+    const relay = stubRelayAdmin(409, {
+      success: false,
+      error: BLOCK_MESSAGE,
+      code: 'age_review_active',
+      caseId: '   ',
+      state: 'open_reported'
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://api-relay-prod.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        caseId: null,
+        caseUrl: null
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
+  it('escapes a case id into the link instead of splicing it in raw', async () => {
+    // Same untrusted-input reason: the case id goes into a query string that the
+    // dashboard hands to window.open, so it is encoded rather than able to add
+    // parameters or a fragment of its own. The raw id is still reported as-is.
+    const awkwardCaseId = 'case 42&role=admin#top';
+    const relay = stubRelayAdmin(409, {
+      success: false,
+      error: BLOCK_MESSAGE,
+      code: 'age_review_active',
+      caseId: awkwardCaseId,
+      state: 'open_reported'
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://api-relay-prod.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        caseId: awkwardCaseId,
+        caseUrl: 'https://relay.admin.divine.video/age-review?case=case%2042%26role%3Dadmin%23top'
       });
     } finally {
       relay.restore();
