@@ -601,3 +601,172 @@ describe('admin uploader enforcement routes', () => {
     }
   });
 });
+
+// relay-manager refuses an un-ban of an account under age review and answers
+// with a structured body rather than a bare failure (divine-relay-manager#217).
+// These pin that the refusal survives the hop instead of being flattened into a
+// generic 502 with no case to open (#191).
+describe('age-review refusals on un-ban', () => {
+  const CASE_ID = '2f3a1c48-9d5e-4b17-9c0a-6e8b1d7f4a20';
+
+  function bannedUploaderRows() {
+    return new Map([[PUBKEY, {
+      pubkey: PUBKEY,
+      approval_required: 0,
+      approval_reason: null,
+      relay_banned: 1,
+      relay_ban_reason: 'prior ban',
+      created_at: '2026-08-01T00:00:00.000Z',
+      updated_at: '2026-08-01T00:00:00.000Z'
+    }]]);
+  }
+
+  async function postUnban(env) {
+    return worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/uploader/${PUBKEY}/enforcement`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+        },
+        body: JSON.stringify({ relayBanned: false, reason: 'Relay ban removed by moderator' })
+      }),
+      env
+    );
+  }
+
+  function stubRelayAdmin(status, body) {
+    const originalFetch = globalThis.fetch;
+    const fetchCalls = [];
+    globalThis.fetch = async (input, init) => {
+      fetchCalls.push({ input: String(input), init });
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    };
+    return {
+      fetchCalls,
+      restore() { globalThis.fetch = originalFetch; }
+    };
+  }
+
+  it('keeps code, caseId and state on an age-review block and points at the case', async () => {
+    const relay = stubRelayAdmin(409, {
+      success: false,
+      error: 'This account is under age review. Restrict or clear it from the Age Review flow.',
+      code: 'age_review_active',
+      caseId: CASE_ID,
+      state: 'restricted_pending_parental_consent'
+    });
+
+    try {
+      const uploaderEnforcements = bannedUploaderRows();
+      // The API host the worker calls is deliberately NOT the UI host the
+      // moderator opens, so a case link built from the wrong one is visible.
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements }),
+        RELAY_ADMIN_URL: 'https://api-relay-prod.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      // 409, not 502: this is a permanent refusal, not a relay malfunction.
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toEqual({
+        success: false,
+        error: 'This account is under age review. Restrict or clear it from the Age Review flow.',
+        code: 'age_review_active',
+        caseId: CASE_ID,
+        state: 'restricted_pending_parental_consent',
+        caseUrl: `https://relay.admin.divine.video/age-review?case=${CASE_ID}`
+      });
+
+      // The refused un-ban was the guarded method, and the local row still
+      // records the ban the relay never lifted.
+      expect(JSON.parse(relay.fetchCalls[0].init.body).method).toBe('unbanpubkey');
+      expect(uploaderEnforcements.get(PUBKEY).relay_banned).toBe(1);
+    } finally {
+      relay.restore();
+    }
+  });
+
+  it('builds the case link from RELAY_ADMIN_UI_URL when it is set', async () => {
+    const relay = stubRelayAdmin(409, {
+      success: false,
+      error: 'This account is under age review. Restrict or clear it from the Age Review flow.',
+      code: 'age_review_active',
+      caseId: CASE_ID,
+      state: 'open_reported'
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://api-relay-staging.divine.video',
+        RELAY_ADMIN_UI_URL: 'https://relay-staging.admin.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      expect(response.status).toBe(409);
+      // The UI host is configured separately from the API host the worker calls.
+      await expect(response.json()).resolves.toMatchObject({
+        caseUrl: `https://relay-staging.admin.divine.video/age-review?case=${CASE_ID}`
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
+  it('marks an age-review check that could not run as retryable', async () => {
+    const relay = stubRelayAdmin(503, {
+      success: false,
+      error: 'Could not check age-review status. Try again.',
+      code: 'age_review_check_failed'
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://relay.admin.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      // 503 is the retryable class; no case exists to link to.
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual({
+        success: false,
+        error: 'Could not check age-review status. Try again.',
+        code: 'age_review_check_failed'
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
+  it('leaves an uncoded relay failure as a 502', async () => {
+    const relay = stubRelayAdmin(400, {
+      success: false,
+      error: 'Invalid pubkey'
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://relay.admin.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      expect(response.status).toBe(502);
+      await expect(response.json()).resolves.toEqual({
+        success: false,
+        error: 'Invalid pubkey'
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+});

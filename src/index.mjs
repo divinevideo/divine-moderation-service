@@ -85,6 +85,9 @@ const API_HOSTNAME = 'moderation-api.divine.video';
 // (reading 'get')" / Cloudflare Error 1101 on every moderate call. Override
 // via env.RELAY_ADMIN_URL if needed for staging or rollback.
 const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
+// Moderator-facing relay-admin UI (Cloudflare Pages), distinct from the API host
+// above. Override via env.RELAY_ADMIN_UI_URL for staging.
+const DEFAULT_RELAY_ADMIN_UI_URL = 'https://relay.admin.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const MODERATION_ACTIONS = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN', 'DELETE'];
 const ADMIN_MODERATION_ACTIONS = MODERATION_ACTIONS.filter((action) => action !== 'DELETE');
@@ -373,6 +376,20 @@ function mergeLookupMetadata(baseVideo, funnelcakeVideo) {
 
 function getRelayAdminUrl(env) {
   return env.RELAY_ADMIN_URL || DEFAULT_RELAY_ADMIN_URL;
+}
+
+// The relay-admin UI is a different host from the relay-admin API: the worker
+// talks to api-relay-prod.divine.video, but a moderator opens an age-review case
+// in the Pages app at relay.admin.divine.video. Only used to build a link we
+// hand back to the dashboard, never to call anything.
+function getRelayAdminUiUrl(env) {
+  return env.RELAY_ADMIN_UI_URL || DEFAULT_RELAY_ADMIN_UI_URL;
+}
+
+// The age-review flow deep-links by case id (`?case=`), which is exactly what a
+// refusal carries. `?pubkey=` also resolves, but costs the UI a lookup first.
+function ageReviewCaseUrl(env, caseId) {
+  return `${getRelayAdminUiUrl(env)}/age-review?case=${encodeURIComponent(caseId)}`;
 }
 
 function getRelayAdminHeaders(env) {
@@ -758,6 +775,29 @@ async function processPendingTranscriptReprocess(env) {
 // is owned by moderation-service's own review flow, so it is not duplicated here.
 const RELAY_ADMIN_TIMEOUT_MS = 15000;
 
+// A relay-admin refusal is structured, not just a sentence: `code` says why, and
+// an age-review block adds the `caseId`/`state` of the case that has to be
+// resolved first (divine-relay-manager#217). Flattening all of that into
+// `new Error(data.error)` left a moderator with a dead-end toast — no case to
+// open, and no way to tell a permanent refusal from a transient one (#191).
+// Carry the fields on the error so each caller can decide what to do with them.
+class RelayAdminError extends Error {
+  constructor(message, { status = null, code = null, caseId = null, state = null } = {}) {
+    super(message);
+    this.name = 'RelayAdminError';
+    this.status = status;
+    this.code = code;
+    this.caseId = caseId;
+    this.state = state;
+  }
+}
+
+// Relay-admin fields are only trusted as non-empty strings; anything else is
+// treated as absent so a malformed body cannot become a bogus case link.
+function relayAdminField(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
+
 function relayRpcForAction(payload) {
   switch (payload?.action) {
     case 'ban_pubkey':
@@ -848,10 +888,64 @@ async function callRelayAdminAction(env, payload) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data?.success === false) {
-    throw new Error(data?.error || `Relay admin error: HTTP ${response.status}`);
+    throw new RelayAdminError(data?.error || `Relay admin error: HTTP ${response.status}`, {
+      status: response.status,
+      code: relayAdminField(data?.code),
+      caseId: relayAdminField(data?.caseId),
+      state: relayAdminField(data?.state)
+    });
   }
 
   return data;
+}
+
+// Turn a relay-admin failure into a response a caller can route on.
+// relay-manager refuses an un-ban of an account under age review
+// (divine-relay-manager#217), and the two refusals mean different things:
+//
+//   age_review_active       permanent — the case must be resolved first, so
+//                           hand back the case id and a link to open it
+//   age_review_check_failed the check could not run — retryable
+//
+// Anything else is a genuine relay failure and keeps the existing 502. Only
+// `allow_pubkey` (NIP-86 `unbanpubkey`) is guarded upstream; `ban_pubkey` and
+// `delete_event` map to unguarded methods and so never carry these codes.
+function relayAdminFailureResponse(error, env) {
+  const message = error instanceof Error ? error.message : 'Relay admin action failed';
+  const code = error instanceof RelayAdminError ? error.code : null;
+
+  if (code === 'age_review_active') {
+    return new Response(JSON.stringify({
+      success: false,
+      error: message,
+      code,
+      caseId: error.caseId,
+      state: error.state,
+      caseUrl: error.caseId ? ageReviewCaseUrl(env, error.caseId) : null
+    }), {
+      status: 409,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  if (code === 'age_review_check_failed') {
+    return new Response(JSON.stringify({
+      success: false,
+      error: message,
+      code
+    }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
+  return new Response(JSON.stringify({
+    success: false,
+    error: message
+  }), {
+    status: 502,
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
 
 async function deleteRelayEventIds(eventIds, env, reason) {
@@ -2087,14 +2181,16 @@ export default {
         } catch (relayError) {
           // Surface the failure (e.g. timeout) with its message instead of an
           // opaque 500, and do not record an enforcement the relay never applied.
-          console.error('[ENFORCE] Relay admin action failed:', relayError);
-          return new Response(JSON.stringify({
-            success: false,
-            error: relayError instanceof Error ? relayError.message : 'Relay admin action failed'
-          }), {
-            status: 502,
-            headers: { 'Content-Type': 'application/json' }
-          });
+          // An age-review refusal keeps its code/caseId/state so the dashboard
+          // can send the moderator to the case rather than dead-end them (#191).
+          // Log the upstream status too: once relay-admin answers with a body of
+          // its own, the message alone no longer says whether it was a refusal
+          // (409/503) or a relay malfunction.
+          console.error(
+            `[ENFORCE] Relay admin action failed (upstream HTTP ${relayError?.status ?? 'unknown'}):`,
+            relayError
+          );
+          return relayAdminFailureResponse(relayError, env);
         }
       }
 
