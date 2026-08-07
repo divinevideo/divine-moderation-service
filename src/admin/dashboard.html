@@ -3485,6 +3485,10 @@
           ? error.caseUrl
           : null;
         if (caseUrl) {
+          // caseUrl is only built when caseId survived validation, so in
+          // practice the id is always here. Kept as a ternary because the two
+          // fields arrive as independent keys off the wire, and a link with no
+          // id printed is still worth offering.
           const blockedMessage = error.caseId
             ? `${error.message} (case ${error.caseId})`
             : error.message;

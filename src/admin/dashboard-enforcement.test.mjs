@@ -264,7 +264,11 @@ describe('dashboard enforcement handler', () => {
     expect(button.disabled).toBe(false);
   });
 
-  it('still offers the case when the refusal carries no case id', async () => {
+  it('falls back to the plain toast when the refusal names no case', async () => {
+    // The shape the server actually emits when it cannot trust the case id:
+    // relayAdminField nulls a non-string or blank caseId, and caseUrl is built
+    // only when caseId survived, so both arrive null together. The moderator
+    // still learns the un-ban was refused and why — they just get no link.
     const harness = createHarness({
       response: {
         status: 409,
@@ -273,7 +277,7 @@ describe('dashboard enforcement handler', () => {
           error: BLOCK_MESSAGE,
           code: 'age_review_active',
           caseId: null,
-          caseUrl: CASE_URL
+          caseUrl: null
         }
       }
     });
@@ -281,8 +285,9 @@ describe('dashboard enforcement handler', () => {
     await runUnban(harness);
 
     const toast = latestToast(harness);
-    expect(toastText(toast)).toBe(BLOCK_MESSAGE);
-    expect(toastAction(toast)?.textContent).toBe('Open case');
+    expect(toastText(toast)).toBe(`User action failed: ${BLOCK_MESSAGE}`);
+    expect(toastAction(toast)).toBeNull();
+    expect(harness.opened).toEqual([]);
   });
 
   it('will not open a case link that is not https', async () => {
