@@ -782,10 +782,15 @@ const RELAY_ADMIN_TIMEOUT_MS = 15000;
 // open, and no way to tell a permanent refusal from a transient one (#191).
 // Carry the fields on the error so each caller can decide what to do with them.
 class RelayAdminError extends Error {
-  constructor(message, { status = null, code = null, caseId = null, state = null } = {}) {
+  constructor(message, { upstreamStatus = null, code = null, caseId = null, state = null } = {}) {
     super(message);
     this.name = 'RelayAdminError';
-    this.status = status;
+    // Deliberately not `status`: elsewhere in this file (createHttpError in
+    // moderation/classic-vine-rollback.mjs) `error.status` is the status to
+    // RESPOND with, and two handlers echo it straight back as
+    // `jsonResponse(error.status || 500, ...)`. This one is the status
+    // RECEIVED from relay-admin. Same name, opposite meaning, one file.
+    this.upstreamStatus = upstreamStatus;
     this.code = code;
     this.caseId = caseId;
     this.state = state;
@@ -898,7 +903,7 @@ async function callRelayAdminAction(env, payload) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data?.success === false) {
     throw new RelayAdminError(relayAdminField(data?.error) || `Relay admin error: HTTP ${response.status}`, {
-      status: response.status,
+      upstreamStatus: response.status,
       code: relayAdminField(data?.code),
       caseId: relayAdminField(data?.caseId),
       state: relayAdminField(data?.state)
@@ -2196,7 +2201,7 @@ export default {
           // its own, the message alone no longer says whether it was a refusal
           // (409/503) or a relay malfunction.
           console.error(
-            `[ENFORCE] Relay admin action failed (upstream HTTP ${relayError?.status ?? 'unknown'}):`,
+            `[ENFORCE] Relay admin action failed (upstream HTTP ${relayError?.upstreamStatus ?? 'unknown'}):`,
             relayError
           );
           return relayAdminFailureResponse(relayError, env);
