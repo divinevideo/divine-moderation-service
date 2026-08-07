@@ -229,6 +229,7 @@ describe('dashboard enforcement handler', () => {
     const toast = latestToast(harness);
     expect(toastText(toast)).toBe(`${BLOCK_MESSAGE} (case ${CASE_ID})`);
     expect(toastAction(toast)?.textContent).toBe('Open case');
+    expect(harness.timers[0]?.delay).toBe(10000);
     expect(harness.statusLines).toEqual([
       { message: `${BLOCK_MESSAGE} (case ${CASE_ID})`, isError: true }
     ]);
