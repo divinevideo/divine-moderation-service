@@ -171,11 +171,12 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // Structured report data travels as NIP-17 tags on the rumor, not as
   // JSON-encoded content -- content stays plain human-readable text
   // (matching NIP-17's "content MUST be plain text" convention) so the
-  // admin Messages UI can keep rendering it as-is. A report DM carries a
-  // ['sha256', <hash>] tag when the reported content has a resolvable
-  // Blossom blob hash (content reports only -- user reports and
-  // DM-message reports have no such hash and never carry this tag,
-  // by design: see divine-mobile#6593 plan's "Non-goals").
+  // admin Messages UI can keep rendering it as-is. Every report DM carries
+  // a ['report_type', <nip-56 type>] tag; only content reports also carry
+  // ['sha256', <hash>], because user reports and DM-message reports have no
+  // resolvable Blossom blob hash (by design: see divine-mobile#6593 plan's
+  // "Non-goals"). So report_type classifies the message, sha256 gates the
+  // user_reports row.
   const rumorTags = Array.isArray(rumor.tags) ? rumor.tags : [];
   const shaTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'sha256' && t[1]);
   const reportTypeTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'report_type' && t[1]);
@@ -205,8 +206,13 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
     }
   }
 
-  // Log to dm_log (dedup by nostr_event_id)
-  const messageType = relatedSha256
+  // Log to dm_log (dedup by nostr_event_id). Either machine-readable tag
+  // marks the DM as a report: report_type is present on all three report
+  // variants, sha256 only on content reports. Keying the badge off sha256
+  // alone would render a user report or a DM-message report as an ordinary
+  // reply in the admin Messages UI, which is a display gap rather than the
+  // deliberate user_reports non-goal above.
+  const messageType = (relatedSha256 || reportTypeTag)
     ? 'conversation_report'
     : (isOutgoing ? 'moderator_reply' : 'creator_reply');
   const result = await logDm(env.BLOSSOM_DB, {
