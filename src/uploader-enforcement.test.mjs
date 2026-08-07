@@ -728,8 +728,9 @@ describe('age-review refusals on un-ban', () => {
     });
 
     try {
+      const uploaderEnforcements = bannedUploaderRows();
       const response = await postUnban(createEnv({
-        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements }),
         RELAY_ADMIN_URL: 'https://relay.admin.divine.video',
         CF_ACCESS_CLIENT_ID: 'client-id',
         CF_ACCESS_CLIENT_SECRET: 'client-secret'
@@ -742,6 +743,11 @@ describe('age-review refusals on un-ban', () => {
         error: 'Could not check age-review status. Try again.',
         code: 'age_review_check_failed'
       });
+
+      // The relay never lifted the ban, so neither does the local row. Asserted
+      // on every refusing path, not just the 409: a regression that wrote the
+      // row after a TRANSIENT failure is the one that quietly un-bans someone.
+      expect(uploaderEnforcements.get(PUBKEY).relay_banned).toBe(1);
     } finally {
       relay.restore();
     }
@@ -754,8 +760,9 @@ describe('age-review refusals on un-ban', () => {
     });
 
     try {
+      const uploaderEnforcements = bannedUploaderRows();
       const response = await postUnban(createEnv({
-        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements }),
         RELAY_ADMIN_URL: 'https://relay.admin.divine.video',
         CF_ACCESS_CLIENT_ID: 'client-id',
         CF_ACCESS_CLIENT_SECRET: 'client-secret'
@@ -766,6 +773,7 @@ describe('age-review refusals on un-ban', () => {
         success: false,
         error: 'Invalid pubkey'
       });
+      expect(uploaderEnforcements.get(PUBKEY).relay_banned).toBe(1);
     } finally {
       relay.restore();
     }
