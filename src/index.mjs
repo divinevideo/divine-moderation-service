@@ -3661,8 +3661,12 @@ async function runMigration() {
 
       const limit = parseInt(url.searchParams.get('limit') || '20');
       const offset = parseInt(url.searchParams.get('offset') || '0');
-      const { getConversations } = await import('./nostr/dm-store.mjs');
+      const { getConversations, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
       const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+      // getConversations LEFT JOINs dm_conversation_read_state for the unread
+      // flag. Ensure it here rather than relying on migration 012 having been
+      // applied: the deploy job runs on merge, `d1 migrations apply` does not.
+      await initDmReadStateTable(env.BLOSSOM_DB);
       // Pass moderatorPubkey so rows are augmented with participant_pubkey
       // (the non-moderator side) + latest_message/message_type aliases that
       // the admin messages UI expects. Without this, every conversation
@@ -3717,12 +3721,13 @@ async function runMigration() {
       if (authError) return authError;
 
       const pubkey = url.pathname.split('/')[4];
-      const { computeConversationId, markConversationRead } = await import('./nostr/dm-store.mjs');
+      const { computeConversationId, markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
       const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
       const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
       if (!moderatorPubkey) {
         return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
+      await initDmReadStateTable(env.BLOSSOM_DB);
       const conversationId = computeConversationId(moderatorPubkey, pubkey);
       await markConversationRead(env.BLOSSOM_DB, conversationId);
       return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });

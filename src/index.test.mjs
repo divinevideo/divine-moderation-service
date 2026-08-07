@@ -7587,6 +7587,32 @@ describe('GET /admin/api/messages/{pubkey} for an unknown pubkey', () => {
   });
 });
 
+describe('GET /admin/api/messages', () => {
+  it('creates dm_conversation_read_state before the unread query joins it', async () => {
+    // Same deploy-ordering guard as the /read route: getConversations LEFT
+    // JOINs this table, so a deploy that lands before migration 012 would
+    // otherwise break the whole conversation list, not just the badge.
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages'),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const createIndex = prepared.findIndex((sql) =>
+      /CREATE TABLE IF NOT EXISTS\s+dm_conversation_read_state/i.test(sql),
+    );
+    const selectIndex = prepared.findIndex((sql) =>
+      /LEFT JOIN dm_conversation_read_state/i.test(sql),
+    );
+    expect(createIndex).toBeGreaterThanOrEqual(0);
+    expect(selectIndex).toBeGreaterThan(createIndex);
+  });
+});
+
 describe('POST /admin/api/messages/{pubkey} when the send fails', () => {
   it('returns 502 with a reason instead of a silent success', async () => {
     const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
@@ -7623,6 +7649,31 @@ describe('POST /admin/api/messages/{pubkey}/read', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ success: true });
     expect(prepared.some((sql) => sql.includes('dm_conversation_read_state'))).toBe(true);
+  });
+
+  it('creates dm_conversation_read_state before writing to it', async () => {
+    // The deploy job runs on merge to main; `wrangler d1 migrations apply`
+    // does not. Without this ensure the first request after a deploy would
+    // fail with "no such table" until migration 012 was applied by hand.
+    const prepared = [];
+    await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX + '/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    const createIndex = prepared.findIndex((sql) =>
+      /CREATE TABLE IF NOT EXISTS\s+dm_conversation_read_state/i.test(sql),
+    );
+    const insertIndex = prepared.findIndex((sql) =>
+      /INSERT INTO dm_conversation_read_state/i.test(sql),
+    );
+    expect(createIndex).toBeGreaterThanOrEqual(0);
+    expect(insertIndex).toBeGreaterThan(createIndex);
   });
 
   it('500s when no moderator signing key is configured, instead of silently no-op succeeding', async () => {
