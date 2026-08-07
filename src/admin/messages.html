@@ -667,7 +667,7 @@
         const preview = (conv.latest_message || conv.preview || '').slice(0, 80);
         const ts = conv.last_message_at || conv.updated_at || conv.created_at;
         const msgType = conv.message_type || conv.latest_message_type || '';
-        const unread = conv.unread || conv.has_unread || false;
+        const unread = Boolean(conv.unread);
         const isActive = pubkey === selectedPubkey;
 
         return `
@@ -698,6 +698,17 @@
 
     async function selectConversation(pubkey, opts = {}) {
       selectedPubkey = pubkey;
+
+      // Optimistically clear the unread dot for this row, then tell the
+      // backend so it stays clear on the next fetchConversations() poll.
+      // Fire-and-forget: a failed mark-read shouldn't block opening the
+      // thread, it just means the dot may reappear next refresh.
+      const conv = conversations.find(c => (c.participant_pubkey || c.pubkey) === pubkey);
+      if (conv && conv.unread) {
+        conv.unread = false;
+      }
+      fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/read', { method: 'POST' }).catch(() => {});
+
       renderConversations();
 
       // Dismiss the New Message recipient bar unless we just resolved from it

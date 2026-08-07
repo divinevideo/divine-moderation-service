@@ -5452,7 +5452,7 @@
         if (res.ok) {
           const data = await res.json();
           const convs = data.conversations || data || [];
-          const unread = convs.filter(c => c.unread || c.has_unread).length;
+          const unread = convs.filter(c => c.unread).length;
           if (unread > 0) {
             const badge = document.getElementById('unread-badge');
             if (badge) {
