@@ -61,8 +61,24 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
   beforeEach(async () => {
     await initDmLogTable(db);
     await initReportsTable(db);
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS moderation_results (
+        sha256 TEXT PRIMARY KEY,
+        action TEXT,
+        provider TEXT,
+        scores TEXT,
+        categories TEXT,
+        raw_response TEXT,
+        moderated_at TEXT,
+        reviewed_by TEXT,
+        reviewed_at TEXT,
+        review_notes TEXT,
+        uploaded_by TEXT
+      )
+    `).run();
     await db.prepare('DELETE FROM dm_log').run();
     await db.prepare('DELETE FROM user_reports').run();
+    await db.prepare('DELETE FROM moderation_results').run();
   });
 
   function makeRumor({ pubkey, tags, content }) {
@@ -91,6 +107,54 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     expect(reportRow.reporter_pubkey).toBe(REPORTER);
     expect(reportRow.report_type).toBe('spam');
     expect(reportRow.reason).toBe(proseContent);
+
+    const moderationRow = await db.prepare('SELECT * FROM moderation_results WHERE sha256 = ?').bind(SHA256).first();
+    expect(moderationRow).toBeTruthy();
+    expect(moderationRow.action).toBe('REVIEW');
+    expect(moderationRow.provider).toBe('user-report');
+    expect(JSON.parse(moderationRow.raw_response)).toMatchObject({
+      source: 'dm-report',
+      reportType: 'spam',
+      reportedBy: REPORTER,
+      reason: proseContent,
+    });
+  });
+
+  it('normalizes a valid uppercase sha256 tag before recording review state', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['sha256', SHA256.toUpperCase()], ['report_type', 'spam']],
+      content: 'Content Report',
+    });
+
+    const outcome = await processRumor(rumor, 'evt-upper-sha', MODERATOR, { BLOSSOM_DB: db });
+
+    expect(outcome).toBe('synced');
+    const dmRow = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dmRow.sha256).toBe(SHA256);
+    const reportRow = await db.prepare('SELECT * FROM user_reports').first();
+    expect(reportRow.sha256).toBe(SHA256);
+    const moderationRow = await db.prepare('SELECT action FROM moderation_results WHERE sha256 = ?').bind(SHA256).first();
+    expect(moderationRow.action).toBe('REVIEW');
+  });
+
+  it('does not record user_reports or moderation_results for an invalid sha256 tag', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['sha256', 'not-a-sha'], ['report_type', 'spam']],
+      content: 'Content Report',
+    });
+
+    const outcome = await processRumor(rumor, 'evt-invalid-sha', MODERATOR, { BLOSSOM_DB: db });
+
+    expect(outcome).toBe('synced');
+    const dmRow = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dmRow.message_type).toBe('conversation_report');
+    expect(dmRow.sha256).toBeNull();
+    const reportRows = await db.prepare('SELECT * FROM user_reports').all();
+    expect(reportRows.results).toHaveLength(0);
+    const moderationRows = await db.prepare('SELECT * FROM moderation_results').all();
+    expect(moderationRows.results).toHaveLength(0);
   });
 
   it('a rumor with report_type but no sha256 (a user report or DM-message report) is still badged as a report, without a user_reports row', async () => {
