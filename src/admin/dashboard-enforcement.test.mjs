@@ -24,7 +24,15 @@ const CASE_URL = `https://relay.admin.divine.video/age-review?case=${CASE_ID}`;
 // function early. That makes extraction survive reformatting of the function it
 // pulls, which is the whole point of testing it this way. Regex literals are not
 // tracked; neither extracted function contains one.
-function extractFunction(source, name) {
+//
+// `mustContain` is the guard on the one failure this cannot otherwise detect.
+// The brace scanner below is mode-aware, but the name search on the next line is
+// a plain regex over raw source: an earlier textual `function showToast(` in a
+// comment or a string hijacks the start index and yields a different function
+// that still parses. That failure is silent — no throw, no SyntaxError, just
+// tests passing against code the page does not ship. Naming a line that only
+// the real body contains turns it into a loud one.
+function extractFunction(source, name, mustContain) {
   const match = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(source);
   if (!match) {
     throw new Error(`extractFunction: no declaration of ${name} in dashboard.html`);
@@ -71,7 +79,14 @@ function extractFunction(source, name) {
       stack.pop();
       i += 1;
       if (opened && stack.length === 0) {
-        return source.slice(start, i);
+        const extracted = source.slice(start, i);
+        if (!extracted.includes(mustContain)) {
+          throw new Error(
+            `extractFunction: extracted a ${name} that does not contain ${JSON.stringify(mustContain)} `
+            + '— the name search matched an earlier occurrence, so this is the wrong function'
+          );
+        }
+        return extracted;
       }
     } else {
       i += 1;
@@ -81,9 +96,9 @@ function extractFunction(source, name) {
   throw new Error(`extractFunction: braces never balanced while reading ${name}`);
 }
 
-const SHOW_TOAST_SRC = extractFunction(dashboardHTML, 'showToast');
-const HIDE_TOAST_SRC = extractFunction(dashboardHTML, 'hideToast');
-const UPDATE_SRC = extractFunction(dashboardHTML, 'updateUploaderEnforcement');
+const SHOW_TOAST_SRC = extractFunction(dashboardHTML, 'showToast', "actionBtn.className = 'toast-action'");
+const HIDE_TOAST_SRC = extractFunction(dashboardHTML, 'hideToast', "toast.classList.add('hiding')");
+const UPDATE_SRC = extractFunction(dashboardHTML, 'updateUploaderEnforcement', "startsWith('https://')");
 
 // workerd blocks the AsyncFunction constructor, but `new Function` is allowed and
 // its generated body may declare an async function the ordinary way. The three
