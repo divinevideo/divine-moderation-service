@@ -33,7 +33,7 @@ Only `allow_pubkey` can be refused by the age-review guard, so it is the only ac
 | `503` `code: age_review_check_failed` | The check could not run (D1 outage / no binding). Fail-closed, so the hold stays on. | `503` with `code`. Retryable. |
 | any other non-2xx, or `success: false` | A genuine relay failure. | `502` with the message, as before. |
 
-`caseUrl` is built from `RELAY_ADMIN_UI_URL` (default `https://relay.admin.divine.video`) as `/age-review?case=<caseId>`. Note this is the **UI** host, which is not the API host the worker calls (`RELAY_ADMIN_URL`, default `https://api-relay-prod.divine.video`). The age-review page also accepts `?pubkey=<hex>`, but that costs it a lookup to resolve the case a refusal already named.
+`caseUrl` is built from `RELAY_ADMIN_UI_URL` (default `https://relay.admin.divine.video`) as `/age-review?case=<caseId>`. Note this is the **UI** host, which is not the API host the worker calls (`RELAY_ADMIN_URL`, default `https://api-relay-prod.divine.video`). The age-review page also accepts `?pubkey=<hex>`; `?case=` is used because a refusal already names the case, so there is no id to resolve.
 
 `state` is one of relay-manager's `AGE_REVIEW_STATES` (`shared/age-review.ts`). Terminal states (`cleared`, `denied_closed`) never appear in a refusal, because a case in one of those no longer blocks the un-ban.
 

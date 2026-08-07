@@ -387,7 +387,8 @@ function getRelayAdminUiUrl(env) {
 }
 
 // The age-review flow deep-links by case id (`?case=`), which is exactly what a
-// refusal carries. `?pubkey=` also resolves, but costs the UI a lookup first.
+// refusal carries. `?pubkey=` also resolves; `?case=` is used because the case
+// is already named, not because the other form is slower.
 function ageReviewCaseUrl(env, caseId) {
   return `${getRelayAdminUiUrl(env)}/age-review?case=${encodeURIComponent(caseId)}`;
 }
