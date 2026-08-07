@@ -32,6 +32,7 @@ Only `allow_pubkey` can be refused by the age-review guard, so it is the only ac
 | `409` `code: age_review_active`, plus `caseId` and `state` | Not retryable. The case has to be resolved in the Age Review flow first, after which the un-ban proceeds. | `409` with `code`, `caseId`, `state` and a `caseUrl` deep-link. |
 | `503` `code: age_review_check_failed` | The check could not run (D1 outage / no binding). Fail-closed, so the hold stays on. | `503` with `code`. Retryable. |
 | any other non-2xx, or `success: false` | A genuine relay failure. | `502` with the message, as before. |
+| no response at all — 15s timeout, or Cloudflare Access bouncing the public-edge fallback | The call never reached relay-admin. | `502` with a self-describing message. These throw a plain `Error`, not a `RelayAdminError`, so they carry no `upstreamStatus` and log as `upstream HTTP unknown`. |
 
 `caseUrl` is built from `RELAY_ADMIN_UI_URL` (default `https://relay.admin.divine.video`) as `/age-review?case=<caseId>`. Note this is the **UI** host, which is not the API host the worker calls (`RELAY_ADMIN_URL`, default `https://api-relay-prod.divine.video`). The age-review page also accepts `?pubkey=<hex>`; `?case=` is used because a refusal already names the case, so there is no id to resolve.
 
