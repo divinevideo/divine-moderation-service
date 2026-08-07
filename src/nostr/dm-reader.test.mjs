@@ -93,7 +93,11 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     expect(reportRow.reason).toBe(proseContent);
   });
 
-  it('a rumor with no sha256 tag (plain prose, e.g. a user report or DM-message report) never creates a user_reports row', async () => {
+  it('a rumor with report_type but no sha256 (a user report or DM-message report) is still badged as a report, without a user_reports row', async () => {
+    // user_reports.sha256 is NOT NULL, so these two report variants can
+    // never become a report row -- but they are still reports, and the
+    // admin Messages UI's badge comes from message_type. Classifying them
+    // as creator_reply would hide them among ordinary chat replies.
     const proseContent = 'User Report\nReason: Impersonation\nUser Pubkey: ' + 'b'.repeat(64);
     const rumor = makeRumor({
       pubkey: REPORTER,
@@ -105,10 +109,24 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
 
     expect(outcome).toBe('synced');
     const dmRow = await db.prepare('SELECT * FROM dm_log').first();
-    expect(dmRow.message_type).toBe('creator_reply');
+    expect(dmRow.message_type).toBe('conversation_report');
     expect(dmRow.sha256).toBeNull();
     const reportRows = await db.prepare('SELECT * FROM user_reports').all();
     expect(reportRows.results).toHaveLength(0);
+  });
+
+  it('an empty-string report_type tag is treated as absent, so an ordinary reply is not badged as a report', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['report_type', '']],
+      content: 'just a normal reply',
+    });
+
+    const outcome = await processRumor(rumor, 'evt-2b', MODERATOR, { BLOSSOM_DB: db });
+
+    expect(outcome).toBe('synced');
+    const dmRow = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dmRow.message_type).toBe('creator_reply');
   });
 
   it('a rumor with no tags at all (e.g. an ordinary chat reply) classifies as creator_reply, unchanged from before #6593', async () => {
