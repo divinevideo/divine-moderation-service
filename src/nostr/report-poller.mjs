@@ -25,6 +25,33 @@ export function extractReportTargetEventId(reportEvent) {
   return null;
 }
 
+// divine-mobile and divine-web publish report reasons as NIP-32 labels in the
+// social.nos.ontology namespace ('NS-sexualContent', 'NS-csam', ...). Those
+// values reach here already lowercased and de-hyphenated, so 'NS-sexualContent'
+// arrives as 'ns_sexualcontent' -- a form that matches nothing in
+// AI_REPORT_TYPES or NSFW_REPORT_TYPES. Resolve each to the canonical type so
+// escalation policy (isNsfwReportType -> AGE_RESTRICTED, isAiReportType -> AI
+// telemetry) actually fires. divine-relay-manager's CATEGORY_LABELS is the
+// same table on the display side.
+const NOS_ONTOLOGY_LABEL_TYPES = new Map([
+  ['ns_spam', 'spam'],
+  ['ns_harassment', 'harassment'],
+  ['ns_violence', 'violence'],
+  ['ns_sexualcontent', 'sexual_content'],
+  ['ns_sexual_content', 'sexual_content'],
+  ['ns_copyright', 'copyright'],
+  ['ns_falseinformation', 'false_information'],
+  ['ns_false_information', 'false_information'],
+  ['ns_childsafety', 'child_safety'],
+  ['ns_child_safety', 'child_safety'],
+  ['ns_csam', 'csam'],
+  ['ns_underageuser', 'underage_user'],
+  ['ns_underage_user', 'underage_user'],
+  ['ns_aigenerated', 'ai_generated'],
+  ['ns_ai_generated', 'ai_generated'],
+  ['ns_other', 'other'],
+]);
+
 function normalizeReportType(value) {
   if (typeof value !== 'string') {
     return null;
@@ -35,10 +62,14 @@ function normalizeReportType(value) {
     return null;
   }
 
+  const fromLabel = NOS_ONTOLOGY_LABEL_TYPES.get(normalized);
+  if (fromLabel) {
+    return fromLabel;
+  }
+
   if (
     normalized === 'aigenerated'
     || normalized === 'ai_generated'
-    || normalized === 'ns_aigenerated'
     || normalized === 'aigenerated_content'
     || normalized === 'ai_generated_content'
   ) {
@@ -48,15 +79,28 @@ function normalizeReportType(value) {
   return normalized;
 }
 
+/**
+ * Resolve a report's type from the most specific source available.
+ *
+ * Shared by both ingestion paths so they can never disagree: the kind-1984
+ * relay poller reads a signed report event, and the DM reader reads a NIP-17
+ * rumor. The `report_type` arm sits above the content regex because a rumor's
+ * content is localized prose ('Reason: Spam or Unwanted Content'), which would
+ * otherwise normalize into a locale-dependent type. kind-1984 events carry no
+ * `report_type` tag, so that arm is inert for them and their behaviour is
+ * unchanged.
+ */
 export function extractReportType(reportEvent) {
   const tags = reportEvent?.tags || [];
   const eMarker = tags.find((tag) => tag[0] === 'e' && tag[2])?.[2];
   const pMarker = tags.find((tag) => tag[0] === 'p' && tag[2])?.[2];
   const label = tags.find((tag) => tag[0] === 'l' && tag[1])?.[1];
+  const reportTypeTag = tags.find((tag) => tag[0] === 'report_type' && tag[1])?.[1];
   const content = typeof reportEvent?.content === 'string' ? reportEvent.content : '';
   const reasonMatch = content.match(/^Reason:\s*([^\n\r]+)/im);
 
   return normalizeReportType(label)
+    || normalizeReportType(reportTypeTag)
     || normalizeReportType(reasonMatch?.[1])
     || normalizeReportType(eMarker)
     || normalizeReportType(pMarker)

@@ -18,6 +18,7 @@ import {
   setLastReportPollTimestamp,
   shouldAcceptReportTarget,
 } from './report-poller.mjs';
+import { isAiReportType, isNsfwReportType } from '../reports.mjs';
 
 const TARGET_EVENT_ID = 'a'.repeat(64);
 const REPORT_EVENT_ID = 'c'.repeat(64);
@@ -89,6 +90,83 @@ describe('kind 1984 parsing', () => {
       ],
       content: 'CONTENT REPORT - NIP-56\nReason: aiGenerated\nDetails: AI-Generated Content',
     })).toBe('ai_generated');
+  });
+
+  // Regression: only the aiGenerated family used to be decoded, so every
+  // other NS- label reached user_reports.report_type still prefixed
+  // ('ns_sexualcontent'), matching nothing in NSFW_REPORT_TYPES -- NSFW auto
+  // age-restriction could never fire from a diVine report. Every existing
+  // fixture used NS-aiGenerated, the one label that happened to work.
+  describe('social.nos.ontology label vocabulary', () => {
+    const divineReport = (label) => ({
+      kind: 1984,
+      tags: [
+        ['e', TARGET_EVENT_ID, 'other'],
+        ['L', 'social.nos.ontology'],
+        ['l', label, 'social.nos.ontology'],
+      ],
+      content: '',
+    });
+
+    it.each([
+      ['NS-spam', 'spam'],
+      ['NS-harassment', 'harassment'],
+      ['NS-violence', 'violence'],
+      ['NS-sexualContent', 'sexual_content'],
+      ['NS-copyright', 'copyright'],
+      ['NS-falseInformation', 'false_information'],
+      ['NS-childSafety', 'child_safety'],
+      ['NS-csam', 'csam'],
+      ['NS-underageUser', 'underage_user'],
+      ['NS-aiGenerated', 'ai_generated'],
+      ['NS-other', 'other'],
+    ])('resolves %s to %s', (label, expected) => {
+      expect(extractReportType(divineReport(label))).toBe(expected);
+    });
+
+    it('makes a sexual-content report eligible for NSFW escalation', () => {
+      expect(isNsfwReportType(extractReportType(divineReport('NS-sexualContent')))).toBe(true);
+    });
+
+    it('makes an AI report eligible for AI detection telemetry', () => {
+      expect(isAiReportType(extractReportType(divineReport('NS-aiGenerated')))).toBe(true);
+    });
+  });
+
+  describe('report_type tag (moderation DM ingestion)', () => {
+    it('prefers the NIP-32 label over the report_type tag', () => {
+      expect(extractReportType({
+        tags: [
+          ['l', 'NS-aiGenerated', 'social.nos.ontology'],
+          ['report_type', 'other'],
+        ],
+        content: '',
+      })).toBe('ai_generated');
+    });
+
+    it('falls back to the report_type tag when no label is present', () => {
+      expect(extractReportType({
+        tags: [['report_type', 'nudity']],
+        content: '',
+      })).toBe('nudity');
+    });
+
+    // A DM's content is localized prose, so letting the Reason: regex
+    // outrank an explicit tag would make report_type locale-dependent.
+    it('outranks a localized Reason line in the content', () => {
+      expect(extractReportType({
+        tags: [['report_type', 'spam']],
+        content: 'Content Report\nReason: Contenu indésirable\nEvent: abc',
+      })).toBe('spam');
+    });
+
+    it('leaves kind-1984 events unchanged (they carry no report_type tag)', () => {
+      expect(extractReportType({
+        kind: 1984,
+        tags: [['e', TARGET_EVENT_ID, 'nudity']],
+        content: '',
+      })).toBe('nudity');
+    });
   });
 
   it('detects reports from the diVine client tag', () => {
