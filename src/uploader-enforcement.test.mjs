@@ -833,6 +833,32 @@ describe('age-review refusals on un-ban', () => {
     }
   });
 
+  it('falls back to the status line when the relay names no usable error', async () => {
+    // error was the one field read straight off the body while its three
+    // siblings were type-guarded. A non-string one stringified into the toast
+    // as "[object Object]", telling the moderator nothing.
+    const relay = stubRelayAdmin(502, {
+      success: false,
+      error: { nested: 'not a string' }
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://api-relay-prod.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      expect(response.status).toBe(502);
+      await expect(response.json()).resolves.toMatchObject({
+        error: 'Relay admin error: HTTP 502'
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
   it('trims a padded caseId instead of encoding the padding into the link', async () => {
     // A padded id clears the emptiness check, so without trimming it reaches the
     // link as `?case=%20...%20` — a live Open case button that resolves to no

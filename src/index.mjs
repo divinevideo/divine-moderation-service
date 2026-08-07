@@ -897,7 +897,7 @@ async function callRelayAdminAction(env, payload) {
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data?.success === false) {
-    throw new RelayAdminError(data?.error || `Relay admin error: HTTP ${response.status}`, {
+    throw new RelayAdminError(relayAdminField(data?.error) || `Relay admin error: HTTP ${response.status}`, {
       status: response.status,
       code: relayAdminField(data?.code),
       caseId: relayAdminField(data?.caseId),
