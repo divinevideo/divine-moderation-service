@@ -183,7 +183,7 @@ function toastText(toast) {
 }
 
 function toastAction(toast) {
-  return toast.children.find((child) => child.className === 'toast-undo') ?? null;
+  return toast.children.find((child) => child.className === 'toast-action') ?? null;
 }
 
 async function runUnban(harness) {

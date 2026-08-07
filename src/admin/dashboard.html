@@ -1879,7 +1879,7 @@
       font-size: 14px;
     }
 
-    .toast-undo {
+    .toast-action {
       background: #2563eb;
       color: white;
       border: none;
@@ -1890,7 +1890,7 @@
       white-space: nowrap;
     }
 
-    .toast-undo:hover {
+    .toast-action:hover {
       background: #1d4ed8;
     }
 
@@ -5034,7 +5034,7 @@
 
       if (onAction) {
         const actionBtn = document.createElement('button');
-        actionBtn.className = 'toast-undo';
+        actionBtn.className = 'toast-action';
         actionBtn.textContent = actionLabel;
         actionBtn.onclick = () => {
           onAction();
