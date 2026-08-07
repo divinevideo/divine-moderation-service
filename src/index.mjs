@@ -794,8 +794,17 @@ class RelayAdminError extends Error {
 
 // Relay-admin fields are only trusted as non-empty strings; anything else is
 // treated as absent so a malformed body cannot become a bogus case link.
+// The trimmed value is what gets returned, not just what gets tested: a padded
+// caseId passes the emptiness check but builds `?case=%20abc%20`, which is a
+// live "Open case" button that resolves to no case — the dead end this whole
+// path exists to remove.
 function relayAdminField(value) {
-  return typeof value === 'string' && value.trim() !== '' ? value : null;
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 function relayRpcForAction(payload) {

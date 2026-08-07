@@ -833,6 +833,37 @@ describe('age-review refusals on un-ban', () => {
     }
   });
 
+  it('trims a padded caseId instead of encoding the padding into the link', async () => {
+    // A padded id clears the emptiness check, so without trimming it reaches the
+    // link as `?case=%20...%20` — a live Open case button that resolves to no
+    // case, which is worse than no button at all.
+    const relay = stubRelayAdmin(409, {
+      success: false,
+      error: BLOCK_MESSAGE,
+      code: 'age_review_active',
+      caseId: `  ${CASE_ID}  `,
+      state: '  open_reported  '
+    });
+
+    try {
+      const response = await postUnban(createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements: bannedUploaderRows() }),
+        RELAY_ADMIN_URL: 'https://api-relay-prod.divine.video',
+        CF_ACCESS_CLIENT_ID: 'client-id',
+        CF_ACCESS_CLIENT_SECRET: 'client-secret'
+      }));
+
+      expect(response.status).toBe(409);
+      await expect(response.json()).resolves.toMatchObject({
+        caseId: CASE_ID,
+        state: 'open_reported',
+        caseUrl: `https://relay.admin.divine.video/age-review?case=${CASE_ID}`
+      });
+    } finally {
+      relay.restore();
+    }
+  });
+
   it('escapes a case id into the link instead of splicing it in raw', async () => {
     // Same untrusted-input reason: the case id goes into a query string that the
     // dashboard hands to window.open, so it is encoded rather than able to add
