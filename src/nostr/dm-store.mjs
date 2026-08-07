@@ -27,6 +27,21 @@ export async function initDmLogTable(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_conversation ON dm_log(conversation_id)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_log(recipient_pubkey)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_sha256 ON dm_log(sha256)').run();
+  await initDmReadStateTable(db);
+}
+
+/**
+ * Create the per-conversation read-state table if it doesn't exist.
+ *
+ * Callable on its own, not just via initDmLogTable, because CI deploys the
+ * worker on every push to main but never runs `wrangler d1 migrations apply`.
+ * Without an ensure on the DM read paths, merging the migration that adds
+ * this table would still ship a getConversations() that LEFT JOINs a table
+ * production does not have yet, and the admin Messages UI would 500 until
+ * someone applied migration 012 by hand.
+ * @param {D1Database} db
+ */
+export async function initDmReadStateTable(db) {
   await db.prepare(`
     CREATE TABLE IF NOT EXISTS dm_conversation_read_state (
       conversation_id TEXT PRIMARY KEY,
