@@ -345,6 +345,90 @@ describe('DM Sender - discoverUserRelays', () => {
   });
 });
 
+describe('DM Sender - DM_RELAY_URLS override', () => {
+  let mockKV;
+
+  beforeEach(() => {
+    mockKV = { get: vi.fn(), put: vi.fn() };
+  });
+
+  it('publishes only to DM_RELAY_URLS when set', async () => {
+    mockKV.get.mockResolvedValue(null);
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://127.0.0.1:4444']);
+    expect(relays).not.toContain('wss://relay.divine.video');
+  });
+
+  it('ignores the KV relay cache when DM_RELAY_URLS is set', async () => {
+    // Containment must not be defeatable by a cache entry written before the
+    // override was configured.
+    mockKV.get.mockResolvedValue(JSON.stringify(['wss://relay.damus.io']));
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://127.0.0.1:4444']);
+  });
+
+  it('does not write the override list back into the KV cache', async () => {
+    // Caching it would leak a local/staging relay into a later prod-configured
+    // run of the same worker against the same namespace.
+    mockKV.get.mockResolvedValue(null);
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    await discoverUserRelays('b'.repeat(64), env);
+
+    expect(mockKV.put).not.toHaveBeenCalled();
+  });
+
+  it('parses a comma-separated list, trimming blanks', async () => {
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: ' ws://127.0.0.1:4444 , ,ws://127.0.0.1:5555 ',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://127.0.0.1:4444', 'ws://127.0.0.1:5555']);
+  });
+
+  it('still caps the override at MAX_RELAYS', async () => {
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: [
+        'ws://r1', 'ws://r2', 'ws://r3', 'ws://r4', 'ws://r5', 'ws://r6',
+      ].join(','),
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toHaveLength(5);
+  });
+
+  it('falls back to normal discovery when DM_RELAY_URLS is only separators', async () => {
+    // An all-blank value must not yield zero relays; that would be read
+    // downstream as success===0 rather than as a configuration error.
+    mockKV.get.mockResolvedValue(null);
+    const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: ' , , ' };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toContain('wss://relay.divine.video');
+  });
+});
+
 describe('DM Sender - Error Handling', () => {
   it('should return failure when NOSTR_PRIVATE_KEY is missing', async () => {
     const env = {};

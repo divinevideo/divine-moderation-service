@@ -144,6 +144,19 @@ AI_DETECTOR_MODE_WATERMARK_VISIBLE = "shadow"
 # threshold; 0.7 is moderate. Tune from shadow-mode agreement data.
 AI_DETECTOR_GATE_WATERMARK_VISIBLE = "0.8"
 
+# Outbound NIP-17 DM publish targets. UNSET in production on purpose: the DM
+# paths then use their built-in list (relay.divine.video plus the user's own
+# NIP-65 read relays, falling back to damus/primal/nos.lol).
+#
+# Set it — comma-separated — and it becomes the exact and only publish target
+# list, skipping both the KV relay cache and kind-10002 discovery. That is the
+# only way to run this Worker outside production with a real signing key without
+# DMs reaching real users, because the default relays are module constants in
+# src/nostr/dm-sender.mjs and are otherwise unreachable from config.
+#
+# Any non-production deployment that sets NOSTR_PRIVATE_KEY must set this too.
+# DM_RELAY_URLS = "ws://127.0.0.1:4444"
+
 # Relay Polling Configuration
 RELAY_POLLING_ENABLED = "true"                    # Enable/disable relay polling
 RELAY_POLLING_RELAY_URL = "wss://relay.divine.video"  # Relay to poll for new video events

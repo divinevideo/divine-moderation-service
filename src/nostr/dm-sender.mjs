@@ -333,15 +333,56 @@ async function recordRateLimit(recipientPubkey, env) {
 // --- Relay Discovery ---
 
 /**
+ * Parse the `DM_RELAY_URLS` publish-target override.
+ *
+ * Unset (the production default) returns [] and every caller keeps today's
+ * behaviour: discovered relays, DIVINE_RELAY, DEFAULT_RELAYS.
+ *
+ * Set, it pins outbound DMs to exactly these relays. That containment is what
+ * makes it safe to run this Worker outside production with a real signing key:
+ * DIVINE_RELAY and DEFAULT_RELAYS are module constants, so without an override
+ * every DM path publishes to relay.divine.video and to three public relays
+ * regardless of environment.
+ *
+ * A value that parses to nothing is treated as unset rather than as "no
+ * relays": returning [] from discovery would surface downstream as success===0,
+ * an ambiguous send, instead of as the misconfiguration it is.
+ *
+ * @param {Object} env
+ * @returns {string[]} Relay URLs, capped at MAX_RELAYS; [] when not overridden
+ */
+function parseRelayOverride(env) {
+  if (!env || typeof env.DM_RELAY_URLS !== 'string') return [];
+  return env.DM_RELAY_URLS
+    .split(',')
+    .map((r) => r.trim())
+    .filter(Boolean)
+    .slice(0, MAX_RELAYS);
+}
+
+/**
  * Discover relays a user reads from, via kind 10002 (NIP-65 relay list).
  * Checks KV cache first, then queries relay.divine.video.
  * Always includes relay.divine.video. Caps at MAX_RELAYS.
+ *
+ * When `DM_RELAY_URLS` is set it short-circuits all of that and becomes the
+ * exact publish target list. See parseRelayOverride.
  *
  * @param {string} pubkey - Hex pubkey of user
  * @param {Object} env
  * @returns {Promise<string[]>} Relay URLs
  */
 export async function discoverUserRelays(pubkey, env) {
+  // A configured override is the complete target list: no cache read, no
+  // kind-10002 discovery, no implicit DIVINE_RELAY. Both of those would
+  // otherwise reintroduce a production relay, which is the whole thing this
+  // exists to prevent.
+  const override = parseRelayOverride(env);
+  if (override.length > 0) {
+    console.log(`[DM] Using DM_RELAY_URLS override (${override.length} relays)`);
+    return override;
+  }
+
   // Check KV cache
   if (env.MODERATION_KV) {
     try {
