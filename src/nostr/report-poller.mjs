@@ -67,6 +67,10 @@ function normalizeReportType(value) {
     return fromLabel;
   }
 
+  if (normalized.startsWith('ns_')) {
+    console.warn(`[REPORT-POLLER] Unmapped social.nos.ontology report label: ${value}`);
+  }
+
   if (
     normalized === 'aigenerated'
     || normalized === 'ai_generated'
@@ -77,6 +81,14 @@ function normalizeReportType(value) {
   }
 
   return normalized;
+}
+
+function isSocialOntologyLabelTag(tag) {
+  return Array.isArray(tag)
+    && tag[0] === 'l'
+    && typeof tag[1] === 'string'
+    && tag[1].trim()
+    && tag[2] === 'social.nos.ontology';
 }
 
 /**
@@ -94,7 +106,7 @@ export function extractReportType(reportEvent) {
   const tags = reportEvent?.tags || [];
   const eMarker = tags.find((tag) => tag[0] === 'e' && tag[2])?.[2];
   const pMarker = tags.find((tag) => tag[0] === 'p' && tag[2])?.[2];
-  const label = tags.find((tag) => tag[0] === 'l' && tag[1])?.[1];
+  const label = tags.find(isSocialOntologyLabelTag)?.[1];
   const reportTypeTag = tags.find((tag) => tag[0] === 'report_type' && tag[1])?.[1];
   const content = typeof reportEvent?.content === 'string' ? reportEvent.content : '';
   const reasonMatch = content.match(/^Reason:\s*([^\n\r]+)/im);

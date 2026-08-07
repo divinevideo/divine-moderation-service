@@ -131,6 +131,30 @@ describe('kind 1984 parsing', () => {
     it('makes an AI report eligible for AI detection telemetry', () => {
       expect(isAiReportType(extractReportType(divineReport('NS-aiGenerated')))).toBe(true);
     });
+
+    it('ignores labels from other NIP-32 namespaces', () => {
+      expect(extractReportType({
+        kind: 1984,
+        tags: [
+          ['e', TARGET_EVENT_ID, 'spam'],
+          ['l', 'NS-aiGenerated', 'com.example.other'],
+        ],
+        content: '',
+      })).toBe('spam');
+    });
+
+    it('warns when an NS label is not mapped to a canonical type', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      try {
+        expect(extractReportType(divineReport('NS-newReason'))).toBe('ns_newreason');
+        expect(warn).toHaveBeenCalledWith(
+          '[REPORT-POLLER] Unmapped social.nos.ontology report label: NS-newReason',
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   describe('report_type tag (moderation DM ingestion)', () => {

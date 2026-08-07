@@ -126,6 +126,9 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       CASE
         WHEN li.latest_incoming_at IS NULL THEN 0
         WHEN rs.read_at IS NULL THEN 1
+        -- Both timestamps use SQLite/D1 CURRENT_TIMESTAMP, which has
+        -- one-second resolution. A message logged in the same second as
+        -- mark-read is treated as read until a later incoming message arrives.
         WHEN li.latest_incoming_at > rs.read_at THEN 1
         ELSE 0
       END AS unread

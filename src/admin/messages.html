@@ -706,8 +706,8 @@
       const conv = conversations.find(c => (c.participant_pubkey || c.pubkey) === pubkey);
       if (conv && conv.unread) {
         conv.unread = false;
+        fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/read', { method: 'POST' }).catch(() => {});
       }
-      fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/read', { method: 'POST' }).catch(() => {});
 
       renderConversations();
 

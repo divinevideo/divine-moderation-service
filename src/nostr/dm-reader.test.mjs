@@ -126,6 +126,25 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     expect(dmRow.message_type).toBe('conversation_report');
   });
 
+  it('does not badge unrelated NIP-32 labels as report DMs', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [
+        ['p', MODERATOR],
+        ['L', 'com.example.other'],
+        ['l', 'NS-underageUser', 'com.example.other'],
+      ],
+      content: 'Plain creator reply with an unrelated label',
+    });
+
+    expect(await processRumor(rumor, 'evt-unrelated-label', MODERATOR, { BLOSSOM_DB: db })).toBe('synced');
+
+    const dmRow = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dmRow.message_type).toBe('creator_reply');
+    const reportRow = await db.prepare('SELECT * FROM user_reports').first();
+    expect(reportRow).toBeFalsy();
+  });
+
   it('a rumor carrying [sha256, x] and [report_type, y] tags creates a user_reports row with those values', async () => {
     const proseContent = 'Content Report\nReason: Spam or Unwanted Content\nEvent: ' + 'e'.repeat(64);
     const rumor = makeRumor({

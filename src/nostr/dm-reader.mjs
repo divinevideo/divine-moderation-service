@@ -189,7 +189,10 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const rumorTags = Array.isArray(rumor.tags) ? rumor.tags : [];
   const shaTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'sha256' && t[1]);
   const hasReportTag = rumorTags.some(
-    (t) => Array.isArray(t) && (t[0] === 'report_type' || t[0] === 'l') && t[1]
+    (t) => Array.isArray(t) && (
+      (t[0] === 'report_type' && t[1])
+      || (t[0] === 'l' && t[1] && t[2] === 'social.nos.ontology')
+    )
   );
   const rawSha256 = typeof shaTag?.[1] === 'string' ? shaTag[1].toLowerCase() : null;
   const relatedSha256 = rawSha256 && isValidSha256(rawSha256) ? rawSha256 : null;
