@@ -51,4 +51,9 @@ describe('dashboard provenance UI hooks', () => {
     expect(dashboardHTML).toContain('uploader-enforcement-slot-\' + sha256 + \'');
     expect(dashboardHTML).toContain('uploader-history-slot-\' + sha256 + \'');
   });
+
+  // The age-review refusal path and the toast's action label are covered by
+  // running them, in dashboard-enforcement.test.mjs. Asserting on their source
+  // text here as well would only add a second test that a reformat can break
+  // and a behaviour change cannot.
 });

@@ -1879,7 +1879,7 @@
       font-size: 14px;
     }
 
-    .toast-undo {
+    .toast-action {
       background: #2563eb;
       color: white;
       border: none;
@@ -1890,7 +1890,7 @@
       white-space: nowrap;
     }
 
-    .toast-undo:hover {
+    .toast-action:hover {
       background: #1d4ed8;
     }
 
@@ -3442,7 +3442,13 @@
 
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          throw new Error(data.error || `HTTP ${response.status}`);
+          const failure = new Error(data.error || `HTTP ${response.status}`);
+          // Carry the structured refusal through the throw. An un-ban of an
+          // account under age review comes back as a 409 naming the case that
+          // has to be resolved first, and the catch below routes to it.
+          failure.caseId = data.caseId || null;
+          failure.caseUrl = data.caseUrl || null;
+          throw failure;
         }
 
         // Confirm success immediately (before the slower list refresh) so the
@@ -3467,6 +3473,30 @@
       } catch (error) {
         button.innerHTML = originalText;
         button.disabled = false;
+
+        // An age-review block is a refusal that names where to go next, not a
+        // dead end. Offer the case instead of a bare red toast, which is what
+        // makes the enforcement hold actionable rather than looking broken.
+        // Only follow an https link: this arrives over the wire and is handed
+        // to window.open, so a javascript:/data: scheme must never be openable.
+        // Anything else falls through to the plain toast below, which carries
+        // the refusal message but not the case id.
+        const caseUrl = typeof error.caseUrl === 'string' && error.caseUrl.startsWith('https://')
+          ? error.caseUrl
+          : null;
+        if (caseUrl) {
+          // caseUrl is only built when caseId survived validation, so in
+          // practice the id is always here. Kept as a ternary because the two
+          // fields arrive as independent keys off the wire, and a link with no
+          // id printed is still worth offering.
+          const blockedMessage = error.caseId
+            ? `${error.message} (case ${error.caseId})`
+            : error.message;
+          showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
+          setLookupStatus(blockedMessage, true);
+          return;
+        }
+
         showToast(`User action failed: ${error.message}`, null, 5000);
         setLookupStatus(`User action failed: ${error.message}`, true);
       }
@@ -4989,7 +5019,10 @@
     }
 
     // Toast notification system
-    function showToast(message, onUndo = null, duration = 5000) {
+    // The action button started life as Undo and is still Undo by default;
+    // actionLabel lets a caller reuse it for a different follow-up, such as
+    // opening the age-review case that blocked an un-ban.
+    function showToast(message, onAction = null, duration = 5000, actionLabel = 'Undo') {
       // Remove existing toast
       if (currentToast) {
         currentToast.remove();
@@ -5003,15 +5036,15 @@
       messageEl.textContent = message;
       toast.appendChild(messageEl);
 
-      if (onUndo) {
-        const undoBtn = document.createElement('button');
-        undoBtn.className = 'toast-undo';
-        undoBtn.textContent = 'Undo';
-        undoBtn.onclick = () => {
-          onUndo();
+      if (onAction) {
+        const actionBtn = document.createElement('button');
+        actionBtn.className = 'toast-action';
+        actionBtn.textContent = actionLabel;
+        actionBtn.onclick = () => {
+          onAction();
           hideToast(toast);
         };
-        toast.appendChild(undoBtn);
+        toast.appendChild(actionBtn);
       }
 
       const closeBtn = document.createElement('button');
