@@ -128,7 +128,7 @@ function createNode(tag) {
 }
 
 // `response` is what the stubbed enforcement endpoint answers with.
-function createHarness({ response, currentLookupVideo = null } = {}) {
+function createHarness({ response, currentLookupVideo = null, refreshError = null } = {}) {
   const body = createNode('body');
   const toasts = [];
   const opened = [];
@@ -148,8 +148,14 @@ function createHarness({ response, currentLookupVideo = null } = {}) {
     console: { error: () => {} },
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     setLookupStatus: (message, isError = false) => { statusLines.push({ message, isError }); },
-    lookupVideo: async (id) => { refreshes.push({ kind: 'lookupVideo', id }); },
-    loadVideos: async () => { refreshes.push({ kind: 'loadVideos' }); },
+    lookupVideo: async (id) => {
+      refreshes.push({ kind: 'lookupVideo', id });
+      if (refreshError) throw refreshError;
+    },
+    loadVideos: async () => {
+      refreshes.push({ kind: 'loadVideos' });
+      if (refreshError) throw refreshError;
+    },
     currentLookupVideo,
     fetch: async (url, init) => {
       fetchCalls.push({ url, init });
@@ -334,6 +340,28 @@ describe('dashboard enforcement handler', () => {
     const toast = latestToast(harness);
     expect(toastText(toast)).toBe('Relay ban removed');
     expect(toastAction(toast)).toBeNull();
+    expect(harness.statusLines).toEqual([
+      { message: 'Relay ban removed', isError: false }
+    ]);
+    expect(harness.refreshes).toEqual([{ kind: 'loadVideos' }]);
+    expect(button.innerHTML).toBe('Unban');
+    expect(button.disabled).toBe(false);
+  });
+  it('keeps a succeeded action reported as success when the refresh then fails', async () => {
+    // The action already landed on the relay before the list is reloaded, so a
+    // reload that throws must not be re-reported as the action failing. Without
+    // the inner try/catch the rejection falls into the outer catch and the
+    // moderator is told the un-ban failed after it succeeded — which invites
+    // them to do it a second time.
+    const harness = createHarness({
+      response: { status: 200, body: { success: true } },
+      refreshError: new Error('network blip while reloading the list')
+    });
+
+    const button = await runUnban(harness);
+
+    const toast = latestToast(harness);
+    expect(toastText(toast)).toBe('Relay ban removed');
     expect(harness.statusLines).toEqual([
       { message: 'Relay ban removed', isError: false }
     ]);
