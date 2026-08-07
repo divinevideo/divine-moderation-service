@@ -7605,6 +7605,38 @@ describe('POST /admin/api/messages/{pubkey} when the send fails', () => {
   });
 });
 
+describe('POST /admin/api/messages/{pubkey}/read', () => {
+  const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+
+  it('marks the conversation read and returns success', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX + '/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true });
+    expect(prepared.some((sql) => sql.includes('dm_conversation_read_state'))).toBe(true);
+  });
+
+  it('500s when no moderator signing key is configured, instead of silently no-op succeeding', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX + '/read', {
+        method: 'POST',
+      }),
+      createEnv({ ALLOW_DEV_ACCESS: 'true', NOSTR_PRIVATE_KEY: undefined }),
+    );
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBeTruthy();
+  });
+});
+
 describe('GET /admin/api/dm-templates', () => {
   it('returns the creator-facing templates with rendered bodies', async () => {
     const res = await worker.fetch(

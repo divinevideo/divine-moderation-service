@@ -3822,6 +3822,23 @@ async function runMigration() {
       return new Response(JSON.stringify({ success: true, relaysPublished: result.relaysPublished }), { headers: { 'Content-Type': 'application/json' } });
     }
 
+    // Admin API: Mark a DM conversation read (clears the unread badge/dot)
+    if (url.pathname.startsWith('/admin/api/messages/') && url.pathname.endsWith('/read') && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      const pubkey = url.pathname.split('/')[4];
+      const { computeConversationId, markConversationRead } = await import('./nostr/dm-store.mjs');
+      const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+      const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
+      if (!moderatorPubkey) {
+        return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      const conversationId = computeConversationId(moderatorPubkey, pubkey);
+      await markConversationRead(env.BLOSSOM_DB, conversationId);
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
     // Admin API: Resolve a recipient (hex / npub / verified nip-05) to a hex pubkey.
     // Display-name lookup is intentionally NOT supported — see
     // docs/superpowers/specs/2026-06-03-moderator-compose-new-dm-design.md (Non-goals).
