@@ -9,6 +9,7 @@ import { hexToBytes } from '@noble/hashes/utils';
 import { unwrapEvent } from 'nostr-tools/nip17';
 import { computeConversationId, logDm } from './dm-store.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
+import { extractReportType } from './report-poller.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
 /**
@@ -173,20 +174,26 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // Structured report data travels as NIP-17 tags on the rumor, not as
   // JSON-encoded content -- content stays plain human-readable text
   // (matching NIP-17's "content MUST be plain text" convention) so the
-  // admin Messages UI can keep rendering it as-is. Every report DM carries
-  // a ['report_type', <nip-56 type>] tag; only content reports also carry
-  // ['sha256', <hash>], because user reports and DM-message reports have no
-  // resolvable Blossom blob hash (by design: see divine-mobile#6593 plan's
-  // "Non-goals"). So report_type classifies the message, sha256 gates the
-  // user_reports row.
+  // admin Messages UI can keep rendering it as-is. A report DM carries the
+  // same NIP-32 ['L'/'l', ...] label pair its kind-1984 sibling publishes,
+  // plus a coarse ['report_type', <nip-56 type>] fallback; only content
+  // reports also carry ['sha256', <hash>], because user reports and
+  // DM-message reports have no resolvable Blossom blob hash (by design: see
+  // divine-mobile#6593 plan's "Non-goals"). So the label classifies the
+  // message and sha256 gates the user_reports row.
+  //
+  // extractReportType is the relay poller's resolver, shared deliberately:
+  // both paths write the same (sha256, reporter_pubkey) row under
+  // INSERT OR IGNORE, so if they disagreed on vocabulary whichever ingested
+  // first would pin its answer permanently.
   const rumorTags = Array.isArray(rumor.tags) ? rumor.tags : [];
   const shaTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'sha256' && t[1]);
-  const reportTypeTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'report_type' && t[1]);
+  const hasReportTag = rumorTags.some(
+    (t) => Array.isArray(t) && (t[0] === 'report_type' || t[0] === 'l') && t[1]
+  );
   const rawSha256 = typeof shaTag?.[1] === 'string' ? shaTag[1].toLowerCase() : null;
   const relatedSha256 = rawSha256 && isValidSha256(rawSha256) ? rawSha256 : null;
-  const reportType = typeof reportTypeTag?.[1] === 'string' && reportTypeTag[1].trim()
-    ? reportTypeTag[1].trim()
-    : 'dm_report';
+  const reportType = hasReportTag ? extractReportType(rumor) : 'dm_report';
 
   if (rawSha256 && !relatedSha256) {
     console.warn(`[DM-READER] Ignoring invalid sha256 tag on report DM ${giftWrapId}`);
@@ -215,12 +222,12 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   }
 
   // Log to dm_log (dedup by nostr_event_id). Either machine-readable tag
-  // marks the DM as a report: report_type is present on all three report
-  // variants, sha256 only on content reports. Keying the badge off sha256
-  // alone would render a user report or a DM-message report as an ordinary
-  // reply in the admin Messages UI, which is a display gap rather than the
-  // deliberate user_reports non-goal above.
-  const messageType = (relatedSha256 || reportTypeTag)
+  // marks the DM as a report: the report tags are present on all three
+  // report variants, sha256 only on content reports. Keying the badge off
+  // sha256 alone would render a user report or a DM-message report as an
+  // ordinary reply in the admin Messages UI, which is a display gap rather
+  // than the deliberate user_reports non-goal above.
+  const messageType = (relatedSha256 || hasReportTag)
     ? 'conversation_report'
     : (isOutgoing ? 'moderator_reply' : 'creator_reply');
   const result = await logDm(env.BLOSSOM_DB, {

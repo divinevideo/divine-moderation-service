@@ -85,6 +85,47 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     return { pubkey, tags, content, created_at: Math.floor(Date.now() / 1000) };
   }
 
+  // The DM and the kind-1984 report write the same
+  // (sha256, reporter_pubkey) row under INSERT OR IGNORE, so whichever
+  // ingests first pins report_type forever. Both must therefore resolve the
+  // reason identically -- the NIP-56 report_type alone collapses aiGenerated
+  // to 'other', which would strand the row as a mis-typed report.
+  it('resolves report_type from the NIP-32 label, not the collapsed NIP-56 tag', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [
+        ['p', MODERATOR],
+        ['L', 'social.nos.ontology'],
+        ['l', 'NS-aiGenerated', 'social.nos.ontology'],
+        ['report_type', 'other'],
+        ['sha256', SHA256],
+      ],
+      content: 'Content Report\nReason: AI-Generated Content\nEvent: ' + 'e'.repeat(64),
+    });
+
+    expect(await processRumor(rumor, 'evt-label', MODERATOR, { BLOSSOM_DB: db })).toBe('synced');
+
+    const reportRow = await db.prepare('SELECT * FROM user_reports').first();
+    expect(reportRow.report_type).toBe('ai_generated');
+  });
+
+  it('badges a report DM that carries only the NIP-32 label', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [
+        ['p', MODERATOR],
+        ['L', 'social.nos.ontology'],
+        ['l', 'NS-underageUser', 'social.nos.ontology'],
+      ],
+      content: 'User Report\nReason: Underage User\nUser Pubkey: ' + 'f'.repeat(64),
+    });
+
+    expect(await processRumor(rumor, 'evt-label-only', MODERATOR, { BLOSSOM_DB: db })).toBe('synced');
+
+    const dmRow = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dmRow.message_type).toBe('conversation_report');
+  });
+
   it('a rumor carrying [sha256, x] and [report_type, y] tags creates a user_reports row with those values', async () => {
     const proseContent = 'Content Report\nReason: Spam or Unwanted Content\nEvent: ' + 'e'.repeat(64);
     const rumor = makeRumor({
