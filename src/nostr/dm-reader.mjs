@@ -8,6 +8,8 @@ import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import { unwrapEvent } from 'nostr-tools/nip17';
 import { computeConversationId, logDm } from './dm-store.mjs';
+import { recordReportForReview } from '../moderation/report-review.mjs';
+import { isValidSha256 } from '../validation.mjs';
 
 /**
  * Derive the moderator's hex pubkey from NOSTR_PRIVATE_KEY (hex)
@@ -180,7 +182,15 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const rumorTags = Array.isArray(rumor.tags) ? rumor.tags : [];
   const shaTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'sha256' && t[1]);
   const reportTypeTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'report_type' && t[1]);
-  const relatedSha256 = shaTag ? shaTag[1] : null;
+  const rawSha256 = typeof shaTag?.[1] === 'string' ? shaTag[1].toLowerCase() : null;
+  const relatedSha256 = rawSha256 && isValidSha256(rawSha256) ? rawSha256 : null;
+  const reportType = typeof reportTypeTag?.[1] === 'string' && reportTypeTag[1].trim()
+    ? reportTypeTag[1].trim()
+    : 'dm_report';
+
+  if (rawSha256 && !relatedSha256) {
+    console.warn(`[DM-READER] Ignoring invalid sha256 tag on report DM ${giftWrapId}`);
+  }
 
   // user_reports.sha256 is NOT NULL (it exists to count distinct
   // reporters per piece of content for escalation policy -- see
@@ -190,19 +200,17 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // message).
   if (relatedSha256 && env.BLOSSOM_DB && !isOutgoing) {
     try {
-      await env.BLOSSOM_DB.prepare(`
-        INSERT OR IGNORE INTO user_reports
-        (sha256, reporter_pubkey, report_type, reason, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(
-        relatedSha256,
-        senderPubkey,
-        reportTypeTag ? reportTypeTag[1] : 'dm_report',
-        content,
-        new Date(createdAt * 1000).toISOString()
-      ).run();
+      await recordReportForReview(env.BLOSSOM_DB, {
+        sha256: relatedSha256,
+        reporterPubkey: senderPubkey,
+        reportType,
+        reason: content,
+        source: 'dm-report',
+        reportedAt: new Date(createdAt * 1000).toISOString(),
+        allowAutoAgeRestrict: true,
+      });
     } catch (reportErr) {
-      console.warn(`[DM-READER] Failed to insert user_report:`, reportErr.message);
+      console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);
     }
   }
 

@@ -7686,6 +7686,38 @@ describe('POST /admin/api/messages/{pubkey}/read', () => {
     expect(res.status).toBe(500);
     expect((await res.json()).error).toBeTruthy();
   });
+
+  it('400s malformed read route shapes instead of inserting junk read state', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/a/b/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(prepared.some((sql) => /INSERT INTO dm_conversation_read_state/i.test(sql))).toBe(false);
+  });
+
+  it('400s non-hex read-route pubkeys instead of inserting junk read state', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/not-a-pubkey/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(prepared.some((sql) => /INSERT INTO dm_conversation_read_state/i.test(sql))).toBe(false);
+  });
 });
 
 describe('GET /admin/api/dm-templates', () => {

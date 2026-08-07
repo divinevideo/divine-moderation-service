@@ -3720,7 +3720,11 @@ async function runMigration() {
       const authError = await requireAuth(request, env);
       if (authError) return authError;
 
-      const pubkey = url.pathname.split('/')[4];
+      const parts = url.pathname.split('/');
+      if (parts.length !== 6 || !isValidPubkey(parts[4])) {
+        return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const pubkey = parts[4].toLowerCase();
       const { computeConversationId, markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
       const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
       const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
