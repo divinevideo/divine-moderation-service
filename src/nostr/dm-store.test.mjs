@@ -766,7 +766,10 @@ describe('DM Store - unread / markConversationRead against real D1', () => {
     });
 
     await markConversationRead(db, conversationId);
-    const firstReadAt = (await db.prepare('SELECT read_at FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first()).read_at;
+    // The exact value isn't asserted (CURRENT_TIMESTAMP has 1s resolution),
+    // only that the first call inserted a row for the upsert to conflict on.
+    const firstRow = await db.prepare('SELECT read_at FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(firstRow.read_at).toBeTruthy();
 
     // Simulate an out-of-order retry carrying an earlier read_at than what's
     // already stored -- the WHERE guard in markConversationRead's upsert
@@ -776,6 +779,5 @@ describe('DM Store - unread / markConversationRead against real D1', () => {
     const secondReadAt = (await db.prepare('SELECT read_at FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first()).read_at;
 
     expect(secondReadAt).toBe('2099-01-01 00:00:00');
-    void firstReadAt; // kept for readability of intent, not asserted directly (CURRENT_TIMESTAMP has 1s resolution)
   });
 });
