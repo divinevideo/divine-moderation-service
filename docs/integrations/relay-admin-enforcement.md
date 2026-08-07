@@ -29,7 +29,7 @@ Only `allow_pubkey` can be refused by the age-review guard, so it is the only ac
 
 | relay-admin returns | Meaning | This service answers |
 |---|---|---|
-| `409` `code: age_review_active`, plus `caseId` and `state` | Permanent. The case has to be resolved in the Age Review flow first. | `409` with `code`, `caseId`, `state` and a `caseUrl` deep-link. |
+| `409` `code: age_review_active`, plus `caseId` and `state` | Not retryable. The case has to be resolved in the Age Review flow first, after which the un-ban proceeds. | `409` with `code`, `caseId`, `state` and a `caseUrl` deep-link. |
 | `503` `code: age_review_check_failed` | The check could not run (D1 outage / no binding). Fail-closed, so the hold stays on. | `503` with `code`. Retryable. |
 | any other non-2xx, or `success: false` | A genuine relay failure. | `502` with the message, as before. |
 
