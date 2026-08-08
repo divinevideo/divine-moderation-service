@@ -208,6 +208,14 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // present. Skip for outgoing self-copies: the reporter is the
   // counterparty, not the moderator (who is echoing their own sent
   // message).
+  // No allowAutoAgeRestrict override: a report DM is the least verified
+  // report we accept. The sender is any key that can reach the moderation
+  // inbox, the sha256 is client-supplied, and unlike the relay poller this
+  // path does not fetch the target event, require a Divine client, or pass
+  // the processed-key gate. So it records the report and leaves the call to
+  // a human -- `source: 'dm-report'` takes the REVIEW-only default, which
+  // is what the relay path (`'relay-report'`) already takes. Only the
+  // authenticated HTTP report API still auto-escalates.
   if (relatedSha256 && env.BLOSSOM_DB && !isOutgoing) {
     try {
       await recordReportForReview(env.BLOSSOM_DB, {
@@ -217,7 +225,6 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
         reason: content,
         source: 'dm-report',
         reportedAt: new Date(createdAt * 1000).toISOString(),
-        allowAutoAgeRestrict: true,
       });
     } catch (reportErr) {
       console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);

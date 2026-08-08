@@ -59,7 +59,7 @@ describe('divine-mobile#6593 cross-repo contract', () => {
 
   // Real crypto: mobile's tags -> kind-14 rumor -> kind-13 seal -> kind-1059
   // gift wrap -> unwrap -> the backend's real classify path.
-  async function roundTrip(tags, content, giftWrapId) {
+  async function roundTrip(tags, content, giftWrapId, sk = reporterSk) {
     // The kind-14 rumor divine-mobile builds: nip17_message_service.buildRumor
     // prepends ['p', recipient], then dm_repository's additionalTags follow.
     const giftWrap = wrapEvent(
@@ -69,13 +69,13 @@ describe('divine-mobile#6593 cross-repo contract', () => {
         tags: [['p', moderatorPubkey], ...tags],
         created_at: Math.floor(Date.now() / 1000),
       },
-      reporterSk,
+      sk,
       moderatorPubkey,
     );
     expect(giftWrap.kind).toBe(1059);
     const rumor = unwrapEvent(giftWrap, moderatorSk);
     expect(rumor.kind).toBe(14);
-    expect(rumor.pubkey).toBe(getPublicKey(reporterSk));
+    expect(rumor.pubkey).toBe(getPublicKey(sk));
     const outcome = await processRumor(rumor, giftWrapId, moderatorPubkey, {
       BLOSSOM_DB: db,
     });
@@ -108,7 +108,7 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     expect(dm.content).toContain('Reason: AI-Generated Content'); // prose intact
   });
 
-  it('a sexualContent report becomes NSFW-escalation eligible', async () => {
+  it('a sexualContent report decodes to the NSFW report type', async () => {
     await roundTrip(
       mobileReportDmTags({
         nip32Label: 'NS-sexualContent',
@@ -123,6 +123,41 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     expect(report.report_type).toBe('sexual_content');
     const { isNsfwReportType } = await import('../reports.mjs');
     expect(isNsfwReportType(report.report_type)).toBe(true);
+  });
+
+  // The trust boundary: a report DM is the least verified report we accept.
+  // Any key that can reach the moderation inbox can send one, the sha256 is
+  // client-supplied, and nothing here fetches the target event, requires a
+  // Divine client, or passes the relay's processed-key gate. Two of them must
+  // therefore still land on a human rather than auto-hiding public content.
+  it('two distinct NSFW report DMs stay REVIEW instead of auto age-restricting', async () => {
+    const secondReporterSk = generateSecretKey();
+    expect(getPublicKey(secondReporterSk)).not.toBe(getPublicKey(reporterSk));
+
+    for (const [i, sk] of [reporterSk, secondReporterSk].entries()) {
+      await roundTrip(
+        mobileReportDmTags({
+          nip32Label: 'NS-sexualContent',
+          nip56Type: 'nudity',
+          sha256: SHA256,
+        }),
+        'Content Report\nReason: Sexual Content\nEvent: ' + 'e'.repeat(64),
+        `gw-nsfw-escalation-${i}`,
+        sk,
+      );
+    }
+
+    // Two distinct reporters really did land — this is the input that would
+    // trip AGE_RESTRICTED if the DM path opted into auto-escalation.
+    const reports = await db.prepare('SELECT * FROM user_reports').all();
+    expect(reports.results).toHaveLength(2);
+    const { isNsfwReportType } = await import('../reports.mjs');
+    expect(isNsfwReportType(reports.results[0].report_type)).toBe(true);
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results').first();
+    expect(moderation.action).toBe('REVIEW');
+    expect(moderation.action).not.toBe('AGE_RESTRICTED');
+    expect(JSON.parse(moderation.raw_response).source).toBe('dm-report');
   });
 
   it('a user report (no sha256) is badged but writes no user_reports row', async () => {
