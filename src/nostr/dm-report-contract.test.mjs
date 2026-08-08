@@ -20,7 +20,7 @@ import { initReportsTable } from '../reports.mjs';
 
 const SHA256 = 'b'.repeat(64);
 
-// Byte-for-byte what report_content_dialog.dart's _reportDmTags() produces,
+// Byte-for-byte what ContentReportingService.moderationDmTags() produces,
 // after dm_repository.sendMessage -> nip17_message_service.buildRumor
 // prepends the ['p', recipient] tag.
 function mobileReportDmTags({ nip32Label, nip56Type, sha256 }) {
