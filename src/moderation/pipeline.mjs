@@ -7,6 +7,7 @@
 import { classifyText, parseVttText } from './text-classifier.mjs';
 import { interpretVideoSealPayload } from './videoseal.mjs';
 import { fetchNostrEventBySha256, parseVideoEventMetadata, isOriginalVine, hasStrongOriginalVineEvidence } from '../nostr/relay-client.mjs';
+import { enrichWithAiDetector } from '../classification/ai-detector-enrichment.mjs';
 import { extractTopics } from '../classification/topic-extractor.mjs';
 import { verifyC2pa } from './inquisitor-client.mjs';
 import { shouldForceAIDetection } from './ai-detection-policy.mjs';
@@ -222,6 +223,15 @@ export async function classifyVideoOnly(sha256, env, options = {}) {
   }
 
   console.log(`[CLASSIFY-ONLY] Skipping Hive VLM scene classification for ${sha256}; using local transcript topics only`);
+
+  // Self-hosted enrichment via divine-ai-detector. Off unless
+  // AI_DETECTOR_ENRICHMENT_ENABLED=true, so this cannot revive proactive
+  // scanning by accident. Best-effort: never allowed to fail classification.
+  try {
+    await enrichWithAiDetector(sha256, videoUrl, env);
+  } catch (error) {
+    console.warn(`[CLASSIFY-ONLY] ai-detector enrichment error for ${sha256}: ${error.message}`);
+  }
 
   let topicProfile = null;
   try {
