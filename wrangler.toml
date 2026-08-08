@@ -125,7 +125,7 @@ AI_DETECTOR_BASE_URL = "https://ai-detector.divine.video"
 # a decision, not a deploy. When true, classifyVideoOnly asks the detector for
 # the nsfw signal and writes any verdict to ClickHouse moderation_labels as
 # review evidence (source_owner divine-ai-detector, no enforcement action).
-AI_DETECTOR_ENRICHMENT_ENABLED = "false"
+AI_DETECTOR_ENRICHMENT_ENABLED = "true"
 
 # DEPRECATED — kept so deployed configs that still set this don't break during
 # cutover. The client reads it as a fallback only when AI_DETECTOR_BASE_URL is
