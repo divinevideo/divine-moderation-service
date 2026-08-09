@@ -31,9 +31,12 @@ export function extractReportTargetEventId(reportEvent) {
 // values reach here already lowercased and de-hyphenated, so 'NS-sexualContent'
 // arrives as 'ns_sexualcontent' -- a form that matches nothing in
 // AI_REPORT_TYPES or NSFW_REPORT_TYPES. Resolve each to the canonical type so
-// escalation policy (isNsfwReportType -> AGE_RESTRICTED, isAiReportType -> AI
-// telemetry) actually fires. divine-relay-manager's CATEGORY_LABELS is the
-// same table on the display side.
+// the predicates keyed off it actually fire: isNsfwReportType sets the adult
+// category on the review row, and isAiReportType records AI telemetry. Neither
+// Nostr path auto age-restricts -- relay reports and report DMs are both
+// REVIEW-only -- so what this fixes is the stored type and the signals
+// moderators triage on, not automatic enforcement.
+// divine-relay-manager's CATEGORY_LABELS is the same table on the display side.
 const NOS_ONTOLOGY_LABEL_TYPES = new Map([
   ['ns_spam', 'spam'],
   ['ns_harassment', 'harassment'],
