@@ -12,6 +12,9 @@ const REPORTER = 'b'.repeat(64);
 
 function createDbMock({
   reporterCount = 1,
+  // Defaults to reporterCount: unless a test says otherwise, every reporter on
+  // the row is one whose source may drive an automatic outcome.
+  escalationReporterCount = reporterCount,
   moderationWrites = [],
   userReportWrites = [],
   aiDetectionEvents = [],
@@ -53,7 +56,7 @@ function createDbMock({
         },
         async first() {
           if (/COUNT\(DISTINCT reporter_pubkey\)/i.test(sql)) {
-            return { cnt: reporterCount };
+            return { cnt: reporterCount, escalation_cnt: escalationReporterCount };
           }
           return null;
         },
@@ -93,6 +96,7 @@ describe('recordReportForReview', () => {
       'violence',
       'reported from relay',
       '2026-05-13T17:19:42.000Z',
+      'relay-report',
     ]);
     expect(moderationWrites).toHaveLength(1);
     expect(moderationWrites[0].sql).toMatch(/uploaded_by = CASE/i);
@@ -127,6 +131,30 @@ describe('recordReportForReview', () => {
     expect(moderationWrites).toHaveLength(1);
     expect(moderationWrites[0].bindings[1]).toBe('AGE_RESTRICTED');
     expect(JSON.parse(moderationWrites[0].bindings[4])).toEqual(['adult']);
+  });
+
+  it('does not let a DM-sourced reporter complete the authenticated threshold', async () => {
+    const moderationWrites = [];
+    // Two distinct reporters on the row, but only one of them came from a
+    // source allowed to drive an automatic outcome -- the other is a report DM.
+    const db = createDbMock({ moderationWrites, reporterCount: 2, escalationReporterCount: 1 });
+
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'nudity',
+      source: 'user-report',
+    });
+
+    expect(result.action).toBe('REVIEW');
+    expect(result.distinctReporterCount).toBe(2);
+    expect(result.escalationReporterCount).toBe(1);
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
+    // Both counts are recorded so a moderator can see why it did not escalate.
+    expect(JSON.parse(moderationWrites[0].bindings[5])).toMatchObject({
+      distinctReporterCount: 2,
+      escalationReporterCount: 1,
+    });
   });
 
   it('keeps relay-origin NSFW reports in REVIEW even with multiple distinct reporters', async () => {

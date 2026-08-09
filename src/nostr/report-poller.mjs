@@ -6,6 +6,7 @@
 
 import { extractMediaShaFromEvent, getEventTagValue } from '../validation.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
+import { initReportsTable } from '../reports.mjs';
 import { fetchNostrEventById } from './relay-client.mjs';
 import { VIDEO_KINDS } from './video-kinds.mjs';
 
@@ -296,6 +297,14 @@ export async function pollRelayForReports(env, options = {}) {
   const fetchReports = injectedFetchReportsFromRelay || fetchReportsFromRelay;
   const fetchTargetEvent = injectedFetchTargetEvent || ((eventId) => fetchNostrEventById(eventId, relays, env));
   const recordReport = injectedRecordReport || ((payload) => recordReportForReview(env.BLOSSOM_DB, payload));
+
+  // Same reason as syncInbox's: this runs from the cron trigger, which never
+  // goes through the fetch handler's schema ensure, so the first tick after a
+  // deploy could otherwise write against a user_reports table missing the
+  // `source` column.
+  if (!injectedRecordReport && env.BLOSSOM_DB) {
+    await initReportsTable(env.BLOSSOM_DB);
+  }
   const requireDivineClient = env.RELAY_REPORTS_REQUIRE_DIVINE_CLIENT !== 'false';
 
   const results = {

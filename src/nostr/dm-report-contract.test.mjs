@@ -160,6 +160,41 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     expect(JSON.parse(moderation.raw_response).source).toBe('dm-report');
   });
 
+  // The same boundary from the other side. Keeping the DM path REVIEW-only
+  // stops a report DM escalating on its own, but the authenticated HTTP route
+  // still auto-escalates on two distinct reporters -- and it counts reporters
+  // per sha256, not per source. A report DM must therefore not be able to
+  // supply one of those two, or a single minted key plus one genuine report
+  // would hide public content.
+  it('a report DM cannot complete the authenticated path\'s two-reporter threshold', async () => {
+    const { recordReportForReview } = await import('../moderation/report-review.mjs');
+
+    await roundTrip(
+      mobileReportDmTags({
+        nip32Label: 'NS-sexualContent',
+        nip56Type: 'nudity',
+        sha256: SHA256,
+      }),
+      'Content Report\nReason: Sexual Content\nEvent: ' + 'e'.repeat(64),
+      'gw-nsfw-mixed',
+    );
+
+    // Now a genuine report for the same blob through POST /api/v1/report.
+    const httpResult = await recordReportForReview(db, {
+      sha256: SHA256,
+      reporterPubkey: 'c'.repeat(64),
+      reportType: 'nudity',
+      source: 'user-report',
+    });
+
+    expect(httpResult.distinctReporterCount).toBe(2);
+    expect(httpResult.escalationReporterCount).toBe(1);
+    expect(httpResult.action).toBe('REVIEW');
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results').first();
+    expect(moderation.action).toBe('REVIEW');
+  });
+
   it('a user report (no sha256) is badged but writes no user_reports row', async () => {
     const { outcome } = await roundTrip(
       mobileReportDmTags({

@@ -57,6 +57,9 @@ function createDbMock({
   aiDetectionRecentRows = [],
   moderationWrites = [],
   reporterCount = 1,
+  // Defaults to reporterCount: unless a test says otherwise, every reporter on
+  // the row came from a source allowed to drive an automatic outcome.
+  escalationReporterCount = reporterCount,
   onPrepare = null,
 } = {}) {
   return {
@@ -102,7 +105,7 @@ function createDbMock({
             return aiDetectionStatsRow;
           }
           if (sql.includes('FROM user_reports') && sql.includes('COUNT(DISTINCT reporter_pubkey)')) {
-            return { cnt: reporterCount };
+            return { cnt: reporterCount, escalation_cnt: escalationReporterCount };
           }
           return null;
         },

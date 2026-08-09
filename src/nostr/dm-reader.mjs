@@ -10,6 +10,7 @@ import { unwrapEvent } from 'nostr-tools/nip17';
 import { computeConversationId, logDm } from './dm-store.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
+import { initReportsTable } from '../reports.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
 /**
@@ -39,6 +40,15 @@ export async function syncInbox(env) {
 
   const privateKey = hexToBytes(env.NOSTR_PRIVATE_KEY);
   const moderatorPubkey = getPublicKey(privateKey);
+
+  // The fetch handler ensures the reports schema on every request, but this
+  // runs from the cron trigger too, which never touches it. Without this, the
+  // first tick after a deploy could reach a user_reports table that has no
+  // `source` column yet and drop every report it decrypted -- processRumor
+  // catches the write failure and moves on.
+  if (env.BLOSSOM_DB) {
+    await initReportsTable(env.BLOSSOM_DB);
+  }
 
   // Get last sync timestamp from KV
   let lastSync = null;

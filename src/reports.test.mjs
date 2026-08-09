@@ -114,6 +114,55 @@ describe('reports', () => {
       expect(count).toBe(2);
     });
 
+    it('counts a dm-report reporter for display but not for escalation', async () => {
+      const first = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'dm-report',
+      });
+      expect(first).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 0 });
+
+      // A second, authenticated reporter arrives. Two distinct people have now
+      // reported the blob, but only one of them through a path allowed to
+      // drive an automatic outcome -- so the NSFW threshold of 2 is not met.
+      const second = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER2,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(second).toMatchObject({ distinctReporterCount: 2, escalationReporterCount: 1 });
+
+      const third = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER3,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(third).toMatchObject({ distinctReporterCount: 3, escalationReporterCount: 2 });
+    });
+
+    it('counts rows written before the source column toward escalation', async () => {
+      // insertReport() writes no source, exactly like every row that predates
+      // the column. Those came from the HTTP or relay paths, so they keep
+      // counting.
+      await insertReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+      });
+
+      const result = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER2,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+
+      expect(result).toMatchObject({ distinctReporterCount: 2, escalationReporterCount: 2 });
+    });
+
     it('stores an explicit created_at timestamp when provided', async () => {
       const sha256 = 'a'.repeat(64);
       const reporter = 'b'.repeat(64);
