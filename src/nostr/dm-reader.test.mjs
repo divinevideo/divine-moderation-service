@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { bytesToHex } from '@noble/hashes/utils';
-import { getModeratorPubkey, processRumor } from './dm-reader.mjs';
+import { getModeratorPubkey, processRumor, resolveReportedAt } from './dm-reader.mjs';
 import { initDmLogTable } from './dm-store.mjs';
 import { initReportsTable } from '../reports.mjs';
 
@@ -81,8 +81,8 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     await db.prepare('DELETE FROM moderation_results').run();
   });
 
-  function makeRumor({ pubkey, tags, content }) {
-    return { pubkey, tags, content, created_at: Math.floor(Date.now() / 1000) };
+  function makeRumor({ pubkey, tags, content, created_at = Math.floor(Date.now() / 1000) }) {
+    return { pubkey, tags, content, created_at };
   }
 
   // The DM and the kind-1984 report write the same
@@ -341,5 +341,85 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
 
     const reportRows = await db.prepare('SELECT * FROM user_reports').all();
     expect(reportRows.results).toHaveLength(1);
+  });
+
+  // rumor.created_at is written by the sender and validated by nothing. Before
+  // resolveReportedAt, a missing one threw RangeError out of
+  // `new Date(undefined * 1000).toISOString()` inside the warn-and-continue
+  // block, so the report vanished entirely -- the worst outcome available for
+  // a moderation report.
+  it('records a report whose rumor carries no created_at instead of dropping it', async () => {
+    // Built literally rather than through makeRumor, whose default parameter
+    // would substitute a valid timestamp and hide the case under test.
+    const rumor = {
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['sha256', SHA256], ['report_type', 'nudity']],
+      content: 'Content Report',
+    };
+    expect(rumor.created_at).toBeUndefined();
+
+    const outcome = await processRumor(rumor, 'evt-no-created-at', MODERATOR, { BLOSSOM_DB: db });
+    expect(outcome).toBe('synced');
+
+    const report = await db.prepare('SELECT * FROM user_reports').first();
+    expect(report).toBeTruthy();
+    expect(report.sha256).toBe(SHA256);
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results').first();
+    expect(moderation.action).toBe('REVIEW');
+    // Stamped with receipt time, so it lands at the top of the queue rather
+    // than nowhere.
+    expect(Date.parse(moderation.moderated_at)).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it('does not let a backdated rumor bury its report at the bottom of the review queue', async () => {
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['sha256', SHA256], ['report_type', 'nudity']],
+      content: 'Content Report',
+      created_at: 1600000000, // 2020
+    });
+
+    await processRumor(rumor, 'evt-backdated', MODERATOR, { BLOSSOM_DB: db });
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results').first();
+    expect(Date.parse(moderation.moderated_at)).toBeGreaterThan(Date.now() - 60_000);
+  });
+});
+
+describe('DM Reader - resolveReportedAt', () => {
+  const NOW_MS = Date.parse('2026-08-09T12:00:00.000Z');
+  const NOW_SECONDS = Math.floor(NOW_MS / 1000);
+
+  it('keeps a plausible timestamp exactly as sent', () => {
+    const tenMinutesAgo = NOW_SECONDS - 600;
+    expect(resolveReportedAt(tenMinutesAgo, NOW_MS)).toBe(new Date(tenMinutesAgo * 1000).toISOString());
+  });
+
+  it('keeps a timestamp at the far edge of the reader\'s own lookback', () => {
+    const sixDaysAgo = NOW_SECONDS - (6 * 86400);
+    expect(resolveReportedAt(sixDaysAgo, NOW_MS)).toBe(new Date(sixDaysAgo * 1000).toISOString());
+  });
+
+  it('falls back to receipt time for missing, non-numeric, or nonsense values', () => {
+    const now = new Date(NOW_MS).toISOString();
+    expect(resolveReportedAt(undefined, NOW_MS)).toBe(now);
+    expect(resolveReportedAt(null, NOW_MS)).toBe(now);
+    expect(resolveReportedAt('1600000000', NOW_MS)).toBe(now); // string, not a number
+    expect(resolveReportedAt(NaN, NOW_MS)).toBe(now);
+    expect(resolveReportedAt(Infinity, NOW_MS)).toBe(now);
+    expect(resolveReportedAt(0, NOW_MS)).toBe(now);
+    expect(resolveReportedAt(-1, NOW_MS)).toBe(now);
+  });
+
+  it('falls back to receipt time for a backdated or future timestamp', () => {
+    const now = new Date(NOW_MS).toISOString();
+    expect(resolveReportedAt(NOW_SECONDS - (8 * 86400), NOW_MS)).toBe(now);
+    expect(resolveReportedAt(NOW_SECONDS + 3600, NOW_MS)).toBe(now);
+  });
+
+  it('tolerates a client clock that runs slightly fast', () => {
+    const oneMinuteAhead = NOW_SECONDS + 60;
+    expect(resolveReportedAt(oneMinuteAhead, NOW_MS)).toBe(new Date(oneMinuteAhead * 1000).toISOString());
   });
 });

@@ -13,6 +13,44 @@ import { extractReportType } from './report-poller.mjs';
 import { initReportsTable } from '../reports.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
+// How far back a first sync looks for gift wraps. Also the floor for a
+// report's self-reported timestamp: nothing this reader ingests can honestly
+// be older than the oldest thing it fetches.
+const INBOX_FIRST_RUN_LOOKBACK_SECONDS = 7 * 86400;
+
+// Tolerance for a reporting client whose clock runs a little fast.
+const REPORT_CLOCK_SKEW_SECONDS = 5 * 60;
+
+/**
+ * Resolve the timestamp a report DM should be recorded under.
+ *
+ * `rumor.created_at` comes out of the decrypted rumor, so it is written by
+ * whoever sent the DM and constrained by nothing. Two ways that bites:
+ * a missing or non-numeric value makes `new Date(x * 1000).toISOString()`
+ * throw `RangeError`, and because the caller records reports inside a
+ * warn-and-continue block, the whole report would be dropped rather than
+ * mis-stamped; a backdated value lands in `moderation_results.moderated_at`,
+ * which the admin queue sorts on and its `since` filter excludes, hiding the
+ * report from the humans it was escalated to.
+ *
+ * So the rumor's own timestamp is used only where it could plausibly be true,
+ * and receipt time stands in otherwise. Both failure directions round toward
+ * "surfaces now", never toward "surfaces never".
+ *
+ * @param {unknown} createdAt - rumor.created_at, in seconds
+ * @param {number} nowMs - current time in ms, injectable for tests
+ * @returns {string} ISO-8601 timestamp
+ */
+export function resolveReportedAt(createdAt, nowMs = Date.now()) {
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const isUsable = Number.isFinite(createdAt)
+    && createdAt > 0
+    && createdAt <= nowSeconds + REPORT_CLOCK_SKEW_SECONDS
+    && createdAt >= nowSeconds - INBOX_FIRST_RUN_LOOKBACK_SECONDS;
+
+  return new Date(isUsable ? createdAt * 1000 : nowMs).toISOString();
+}
+
 /**
  * Derive the moderator's hex pubkey from NOSTR_PRIVATE_KEY (hex)
  * @param {Object} env - Environment with NOSTR_PRIVATE_KEY
@@ -66,7 +104,7 @@ export async function syncInbox(env) {
     since = lastSync - TWO_DAYS;
   } else {
     // First run: look back 7 days
-    since = Math.floor(Date.now() / 1000) - (7 * 86400);
+    since = Math.floor(Date.now() / 1000) - INBOX_FIRST_RUN_LOOKBACK_SECONDS;
   }
 
   // Fetch gift wrap events from relay
@@ -234,7 +272,7 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
         reportType,
         reason: content,
         source: 'dm-report',
-        reportedAt: new Date(createdAt * 1000).toISOString(),
+        reportedAt: resolveReportedAt(createdAt),
       });
     } catch (reportErr) {
       console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);
