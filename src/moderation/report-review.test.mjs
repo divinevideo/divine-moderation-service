@@ -90,6 +90,8 @@ describe('recordReportForReview', () => {
       aiTelemetryRecorded: false,
     });
     expect(userReportWrites).toHaveLength(1);
+    // The trailing pair is the conflict guard: upgrade the stored source only
+    // when it is 'dm-report' and the incoming one is not.
     expect(userReportWrites[0].bindings).toEqual([
       SHA,
       REPORTER,
@@ -97,7 +99,10 @@ describe('recordReportForReview', () => {
       'reported from relay',
       '2026-05-13T17:19:42.000Z',
       'relay-report',
+      'dm-report',
+      'dm-report',
     ]);
+    expect(userReportWrites[0].sql).toMatch(/ON CONFLICT\(sha256, reporter_pubkey\) DO UPDATE SET source = excluded\.source/i);
     expect(moderationWrites).toHaveLength(1);
     expect(moderationWrites[0].sql).toMatch(/uploaded_by = CASE/i);
     expect(moderationWrites[0].sql).toMatch(/moderation_results\.uploaded_by IS NULL/i);

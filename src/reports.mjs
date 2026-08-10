@@ -67,10 +67,39 @@ const NON_ESCALATING_SOURCE = 'dm-report';
  * @returns {Promise<{escalate: 'AGE_RESTRICTED'|'REVIEW'|null, distinctReporterCount: number, escalationReporterCount: number}>}
  */
 export async function addReport(db, { sha256, reporter_pubkey, report_type, reason, created_at, source = null }) {
+  // One report can reach two ingestion paths: divine-mobile publishes the
+  // kind-1984 and sends the report DM for the same content from the same key,
+  // so both write this same (sha256, reporter_pubkey) row. The two paths were
+  // made to agree on `report_type`, but they cannot agree on `source` -- it
+  // names the path they came in through. Under a plain INSERT OR IGNORE that
+  // left arrival order deciding whether a reporter is escalation-eligible,
+  // and a reporter pinned to 'dm-report' stayed excluded from
+  // escalationReporterCount forever, even after reporting again through the
+  // authenticated route.
+  //
+  // So upgrade on conflict, in one direction only: once a reporter has been
+  // seen through a path that may drive an automatic outcome, that sticks. A
+  // later report DM never downgrades a reporter the HTTP or relay path
+  // already established. Everything else about the row stays first-write-wins
+  // -- `report_type`, `reason` and `created_at` keep the report of record as
+  // it was first filed.
   await db.prepare(`
     INSERT OR IGNORE INTO user_reports (sha256, reporter_pubkey, report_type, reason, created_at, source)
     VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)
-  `).bind(sha256, reporter_pubkey, report_type, reason ?? null, created_at ?? null, source ?? null).run();
+    ON CONFLICT(sha256, reporter_pubkey) DO UPDATE SET source = excluded.source
+      WHERE user_reports.source = ?
+        AND excluded.source IS NOT NULL
+        AND excluded.source <> ?
+  `).bind(
+    sha256,
+    reporter_pubkey,
+    report_type,
+    reason ?? null,
+    created_at ?? null,
+    source ?? null,
+    NON_ESCALATING_SOURCE,
+    NON_ESCALATING_SOURCE,
+  ).run();
 
   const row = await db.prepare(`
     SELECT

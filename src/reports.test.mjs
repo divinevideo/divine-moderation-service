@@ -163,6 +163,107 @@ describe('reports', () => {
       expect(result).toMatchObject({ distinctReporterCount: 2, escalationReporterCount: 2 });
     });
 
+    it('upgrades a dm-report reporter who later reports through the authenticated path', async () => {
+      const first = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'dm-report',
+      });
+      expect(first).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 0 });
+
+      // Same person, same blob, now through POST /api/v1/report. Under a plain
+      // INSERT OR IGNORE this row stayed 'dm-report' and the reporter never
+      // counted toward escalation again.
+      const second = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(second).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+
+      const row = await db.prepare(
+        'SELECT source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+      ).bind(SHA256, REPORTER1).first();
+      expect(row.source).toBe('user-report');
+    });
+
+    it('upgrades a dm-report reporter when the kind-1984 poller ingests the same report', async () => {
+      // divine-mobile sends both channels for one report, so this pair is the
+      // ordinary case rather than an edge one -- it just depends which lands
+      // first.
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'sexual_content',
+        source: 'dm-report',
+      });
+
+      const afterRelay = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'sexual_content',
+        source: 'relay-report',
+      });
+
+      expect(afterRelay).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+    });
+
+    it('does not let a later report DM downgrade an escalating reporter', async () => {
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+
+      const afterDm = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'dm-report',
+      });
+
+      expect(afterDm).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+
+      const row = await db.prepare(
+        'SELECT source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+      ).bind(SHA256, REPORTER1).first();
+      expect(row.source).toBe('user-report');
+    });
+
+    it('upgrades only the source, leaving the report of record as first filed', async () => {
+      const firstFiledAt = '2026-05-13T17:19:42.000Z';
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'ai_generated',
+        reason: 'as the DM described it',
+        created_at: firstFiledAt,
+        source: 'dm-report',
+      });
+
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'spam',
+        reason: 'as the later report described it',
+        created_at: '2026-06-01T00:00:00.000Z',
+        source: 'user-report',
+      });
+
+      const row = await db.prepare(
+        'SELECT report_type, reason, created_at, source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+      ).bind(SHA256, REPORTER1).first();
+      expect(row).toMatchObject({
+        report_type: 'ai_generated',
+        reason: 'as the DM described it',
+        created_at: firstFiledAt,
+        source: 'user-report',
+      });
+    });
+
     it('stores an explicit created_at timestamp when provided', async () => {
       const sha256 = 'a'.repeat(64);
       const reporter = 'b'.repeat(64);

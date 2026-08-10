@@ -195,6 +195,48 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     expect(moderation.action).toBe('REVIEW');
   });
 
+  // The upgrade side of that same boundary. A reporter who DM'd first and then
+  // filed an authenticated report is one genuine reporter, not zero -- but
+  // INSERT OR IGNORE pinned their row to 'dm-report', so they stayed out of the
+  // escalation count for good. Only the trusted paths can drive the upgrade; a
+  // report DM never promotes itself.
+  it('a reporter who DM\'d first counts once they report through the authenticated path', async () => {
+    const { recordReportForReview } = await import('../moderation/report-review.mjs');
+
+    const { rumor } = await roundTrip(
+      mobileReportDmTags({
+        nip32Label: 'NS-sexualContent',
+        nip56Type: 'nudity',
+        sha256: SHA256,
+      }),
+      'Content Report\nReason: Sexual Content\nEvent: ' + 'e'.repeat(64),
+      'gw-nsfw-upgrade',
+    );
+
+    // Same key, same blob, now through POST /api/v1/report.
+    const upgraded = await recordReportForReview(db, {
+      sha256: SHA256,
+      reporterPubkey: rumor.pubkey,
+      reportType: 'nudity',
+      source: 'user-report',
+    });
+
+    expect(upgraded.distinctReporterCount).toBe(1);
+    expect(upgraded.escalationReporterCount).toBe(1);
+    expect(upgraded.action).toBe('REVIEW'); // one reporter is still only one
+
+    // And they now count as one of the two the authenticated path escalates on.
+    const second = await recordReportForReview(db, {
+      sha256: SHA256,
+      reporterPubkey: 'c'.repeat(64),
+      reportType: 'nudity',
+      source: 'user-report',
+    });
+
+    expect(second.escalationReporterCount).toBe(2);
+    expect(second.action).toBe('AGE_RESTRICTED');
+  });
+
   it('a user report (no sha256) is badged but writes no user_reports row', async () => {
     const { outcome } = await roundTrip(
       mobileReportDmTags({
