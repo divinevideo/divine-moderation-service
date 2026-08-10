@@ -67,7 +67,7 @@ describe('reports', () => {
   });
 
   describe('addReport', () => {
-    it('should add a new report and not escalate', async () => {
+    it('should add a new report and count one distinct reporter', async () => {
       const result = await addReport(db, {
         sha256: SHA256,
         reporter_pubkey: REPORTER1,
@@ -75,7 +75,7 @@ describe('reports', () => {
         reason: 'inappropriate content',
       });
 
-      expect(result).toMatchObject({ escalate: null, distinctReporterCount: 1 });
+      expect(result).toEqual({ distinctReporterCount: 1, escalationReporterCount: 1 });
     });
 
     it('should deduplicate same reporter for same sha256', async () => {
@@ -313,33 +313,25 @@ describe('reports', () => {
     });
   });
 
-  describe('escalation thresholds', () => {
-    it('should escalate to REVIEW at 3 unique reporters', async () => {
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'nudity' });
-
-      const result = await addReport(db, {
-        sha256: SHA256,
-        reporter_pubkey: REPORTER3,
-        report_type: 'nudity',
-      });
-
-      expect(result).toMatchObject({ escalate: 'REVIEW', distinctReporterCount: 3 });
-    });
-
-    it('should escalate to AGE_RESTRICTED at 5 unique reporters', async () => {
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER3, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER4, report_type: 'nudity' });
+  describe('reporter counts', () => {
+    // addReport used to own 3-and-5-reporter thresholds of its own. Nothing
+    // enforced them, and `/api/v1/report` echoed the result as though it were
+    // the outcome; the real gate lives in recordReportForReview and runs on
+    // escalationReporterCount. All this owes its caller now is the counts.
+    it('reports both counts as distinct reporters accumulate', async () => {
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'nudity', source: 'dm-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'nudity', source: 'user-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER3, report_type: 'nudity', source: 'relay-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER4, report_type: 'nudity', source: 'user-report' });
 
       const result = await addReport(db, {
         sha256: SHA256,
         reporter_pubkey: REPORTER5,
         report_type: 'nudity',
+        source: 'user-report',
       });
 
-      expect(result).toMatchObject({ escalate: 'AGE_RESTRICTED', distinctReporterCount: 5 });
+      expect(result).toEqual({ distinctReporterCount: 5, escalationReporterCount: 4 });
     });
   });
 

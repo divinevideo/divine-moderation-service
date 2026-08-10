@@ -412,6 +412,10 @@ describe('HTTP hostname routing', () => {
     expect(moderationWrites[0].bindings[0]).toBe(SHA256);
     expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
     expect(moderationWrites[0].bindings[2]).toBe('user-report');
+    // The response reports the action that was recorded, not a second guess.
+    const reportBody = await response.json();
+    expect(reportBody).toMatchObject({ success: true, escalate: 'REVIEW', distinctReporterCount: 1 });
+    expect(reportBody.escalate).toBe(moderationWrites[0].bindings[1]);
     expect(aiDetectionEvents).toHaveLength(1);
     expect(aiDetectionEvents[0]).toMatchObject({
       sha256: SHA256,
@@ -460,6 +464,47 @@ describe('HTTP hostname routing', () => {
     expect(bound.bindings[0]).toBe(SHA256);
     expect(bound.bindings[1]).toBe('AGE_RESTRICTED');
     expect(bound.bindings[2]).toBe('user-report');
+    const body = await response.json();
+    expect(body).toMatchObject({ success: true, escalate: 'AGE_RESTRICTED', distinctReporterCount: 2 });
+    expect(body.escalate).toBe(bound.bindings[1]);
+  });
+
+  // The response used to carry addReport's own count-based verdict, which ran
+  // on different inputs and different thresholds than the enforcement gate.
+  // Five reporters on a report type that never auto age-restricts is where the
+  // two disagreed outright: the row said REVIEW, the client was told
+  // AGE_RESTRICTED.
+  it('does not report an escalation the moderation row contradicts', async () => {
+    const moderationWrites = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({ moderationWrites, reporterCount: 5 }),
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: 'b'.repeat(64),
+          report_type: 'spam',
+          reason: 'flooding the feed'
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(moderationWrites).toHaveLength(1);
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
+
+    const body = await response.json();
+    expect(body.escalate).toBe('REVIEW');
+    expect(body.escalate).not.toBe('AGE_RESTRICTED');
+    expect(body.distinctReporterCount).toBe(5);
   });
 
   it('rejects /api/v1/report with malformed sha256', async () => {

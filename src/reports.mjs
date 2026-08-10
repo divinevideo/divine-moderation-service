@@ -48,10 +48,16 @@ export async function initReportsTable(db) {
 const NON_ESCALATING_SOURCE = 'dm-report';
 
 /**
- * Insert a report and return the legacy escalation level plus two reporter
- * counts, so callers can apply per-report-type policy (e.g. NSFW needs 2
- * unique reporters before auto AGE_RESTRICTED to defend against single-token
- * griefing).
+ * Insert a report and return two reporter counts, so callers can apply
+ * per-report-type policy (e.g. NSFW needs 2 unique reporters before auto
+ * AGE_RESTRICTED to defend against single-token griefing).
+ *
+ * Counting is all this does. It used to also return an `escalate` level of its
+ * own, off 3-and-5-reporter thresholds that nothing in the service enforced --
+ * a second opinion with no authority, which `/api/v1/report` then echoed to
+ * clients as though it were the outcome. Whether a report escalates depends on
+ * the report type and the source policy, neither of which is knowable here;
+ * recordReportForReview is the only caller and the only place that knows both.
  *
  * `distinctReporterCount` counts every distinct reporter, whatever the source
  * -- it is what the admin UI and the HTTP report response report, and its
@@ -64,7 +70,7 @@ const NON_ESCALATING_SOURCE = 'dm-report';
  *
  * @param {D1Database} db
  * @param {{sha256: string, reporter_pubkey: string, report_type: string, reason?: string, created_at?: string, source?: string}} report
- * @returns {Promise<{escalate: 'AGE_RESTRICTED'|'REVIEW'|null, distinctReporterCount: number, escalationReporterCount: number}>}
+ * @returns {Promise<{distinctReporterCount: number, escalationReporterCount: number}>}
  */
 export async function addReport(db, { sha256, reporter_pubkey, report_type, reason, created_at, source = null }) {
   // One report can reach two ingestion paths: divine-mobile publishes the
@@ -111,14 +117,10 @@ export async function addReport(db, { sha256, reporter_pubkey, report_type, reas
     WHERE sha256 = ?
   `).bind(NON_ESCALATING_SOURCE, sha256).first();
 
-  const count = row?.cnt ?? 0;
-  const escalationCount = row?.escalation_cnt ?? 0;
-
-  let escalate = null;
-  if (count >= 5) escalate = 'AGE_RESTRICTED';
-  else if (count >= 3) escalate = 'REVIEW';
-
-  return { escalate, distinctReporterCount: count, escalationReporterCount: escalationCount };
+  return {
+    distinctReporterCount: row?.cnt ?? 0,
+    escalationReporterCount: row?.escalation_cnt ?? 0,
+  };
 }
 
 const AI_REPORT_TYPES = new Set([
