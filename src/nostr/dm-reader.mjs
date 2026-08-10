@@ -7,15 +7,15 @@
 import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import { unwrapEvent } from 'nostr-tools/nip17';
-import { computeConversationId, logDm } from './dm-store.mjs';
+import { computeConversationId, findDmByNostrEventId, logDm } from './dm-store.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
 import { initReportsTable } from '../reports.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
-// How far back a first sync looks for gift wraps. Also the floor for a
-// report's self-reported timestamp: nothing this reader ingests can honestly
-// be older than the oldest thing it fetches.
+// How far back a first sync looks for gift wraps. Also the plausibility floor
+// for a report's self-reported timestamp: older values are still ingested, but
+// are stamped with receipt time so they surface in the current review queue.
 const INBOX_FIRST_RUN_LOOKBACK_SECONDS = 7 * 86400;
 
 // Tolerance for a reporting client whose clock runs a little fast.
@@ -218,6 +218,15 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // Compute conversation ID against the non-moderator side so inbound
   // and outbound messages in the same thread share a conversation_id.
   const conversationId = computeConversationId(moderatorPubkey, counterpartyPubkey);
+
+  // syncInbox deliberately overlaps two days of gift wraps on every tick for
+  // NIP-17 timestamp randomization. If this gift wrap already reached dm_log,
+  // stop before report ingestion so repeated polls cannot re-bump review rows
+  // or emit fresh AI-report telemetry. Keep logDm's own check too as a final
+  // write-side guard.
+  if (env.BLOSSOM_DB && await findDmByNostrEventId(env.BLOSSOM_DB, giftWrapId)) {
+    return 'skipped';
+  }
 
   // Structured report data travels as NIP-17 tags on the rumor, not as
   // JSON-encoded content -- content stays plain human-readable text

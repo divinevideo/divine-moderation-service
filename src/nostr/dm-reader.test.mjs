@@ -319,28 +319,30 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     expect(dmRows.results).toHaveLength(0);
   });
 
-  it('re-processing the same gift-wrap id does not double-insert a user_reports row', async () => {
-    const rumor = makeRumor({
+  it('re-processing the same gift-wrap id skips before re-recording review state', async () => {
+    const rumor = {
       pubkey: REPORTER,
-      tags: [['p', MODERATOR], ['sha256', SHA256]],
+      tags: [['p', MODERATOR], ['sha256', SHA256], ['report_type', 'nudity']],
       content: 'Content Report',
-    });
+    };
 
     const first = await processRumor(rumor, 'evt-dedup', MODERATOR, { BLOSSOM_DB: db });
     expect(first).toBe('synced');
 
-    // logDm's dedup-by-nostr_event_id path returns the *existing* row (a
-    // truthy .id), which processRumor can't tell apart from a fresh
-    // insert -- so a dedup hit is pre-existing, unrelated-to-#6593
-    // behavior that still reports 'synced' here (see the issue's own
-    // note: "skipped is structurally always 0"). What this test actually
-    // pins is the user_reports side: INSERT OR IGNORE against
-    // UNIQUE(sha256, reporter_pubkey) must not create a second row.
+    await db.prepare('UPDATE moderation_results SET moderated_at = ? WHERE sha256 = ?')
+      .bind('2000-01-01T00:00:00.000Z', SHA256)
+      .run();
+
     const second = await processRumor(rumor, 'evt-dedup', MODERATOR, { BLOSSOM_DB: db });
-    expect(second).toBe('synced');
+    expect(second).toBe('skipped');
 
     const reportRows = await db.prepare('SELECT * FROM user_reports').all();
     expect(reportRows.results).toHaveLength(1);
+    const dmRows = await db.prepare('SELECT * FROM dm_log').all();
+    expect(dmRows.results).toHaveLength(1);
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results WHERE sha256 = ?').bind(SHA256).first();
+    expect(moderation.moderated_at).toBe('2000-01-01T00:00:00.000Z');
   });
 
   // rumor.created_at is written by the sender and validated by nothing. Before

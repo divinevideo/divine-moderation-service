@@ -50,10 +50,15 @@ export async function initDmReadStateTable(db) {
   `).run();
 }
 
+export async function findDmByNostrEventId(db, nostrEventId) {
+  if (!nostrEventId) return null;
+  return db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(nostrEventId).first();
+}
+
 export async function logDm(db, { conversationId, sha256, direction, senderPubkey, recipientPubkey, messageType, content, nostrEventId }) {
   // Dedup by nostr_event_id if provided
   if (nostrEventId) {
-    const existing = await db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(nostrEventId).first();
+    const existing = await findDmByNostrEventId(db, nostrEventId);
     if (existing) return existing;
   }
 

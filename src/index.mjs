@@ -4224,8 +4224,8 @@ async function runMigration() {
 
         console.log(`[API] Recorded ${result.action} from user report for ${sha256} (type=${report_type}, distinctReporters=${result.distinctReporterCount})`);
 
-        // `escalate` is the action that was actually recorded for this sha256,
-        // not a separate prediction. It used to be addReport's own count-based
+        // `escalate` is this report's recorded-action decision, not a separate
+        // prediction. It used to be addReport's own count-based
         // guess, which could read AGE_RESTRICTED while the row written a line
         // earlier said REVIEW -- the two ran on different inputs (any reporter
         // vs escalation-eligible ones) and different thresholds (5 vs 2, and

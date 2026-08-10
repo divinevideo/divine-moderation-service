@@ -305,7 +305,7 @@ export async function pollRelayForReports(env, options = {}) {
   // goes through the fetch handler's schema ensure, so the first tick after a
   // deploy could otherwise write against a user_reports table missing the
   // `source` column.
-  if (!injectedRecordReport && env.BLOSSOM_DB) {
+  if (env.BLOSSOM_DB?.prepare) {
     await initReportsTable(env.BLOSSOM_DB);
   }
   const requireDivineClient = env.RELAY_REPORTS_REQUIRE_DIVINE_CLIENT !== 'false';
