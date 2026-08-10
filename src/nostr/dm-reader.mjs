@@ -10,7 +10,7 @@ import { unwrapEvent } from 'nostr-tools/nip17';
 import { computeConversationId, findDmByNostrEventId, logDm } from './dm-store.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
-import { initReportsTable } from '../reports.mjs';
+import { findReportByReporter, initReportsTable } from '../reports.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
 // How far back a first sync looks for gift wraps. Also the plausibility floor
@@ -220,13 +220,16 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const conversationId = computeConversationId(moderatorPubkey, counterpartyPubkey);
 
   // syncInbox deliberately overlaps two days of gift wraps on every tick for
-  // NIP-17 timestamp randomization. If this gift wrap already reached dm_log,
-  // stop before report ingestion so repeated polls cannot re-bump review rows
-  // or emit fresh AI-report telemetry. Keep logDm's own check too as a final
-  // write-side guard.
-  if (env.BLOSSOM_DB && await findDmByNostrEventId(env.BLOSSOM_DB, giftWrapId)) {
-    return 'skipped';
-  }
+  // NIP-17 timestamp randomization, so the same gift wrap is re-processed for
+  // up to two days. Look up whether it already reached dm_log, but don't
+  // return yet: a dm_log row proves the DM was stored, not that its report
+  // was. The report write below warns and continues, and logDm runs either
+  // way, so returning here would make a transient failure permanent -- the
+  // next tick would skip before it ever retried. Each side is deduped against
+  // its own row instead.
+  const alreadyLogged = env.BLOSSOM_DB
+    ? await findDmByNostrEventId(env.BLOSSOM_DB, giftWrapId)
+    : null;
 
   // Structured report data travels as NIP-17 tags on the rumor, not as
   // JSON-encoded content -- content stays plain human-readable text
@@ -273,19 +276,39 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // a human -- `source: 'dm-report'` takes the REVIEW-only default, which
   // is what the relay path (`'relay-report'`) already takes. Only the
   // authenticated HTTP report API still auto-escalates.
+  //
+  // On a re-poll, skip only once this reporter's row for this sha256 exists.
+  // recordReportForReview is not idempotent for a report whose timestamp fell
+  // back to receipt time: moderated_at moves and the AI telemetry event_key
+  // (report:<sha>:<type>:<createdAt>) changes, so INSERT OR IGNORE stops
+  // deduping it. Keying the skip on the report row rather than the dm_log row
+  // suppresses that without also suppressing the retry a failed write needs.
   if (relatedSha256 && env.BLOSSOM_DB && !isOutgoing) {
-    try {
-      await recordReportForReview(env.BLOSSOM_DB, {
-        sha256: relatedSha256,
-        reporterPubkey: senderPubkey,
-        reportType,
-        reason: content,
-        source: 'dm-report',
-        reportedAt: resolveReportedAt(createdAt),
-      });
-    } catch (reportErr) {
-      console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);
+    const alreadyRecorded = alreadyLogged
+      && await findReportByReporter(env.BLOSSOM_DB, relatedSha256, senderPubkey);
+    if (!alreadyRecorded) {
+      try {
+        await recordReportForReview(env.BLOSSOM_DB, {
+          sha256: relatedSha256,
+          reporterPubkey: senderPubkey,
+          reportType,
+          reason: content,
+          source: 'dm-report',
+          reportedAt: resolveReportedAt(createdAt),
+        });
+      } catch (reportErr) {
+        console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);
+      }
     }
+  }
+
+  // The DM side is settled once dm_log holds this gift wrap. Returning here
+  // rather than letting logDm's own dedup decide keeps the outcome honest:
+  // logDm hands back the *existing* row on a dedup hit, whose truthy .id is
+  // indistinguishable from a fresh insert, so a re-poll used to count as
+  // 'synced'.
+  if (alreadyLogged) {
+    return 'skipped';
   }
 
   // Log to dm_log (dedup by nostr_event_id). Either machine-readable tag

@@ -345,6 +345,50 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     expect(moderation.moderated_at).toBe('2000-01-01T00:00:00.000Z');
   });
 
+  // The other half of that dedup: a report whose write failed is not "already
+  // recorded", and the DM being in dm_log doesn't make it so. The report write
+  // sits in a warn-and-continue block and logDm runs regardless, so gating the
+  // re-poll on the dm_log row alone turns any transient D1 failure into a
+  // permanently dropped report -- counted as 'deduped' in the sync log, so it
+  // reads as handled. Same shape as the RangeError this branch removed.
+  it('retries a report whose write failed, on the next pass over the same gift wrap', async () => {
+    let failReportWrite = true;
+    const flakyDb = {
+      prepare(sql) {
+        if (failReportWrite && sql.includes('INSERT OR IGNORE INTO user_reports')) {
+          throw new Error('D1_ERROR: Network connection lost');
+        }
+        return db.prepare(sql);
+      },
+      batch: (...args) => db.batch(...args),
+      exec: (...args) => db.exec(...args),
+    };
+
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['sha256', SHA256], ['report_type', 'nudity']],
+      content: 'Content Report',
+    });
+
+    // First pass: the report write blows up, the DM is still logged.
+    expect(await processRumor(rumor, 'evt-flaky', MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('synced');
+    expect((await db.prepare('SELECT * FROM user_reports').all()).results).toHaveLength(0);
+    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+
+    // Second pass, inside syncInbox's two-day overlap, D1 healthy again.
+    failReportWrite = false;
+    expect(await processRumor(rumor, 'evt-flaky', MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('skipped');
+
+    const reportRows = await db.prepare('SELECT * FROM user_reports').all();
+    expect(reportRows.results).toHaveLength(1);
+    expect(reportRows.results[0].source).toBe('dm-report');
+    const moderation = await db.prepare('SELECT * FROM moderation_results WHERE sha256 = ?').bind(SHA256).first();
+    expect(moderation.action).toBe('REVIEW');
+
+    // The DM itself is still deduped -- the retry must not double-log it.
+    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+  });
+
   // rumor.created_at is written by the sender and validated by nothing. Before
   // resolveReportedAt, a missing one threw RangeError out of
   // `new Date(undefined * 1000).toISOString()` inside the warn-and-continue

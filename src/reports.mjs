@@ -45,6 +45,26 @@ export async function initReportsTable(db) {
 // to a human -- it just cannot be one of the two "distinct reporters" that
 // auto age-restriction counts, or a single actor could supply both halves of
 // the threshold the authenticated path relies on.
+/**
+ * Whether this reporter already has a row for this sha256.
+ *
+ * Used by the DM reader to tell "this report is already ingested" apart from
+ * "this gift wrap is already in dm_log", which are not the same thing: the
+ * report write is wrapped in a warn-and-continue block, so a transient failure
+ * leaves the DM logged and the report missing. Asking about the report row
+ * directly is what keeps that case retryable on the next poll.
+ *
+ * @param {D1Database} db
+ * @param {string} sha256
+ * @param {string} reporterPubkey
+ * @returns {Promise<Object|null>} the matching row, or null
+ */
+export async function findReportByReporter(db, sha256, reporterPubkey) {
+  return db.prepare(
+    'SELECT id FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+  ).bind(sha256, reporterPubkey).first();
+}
+
 const NON_ESCALATING_SOURCE = 'dm-report';
 
 /**
