@@ -389,6 +389,39 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
     expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
   });
 
+  it('retries a report whose review row write failed after the reporter row was stored', async () => {
+    let failReviewWrite = true;
+    const flakyDb = {
+      prepare(sql) {
+        if (failReviewWrite && /INSERT INTO moderation_results/i.test(sql)) {
+          throw new Error('D1_ERROR: Network connection lost');
+        }
+        return db.prepare(sql);
+      },
+      batch: (...args) => db.batch(...args),
+      exec: (...args) => db.exec(...args),
+    };
+
+    const rumor = makeRumor({
+      pubkey: REPORTER,
+      tags: [['p', MODERATOR], ['sha256', SHA256], ['report_type', 'nudity']],
+      content: 'Content Report',
+    });
+
+    expect(await processRumor(rumor, 'evt-flaky-review', MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('synced');
+    expect((await db.prepare('SELECT * FROM user_reports').all()).results).toHaveLength(1);
+    expect(await db.prepare('SELECT * FROM moderation_results WHERE sha256 = ?').bind(SHA256).first()).toBeNull();
+    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+
+    failReviewWrite = false;
+    expect(await processRumor(rumor, 'evt-flaky-review', MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('skipped');
+
+    expect((await db.prepare('SELECT * FROM user_reports').all()).results).toHaveLength(1);
+    const moderation = await db.prepare('SELECT * FROM moderation_results WHERE sha256 = ?').bind(SHA256).first();
+    expect(moderation.action).toBe('REVIEW');
+    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+  });
+
   // rumor.created_at is written by the sender and validated by nothing. Before
   // resolveReportedAt, a missing one threw RangeError out of
   // `new Date(undefined * 1000).toISOString()` inside the warn-and-continue

@@ -51,6 +51,12 @@ export function resolveReportedAt(createdAt, nowMs = Date.now()) {
   return new Date(isUsable ? createdAt * 1000 : nowMs).toISOString();
 }
 
+async function findModerationResultBySha(db, sha256) {
+  return db.prepare(
+    'SELECT sha256 FROM moderation_results WHERE sha256 = ?'
+  ).bind(sha256).first();
+}
+
 /**
  * Derive the moderator's hex pubkey from NOSTR_PRIVATE_KEY (hex)
  * @param {Object} env - Environment with NOSTR_PRIVATE_KEY
@@ -277,15 +283,18 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // is what the relay path (`'relay-report'`) already takes. Only the
   // authenticated HTTP report API still auto-escalates.
   //
-  // On a re-poll, skip only once this reporter's row for this sha256 exists.
+  // On a re-poll, skip only once this reporter's row and the review row both
+  // exist for this sha256.
   // recordReportForReview is not idempotent for a report whose timestamp fell
   // back to receipt time: moderated_at moves and the AI telemetry event_key
   // (report:<sha>:<type>:<createdAt>) changes, so INSERT OR IGNORE stops
-  // deduping it. Keying the skip on the report row rather than the dm_log row
-  // suppresses that without also suppressing the retry a failed write needs.
+  // deduping it. Keying the skip on the completed report+review pair, rather
+  // than the dm_log row alone or user_reports alone, suppresses that without
+  // also suppressing the retry a partial failed write needs.
   if (relatedSha256 && env.BLOSSOM_DB && !isOutgoing) {
     const alreadyRecorded = alreadyLogged
-      && await findReportByReporter(env.BLOSSOM_DB, relatedSha256, senderPubkey);
+      && await findReportByReporter(env.BLOSSOM_DB, relatedSha256, senderPubkey)
+      && await findModerationResultBySha(env.BLOSSOM_DB, relatedSha256);
     if (!alreadyRecorded) {
       try {
         await recordReportForReview(env.BLOSSOM_DB, {
