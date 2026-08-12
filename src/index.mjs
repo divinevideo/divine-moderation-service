@@ -3772,8 +3772,12 @@ async function runMigration() {
 
       const limit = parseInt(url.searchParams.get('limit') || '20');
       const offset = parseInt(url.searchParams.get('offset') || '0');
-      const { getConversations } = await import('./nostr/dm-store.mjs');
+      const { getConversations, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
       const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+      // getConversations LEFT JOINs dm_conversation_read_state for the unread
+      // flag. Ensure it here rather than relying on migration 012 having been
+      // applied: the deploy job runs on merge, `d1 migrations apply` does not.
+      await initDmReadStateTable(env.BLOSSOM_DB);
       // Pass moderatorPubkey so rows are augmented with participant_pubkey
       // (the non-moderator side) + latest_message/message_type aliases that
       // the admin messages UI expects. Without this, every conversation
@@ -3820,6 +3824,28 @@ async function runMigration() {
         return new Response(JSON.stringify({ error: result?.reason || 'Failed to send message' }), { status: 502, headers: { 'Content-Type': 'application/json' } });
       }
       return new Response(JSON.stringify({ success: true, relaysPublished: result.relaysPublished }), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin API: Mark a DM conversation read (clears the unread badge/dot)
+    if (url.pathname.startsWith('/admin/api/messages/') && url.pathname.endsWith('/read') && request.method === 'POST') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      const parts = url.pathname.split('/');
+      if (parts.length !== 6 || !isValidPubkey(parts[4])) {
+        return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const pubkey = parts[4].toLowerCase();
+      const { computeConversationId, markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
+      const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+      const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
+      if (!moderatorPubkey) {
+        return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      await initDmReadStateTable(env.BLOSSOM_DB);
+      const conversationId = computeConversationId(moderatorPubkey, pubkey);
+      await markConversationRead(env.BLOSSOM_DB, conversationId);
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
     }
 
     // Admin API: Resolve a recipient (hex / npub / verified nip-05) to a hex pubkey.
@@ -4198,9 +4224,17 @@ async function runMigration() {
 
         console.log(`[API] Recorded ${result.action} from user report for ${sha256} (type=${report_type}, distinctReporters=${result.distinctReporterCount})`);
 
+        // `escalate` is this report's recorded-action decision, not a separate
+        // prediction. It used to be addReport's own count-based
+        // guess, which could read AGE_RESTRICTED while the row written a line
+        // earlier said REVIEW -- the two ran on different inputs (any reporter
+        // vs escalation-eligible ones) and different thresholds (5 vs 2, and
+        // only NSFW escalates). Sourcing it from the decision makes the
+        // response unable to contradict enforcement. It is no longer null: a
+        // single report reads REVIEW, which is what the service did with it.
         return new Response(JSON.stringify({
           success: true,
-          escalate: result.escalate,
+          escalate: result.action,
           distinctReporterCount: result.distinctReporterCount,
         }), {
           headers: { 'Content-Type': 'application/json' }

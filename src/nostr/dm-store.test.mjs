@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { computeConversationId, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable } from './dm-store.mjs';
+import { computeConversationId, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead } from './dm-store.mjs';
 
 /**
  * Create a mock D1 database that tracks calls and stores data in-memory
@@ -578,5 +578,206 @@ describe('DM Store - getConversationByPubkey against real D1', () => {
 
     expect(messages).not.toBeNull();
     expect(messages.map((m) => m.content)).toEqual(['newer moderator conversation']);
+  });
+});
+
+// Regression suite for the unread badge (divine-mobile#6593): prior to this
+// change, admin/dashboard.html and admin/messages.html read `conv.unread` /
+// `conv.has_unread`, fields getConversations() never produced -- the badge
+// was structurally always empty. These tests run against real D1 so the
+// SQL CASE/JOIN logic (and the timestamp-format hazard called out in
+// migrations/012-dm-read-state.sql -- read_at and created_at must both be
+// generated via SQLite CURRENT_TIMESTAMP to stay comparably ordered) is
+// verified for real, not against a hand-rolled mock that could silently
+// drift from actual SQLite semantics.
+describe('DM Store - unread / markConversationRead against real D1', () => {
+  const db = env.BLOSSOM_DB;
+
+  const MODERATOR = 'f'.repeat(64);
+  const CREATOR = ('a'.repeat(63) + '1').slice(0, 64);
+  const OTHER_CREATOR = ('a'.repeat(63) + '2').slice(0, 64);
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM dm_conversation_read_state').run();
+  });
+
+  async function backdateMessage(nostrEventId, timestamp) {
+    await db.prepare('UPDATE dm_log SET created_at = ? WHERE nostr_event_id = ?').bind(timestamp, nostrEventId).run();
+  }
+
+  async function unreadFor(conversationId) {
+    const conversations = await getConversations(db, { limit: 20, offset: 0 });
+    return conversations.find((c) => c.conversation_id === conversationId).unread;
+  }
+
+  it('a fresh conversation with an incoming message and no read state is unread', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi',
+      nostrEventId: 'evt-1',
+    });
+
+    expect(await unreadFor(conversationId)).toBe(1);
+  });
+
+  it('markConversationRead clears unread for a message sent before the mark', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi',
+      nostrEventId: 'evt-1',
+    });
+    await backdateMessage('evt-1', '2000-01-01 00:00:00');
+
+    await markConversationRead(db, conversationId);
+
+    expect(await unreadFor(conversationId)).toBe(0);
+  });
+
+  it('a new incoming message after markConversationRead flips the conversation unread again', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'first',
+      nostrEventId: 'evt-1',
+    });
+    await backdateMessage('evt-1', '2000-01-01 00:00:00');
+    await markConversationRead(db, conversationId);
+    expect(await unreadFor(conversationId)).toBe(0);
+
+    // A message that arrives after the mark-read timestamp must flip the
+    // conversation back to unread -- this is the exact comparison this
+    // suite exists to pin: read_at and created_at share the same
+    // CURRENT_TIMESTAMP-generated text format, so `>` compares correctly
+    // regardless of which side is "later" in wall-clock terms.
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'second, after read',
+      nostrEventId: 'evt-2',
+    });
+    await backdateMessage('evt-2', '2099-01-01 00:00:00');
+
+    expect(await unreadFor(conversationId)).toBe(1);
+  });
+
+  it('a conversation with only an outgoing message (moderator sent first) is never unread', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'outgoing',
+      senderPubkey: MODERATOR,
+      recipientPubkey: CREATOR,
+      messageType: 'moderator_reply',
+      content: 'starting a conversation',
+      nostrEventId: 'evt-1',
+    });
+
+    expect(await unreadFor(conversationId)).toBe(0);
+  });
+
+  it('the moderators own reply after marking read does not flip the conversation back to unread', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi',
+      nostrEventId: 'evt-1',
+    });
+    await backdateMessage('evt-1', '2000-01-01 00:00:00');
+    await markConversationRead(db, conversationId);
+    expect(await unreadFor(conversationId)).toBe(0);
+
+    // Moderator's own reply, timestamped after the mark-read point --
+    // must NOT flip unread, or a moderator would see their own inbox as
+    // unread immediately after replying.
+    await logDm(db, {
+      conversationId,
+      direction: 'outgoing',
+      senderPubkey: MODERATOR,
+      recipientPubkey: CREATOR,
+      messageType: 'moderator_reply',
+      content: 'here is my reply',
+      nostrEventId: 'evt-2',
+    });
+    await backdateMessage('evt-2', '2099-01-01 00:00:00');
+
+    expect(await unreadFor(conversationId)).toBe(0);
+  });
+
+  it('unread state is independent per conversation', async () => {
+    const readConvId = computeConversationId(MODERATOR, CREATOR);
+    const unreadConvId = computeConversationId(MODERATOR, OTHER_CREATOR);
+
+    await logDm(db, {
+      conversationId: readConvId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi from creator',
+      nostrEventId: 'evt-read',
+    });
+    await backdateMessage('evt-read', '2000-01-01 00:00:00');
+    await markConversationRead(db, readConvId);
+
+    await logDm(db, {
+      conversationId: unreadConvId,
+      direction: 'incoming',
+      senderPubkey: OTHER_CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi from other creator',
+      nostrEventId: 'evt-unread',
+    });
+
+    expect(await unreadFor(readConvId)).toBe(0);
+    expect(await unreadFor(unreadConvId)).toBe(1);
+  });
+
+  it('markConversationRead is safe to call on a conversation with no messages', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await expect(markConversationRead(db, conversationId)).resolves.not.toThrow();
+  });
+
+  it('markConversationRead does not move read_at backwards on a second call', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR,
+      recipientPubkey: MODERATOR,
+      content: 'hi',
+      nostrEventId: 'evt-1',
+    });
+
+    await markConversationRead(db, conversationId);
+    // The exact value isn't asserted (CURRENT_TIMESTAMP has 1s resolution),
+    // only that the first call inserted a row for the upsert to conflict on.
+    const firstRow = await db.prepare('SELECT read_at FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(firstRow.read_at).toBeTruthy();
+
+    // Simulate an out-of-order retry carrying an earlier read_at than what's
+    // already stored -- the WHERE guard in markConversationRead's upsert
+    // must leave the newer stored value alone rather than regressing it.
+    await db.prepare('UPDATE dm_conversation_read_state SET read_at = ? WHERE conversation_id = ?').bind('2099-01-01 00:00:00', conversationId).run();
+    await markConversationRead(db, conversationId);
+    const secondReadAt = (await db.prepare('SELECT read_at FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first()).read_at;
+
+    expect(secondReadAt).toBe('2099-01-01 00:00:00');
   });
 });

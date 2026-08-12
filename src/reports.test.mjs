@@ -67,7 +67,7 @@ describe('reports', () => {
   });
 
   describe('addReport', () => {
-    it('should add a new report and not escalate', async () => {
+    it('should add a new report and count one distinct reporter', async () => {
       const result = await addReport(db, {
         sha256: SHA256,
         reporter_pubkey: REPORTER1,
@@ -75,7 +75,7 @@ describe('reports', () => {
         reason: 'inappropriate content',
       });
 
-      expect(result).toMatchObject({ escalate: null, distinctReporterCount: 1 });
+      expect(result).toEqual({ distinctReporterCount: 1, escalationReporterCount: 1 });
     });
 
     it('should deduplicate same reporter for same sha256', async () => {
@@ -112,6 +112,156 @@ describe('reports', () => {
 
       const count = await getReportCount(db, SHA256);
       expect(count).toBe(2);
+    });
+
+    it('counts a dm-report reporter for display but not for escalation', async () => {
+      const first = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'dm-report',
+      });
+      expect(first).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 0 });
+
+      // A second, authenticated reporter arrives. Two distinct people have now
+      // reported the blob, but only one of them through a path allowed to
+      // drive an automatic outcome -- so the NSFW threshold of 2 is not met.
+      const second = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER2,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(second).toMatchObject({ distinctReporterCount: 2, escalationReporterCount: 1 });
+
+      const third = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER3,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(third).toMatchObject({ distinctReporterCount: 3, escalationReporterCount: 2 });
+    });
+
+    it('counts rows written before the source column toward escalation', async () => {
+      // insertReport() writes no source, exactly like every row that predates
+      // the column. Those came from the HTTP or relay paths, so they keep
+      // counting.
+      await insertReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+      });
+
+      const result = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER2,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+
+      expect(result).toMatchObject({ distinctReporterCount: 2, escalationReporterCount: 2 });
+    });
+
+    it('upgrades a dm-report reporter who later reports through the authenticated path', async () => {
+      const first = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'dm-report',
+      });
+      expect(first).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 0 });
+
+      // Same person, same blob, now through POST /api/v1/report. Under a plain
+      // INSERT OR IGNORE this row stayed 'dm-report' and the reporter never
+      // counted toward escalation again.
+      const second = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(second).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+
+      const row = await db.prepare(
+        'SELECT source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+      ).bind(SHA256, REPORTER1).first();
+      expect(row.source).toBe('user-report');
+    });
+
+    it('upgrades a dm-report reporter when the kind-1984 poller ingests the same report', async () => {
+      // divine-mobile sends both channels for one report, so this pair is the
+      // ordinary case rather than an edge one -- it just depends which lands
+      // first.
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'sexual_content',
+        source: 'dm-report',
+      });
+
+      const afterRelay = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'sexual_content',
+        source: 'relay-report',
+      });
+
+      expect(afterRelay).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+    });
+
+    it('does not let a later report DM downgrade an escalating reporter', async () => {
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+
+      const afterDm = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'dm-report',
+      });
+
+      expect(afterDm).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+
+      const row = await db.prepare(
+        'SELECT source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+      ).bind(SHA256, REPORTER1).first();
+      expect(row.source).toBe('user-report');
+    });
+
+    it('upgrades only the source, leaving the report of record as first filed', async () => {
+      const firstFiledAt = '2026-05-13T17:19:42.000Z';
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'ai_generated',
+        reason: 'as the DM described it',
+        created_at: firstFiledAt,
+        source: 'dm-report',
+      });
+
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'spam',
+        reason: 'as the later report described it',
+        created_at: '2026-06-01T00:00:00.000Z',
+        source: 'user-report',
+      });
+
+      const row = await db.prepare(
+        'SELECT report_type, reason, created_at, source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?'
+      ).bind(SHA256, REPORTER1).first();
+      expect(row).toMatchObject({
+        report_type: 'ai_generated',
+        reason: 'as the DM described it',
+        created_at: firstFiledAt,
+        source: 'user-report',
+      });
     });
 
     it('stores an explicit created_at timestamp when provided', async () => {
@@ -163,33 +313,25 @@ describe('reports', () => {
     });
   });
 
-  describe('escalation thresholds', () => {
-    it('should escalate to REVIEW at 3 unique reporters', async () => {
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'nudity' });
-
-      const result = await addReport(db, {
-        sha256: SHA256,
-        reporter_pubkey: REPORTER3,
-        report_type: 'nudity',
-      });
-
-      expect(result).toMatchObject({ escalate: 'REVIEW', distinctReporterCount: 3 });
-    });
-
-    it('should escalate to AGE_RESTRICTED at 5 unique reporters', async () => {
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER3, report_type: 'nudity' });
-      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER4, report_type: 'nudity' });
+  describe('reporter counts', () => {
+    // addReport used to own 3-and-5-reporter thresholds of its own. Nothing
+    // enforced them, and `/api/v1/report` echoed the result as though it were
+    // the outcome; the real gate lives in recordReportForReview and runs on
+    // escalationReporterCount. All this owes its caller now is the counts.
+    it('reports both counts as distinct reporters accumulate', async () => {
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'nudity', source: 'dm-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'nudity', source: 'user-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER3, report_type: 'nudity', source: 'relay-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER4, report_type: 'nudity', source: 'user-report' });
 
       const result = await addReport(db, {
         sha256: SHA256,
         reporter_pubkey: REPORTER5,
         report_type: 'nudity',
+        source: 'user-report',
       });
 
-      expect(result).toMatchObject({ escalate: 'AGE_RESTRICTED', distinctReporterCount: 5 });
+      expect(result).toEqual({ distinctReporterCount: 5, escalationReporterCount: 4 });
     });
   });
 

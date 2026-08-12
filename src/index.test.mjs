@@ -57,6 +57,9 @@ function createDbMock({
   aiDetectionRecentRows = [],
   moderationWrites = [],
   reporterCount = 1,
+  // Defaults to reporterCount: unless a test says otherwise, every reporter on
+  // the row came from a source allowed to drive an automatic outcome.
+  escalationReporterCount = reporterCount,
   onPrepare = null,
 } = {}) {
   return {
@@ -102,7 +105,7 @@ function createDbMock({
             return aiDetectionStatsRow;
           }
           if (sql.includes('FROM user_reports') && sql.includes('COUNT(DISTINCT reporter_pubkey)')) {
-            return { cnt: reporterCount };
+            return { cnt: reporterCount, escalation_cnt: escalationReporterCount };
           }
           return null;
         },
@@ -409,6 +412,10 @@ describe('HTTP hostname routing', () => {
     expect(moderationWrites[0].bindings[0]).toBe(SHA256);
     expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
     expect(moderationWrites[0].bindings[2]).toBe('user-report');
+    // The response reports the action that was recorded, not a second guess.
+    const reportBody = await response.json();
+    expect(reportBody).toMatchObject({ success: true, escalate: 'REVIEW', distinctReporterCount: 1 });
+    expect(reportBody.escalate).toBe(moderationWrites[0].bindings[1]);
     expect(aiDetectionEvents).toHaveLength(1);
     expect(aiDetectionEvents[0]).toMatchObject({
       sha256: SHA256,
@@ -457,6 +464,47 @@ describe('HTTP hostname routing', () => {
     expect(bound.bindings[0]).toBe(SHA256);
     expect(bound.bindings[1]).toBe('AGE_RESTRICTED');
     expect(bound.bindings[2]).toBe('user-report');
+    const body = await response.json();
+    expect(body).toMatchObject({ success: true, escalate: 'AGE_RESTRICTED', distinctReporterCount: 2 });
+    expect(body.escalate).toBe(bound.bindings[1]);
+  });
+
+  // The response used to carry addReport's own count-based verdict, which ran
+  // on different inputs and different thresholds than the enforcement gate.
+  // Five reporters on a report type that never auto age-restricts is where the
+  // two disagreed outright: the row said REVIEW, the client was told
+  // AGE_RESTRICTED.
+  it('does not report an escalation the moderation row contradicts', async () => {
+    const moderationWrites = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({ moderationWrites, reporterCount: 5 }),
+    });
+
+    const response = await worker.fetch(
+      new Request('https://moderation-api.divine.video/api/v1/report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer test-service-token'
+        },
+        body: JSON.stringify({
+          sha256: SHA256,
+          reporter_pubkey: 'b'.repeat(64),
+          report_type: 'spam',
+          reason: 'flooding the feed'
+        })
+      }),
+      env
+    );
+
+    expect(response.status).toBe(200);
+    expect(moderationWrites).toHaveLength(1);
+    expect(moderationWrites[0].bindings[1]).toBe('REVIEW');
+
+    const body = await response.json();
+    expect(body.escalate).toBe('REVIEW');
+    expect(body.escalate).not.toBe('AGE_RESTRICTED');
+    expect(body.distinctReporterCount).toBe(5);
   });
 
   it('rejects /api/v1/report with malformed sha256', async () => {
@@ -7587,6 +7635,32 @@ describe('GET /admin/api/messages/{pubkey} for an unknown pubkey', () => {
   });
 });
 
+describe('GET /admin/api/messages', () => {
+  it('creates dm_conversation_read_state before the unread query joins it', async () => {
+    // Same deploy-ordering guard as the /read route: getConversations LEFT
+    // JOINs this table, so a deploy that lands before migration 012 would
+    // otherwise break the whole conversation list, not just the badge.
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages'),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const createIndex = prepared.findIndex((sql) =>
+      /CREATE TABLE IF NOT EXISTS\s+dm_conversation_read_state/i.test(sql),
+    );
+    const selectIndex = prepared.findIndex((sql) =>
+      /LEFT JOIN dm_conversation_read_state/i.test(sql),
+    );
+    expect(createIndex).toBeGreaterThanOrEqual(0);
+    expect(selectIndex).toBeGreaterThan(createIndex);
+  });
+});
+
 describe('POST /admin/api/messages/{pubkey} when the send fails', () => {
   it('returns 502 with a reason instead of a silent success', async () => {
     const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
@@ -7602,6 +7676,95 @@ describe('POST /admin/api/messages/{pubkey} when the send fails', () => {
     );
     expect(res.status).toBe(502);
     expect((await res.json()).error).toBeTruthy();
+  });
+});
+
+describe('POST /admin/api/messages/{pubkey}/read', () => {
+  const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+
+  it('marks the conversation read and returns success', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX + '/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true });
+    expect(prepared.some((sql) => sql.includes('dm_conversation_read_state'))).toBe(true);
+  });
+
+  it('creates dm_conversation_read_state before writing to it', async () => {
+    // The deploy job runs on merge to main; `wrangler d1 migrations apply`
+    // does not. Without this ensure the first request after a deploy would
+    // fail with "no such table" until migration 012 was applied by hand.
+    const prepared = [];
+    await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX + '/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    const createIndex = prepared.findIndex((sql) =>
+      /CREATE TABLE IF NOT EXISTS\s+dm_conversation_read_state/i.test(sql),
+    );
+    const insertIndex = prepared.findIndex((sql) =>
+      /INSERT INTO dm_conversation_read_state/i.test(sql),
+    );
+    expect(createIndex).toBeGreaterThanOrEqual(0);
+    expect(insertIndex).toBeGreaterThan(createIndex);
+  });
+
+  it('500s when no moderator signing key is configured, instead of silently no-op succeeding', async () => {
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/' + HEX + '/read', {
+        method: 'POST',
+      }),
+      createEnv({ ALLOW_DEV_ACCESS: 'true', NOSTR_PRIVATE_KEY: undefined }),
+    );
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBeTruthy();
+  });
+
+  it('400s malformed read route shapes instead of inserting junk read state', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/a/b/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(prepared.some((sql) => /INSERT INTO dm_conversation_read_state/i.test(sql))).toBe(false);
+  });
+
+  it('400s non-hex read-route pubkeys instead of inserting junk read state', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request('https://moderation.admin.divine.video/admin/api/messages/not-a-pubkey/read', {
+        method: 'POST',
+      }),
+      createEnv({
+        ALLOW_DEV_ACCESS: 'true',
+        NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+        BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(prepared.some((sql) => /INSERT INTO dm_conversation_read_state/i.test(sql))).toBe(false);
   });
 });
 

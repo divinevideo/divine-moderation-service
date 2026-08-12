@@ -7,7 +7,55 @@
 import { getPublicKey } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import { unwrapEvent } from 'nostr-tools/nip17';
-import { computeConversationId, logDm } from './dm-store.mjs';
+import { computeConversationId, findDmByNostrEventId, logDm } from './dm-store.mjs';
+import { recordReportForReview } from '../moderation/report-review.mjs';
+import { extractReportType } from './report-poller.mjs';
+import { findReportByReporter, initReportsTable } from '../reports.mjs';
+import { isValidSha256 } from '../validation.mjs';
+
+// How far back a first sync looks for gift wraps. Also the plausibility floor
+// for a report's self-reported timestamp: older values are still ingested, but
+// are stamped with receipt time so they surface in the current review queue.
+const INBOX_FIRST_RUN_LOOKBACK_SECONDS = 7 * 86400;
+
+// Tolerance for a reporting client whose clock runs a little fast.
+const REPORT_CLOCK_SKEW_SECONDS = 5 * 60;
+
+/**
+ * Resolve the timestamp a report DM should be recorded under.
+ *
+ * `rumor.created_at` comes out of the decrypted rumor, so it is written by
+ * whoever sent the DM and constrained by nothing. Two ways that bites:
+ * a missing or non-numeric value makes `new Date(x * 1000).toISOString()`
+ * throw `RangeError`, and because the caller records reports inside a
+ * warn-and-continue block, the whole report would be dropped rather than
+ * mis-stamped; a backdated value lands in `moderation_results.moderated_at`,
+ * which the admin queue sorts on and its `since` filter excludes, hiding the
+ * report from the humans it was escalated to.
+ *
+ * So the rumor's own timestamp is used only where it could plausibly be true,
+ * and receipt time stands in otherwise. Both failure directions round toward
+ * "surfaces now", never toward "surfaces never".
+ *
+ * @param {unknown} createdAt - rumor.created_at, in seconds
+ * @param {number} nowMs - current time in ms, injectable for tests
+ * @returns {string} ISO-8601 timestamp
+ */
+export function resolveReportedAt(createdAt, nowMs = Date.now()) {
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const isUsable = Number.isFinite(createdAt)
+    && createdAt > 0
+    && createdAt <= nowSeconds + REPORT_CLOCK_SKEW_SECONDS
+    && createdAt >= nowSeconds - INBOX_FIRST_RUN_LOOKBACK_SECONDS;
+
+  return new Date(isUsable ? createdAt * 1000 : nowMs).toISOString();
+}
+
+async function findModerationResultBySha(db, sha256) {
+  return db.prepare(
+    'SELECT sha256 FROM moderation_results WHERE sha256 = ?'
+  ).bind(sha256).first();
+}
 
 /**
  * Derive the moderator's hex pubkey from NOSTR_PRIVATE_KEY (hex)
@@ -37,6 +85,15 @@ export async function syncInbox(env) {
   const privateKey = hexToBytes(env.NOSTR_PRIVATE_KEY);
   const moderatorPubkey = getPublicKey(privateKey);
 
+  // The fetch handler ensures the reports schema on every request, but this
+  // runs from the cron trigger too, which never touches it. Without this, the
+  // first tick after a deploy could reach a user_reports table that has no
+  // `source` column yet and drop every report it decrypted -- processRumor
+  // catches the write failure and moves on.
+  if (env.BLOSSOM_DB) {
+    await initReportsTable(env.BLOSSOM_DB);
+  }
+
   // Get last sync timestamp from KV
   let lastSync = null;
   if (env.MODERATION_KV) {
@@ -53,7 +110,7 @@ export async function syncInbox(env) {
     since = lastSync - TWO_DAYS;
   } else {
     // First run: look back 7 days
-    since = Math.floor(Date.now() / 1000) - (7 * 86400);
+    since = Math.floor(Date.now() / 1000) - INBOX_FIRST_RUN_LOOKBACK_SECONDS;
   }
 
   // Fetch gift wrap events from relay
@@ -85,98 +142,12 @@ export async function syncInbox(env) {
         continue;
       }
 
-      const senderPubkey = rumor.pubkey;
-      const content = rumor.content;
-      const createdAt = rumor.created_at;
-
-      // NIP-17 gift wraps reach the moderator's inbox in two shapes:
-      //   1. Inbound: someone writes to moderator. rumor.pubkey = them,
-      //      rumor's ['p'] tag = moderator.
-      //   2. Outbound self-copy: moderator writes to someone else, client
-      //      also wraps a copy addressed to moderator so sent messages
-      //      aren't lost. rumor.pubkey = moderator, rumor's ['p'] tag =
-      //      real recipient.
-      // Without handling (2), outgoing replies get stored with
-      // sender = recipient = moderator, which produces a separate
-      // conversation_id (moderator+moderator) and breaks threading.
-      const isOutgoing = senderPubkey === moderatorPubkey;
-      let counterpartyPubkey = null;
-      if (isOutgoing) {
-        // Find the real recipient in rumor tags: first 'p' tag whose value
-        // is not the moderator itself. A valid NIP-17 outgoing rumor must
-        // have one; if it doesn't, the gift wrap is malformed and we can't
-        // thread it correctly. Skip rather than store as a self-conversation
-        // that would later disappear from the admin UI.
-        const pTags = Array.isArray(rumor.tags)
-          ? rumor.tags.filter((t) => Array.isArray(t) && t[0] === 'p' && t[1])
-          : [];
-        const other = pTags.find((t) => t[1] !== moderatorPubkey);
-        if (!other) {
-          console.warn(
-            `[DM-READER] Outgoing rumor has no non-moderator 'p' tag; skipping event ${giftWrap.id}. rumor.tags=${JSON.stringify(rumor.tags || [])}`
-          );
-          errors++;
-          continue;
-        }
-        counterpartyPubkey = other[1];
-      } else {
-        counterpartyPubkey = senderPubkey;
-      }
-
-      const recipientPubkey = isOutgoing ? counterpartyPubkey : moderatorPubkey;
-      const direction = isOutgoing ? 'outgoing' : 'incoming';
-      // Compute conversation ID against the non-moderator side so inbound
-      // and outbound messages in the same thread share a conversation_id.
-      const conversationId = computeConversationId(moderatorPubkey, counterpartyPubkey);
-
-      // Check if this is a structured conversation_report
-      let relatedSha256 = null;
-      try {
-        const parsed = JSON.parse(content);
-        if (parsed && parsed.type === 'conversation_report' && parsed.sha256) {
-          relatedSha256 = parsed.sha256;
-
-          // Also create entry in user_reports table if available.
-          // Skip for outgoing self-copies: the reporter is the counterparty,
-          // not the moderator (who is echoing their own sent message).
-          if (env.BLOSSOM_DB && !isOutgoing) {
-            try {
-              await env.BLOSSOM_DB.prepare(`
-                INSERT OR IGNORE INTO user_reports
-                (sha256, reporter_pubkey, report_type, reason, created_at)
-                VALUES (?, ?, ?, ?, ?)
-              `).bind(
-                parsed.sha256,
-                senderPubkey,
-                parsed.report_type || 'dm_report',
-                parsed.reason || content,
-                new Date(createdAt * 1000).toISOString()
-              ).run();
-            } catch (reportErr) {
-              console.warn(`[DM-READER] Failed to insert user_report:`, reportErr.message);
-            }
-          }
-        }
-      } catch {
-        // Not JSON — regular text message, that's fine
-      }
-
-      // Log to dm_log (dedup by nostr_event_id)
-      const messageType = relatedSha256
-        ? 'conversation_report'
-        : (isOutgoing ? 'moderator_reply' : 'creator_reply');
-      const result = await logDm(env.BLOSSOM_DB, {
-        conversationId,
-        nostrEventId: giftWrap.id,
-        senderPubkey,
-        recipientPubkey,
-        content,
-        direction,
-        messageType,
-        sha256: relatedSha256
-      });
-
-      if (result && result.id) {
+      const outcome = await processRumor(rumor, giftWrap.id, moderatorPubkey, env);
+      if (outcome === null) {
+        // Malformed outgoing self-copy (no resolvable counterparty) --
+        // logged inside processRumor.
+        errors++;
+      } else if (outcome === 'synced') {
         synced++;
       } else {
         skipped++;
@@ -194,6 +165,182 @@ export async function syncInbox(env) {
 
   console.log(`[DM-READER] Sync complete: ${synced} new, ${skipped} deduped, ${errors} errors`);
   return { synced, skipped, errors };
+}
+
+/**
+ * Classify and persist a single already-unwrapped NIP-17 rumor addressed
+ * to (or from) the moderator. Split out from syncInbox's loop so the
+ * classify logic (tag-based report detection, direction handling) is
+ * directly testable against a plain rumor object -- no relay connection
+ * or gift-wrap crypto round-trip required.
+ *
+ * @param {Object} rumor - decrypted kind-14 rumor (unwrapEvent's output)
+ * @param {string} giftWrapId - the outer kind-1059 event id (dm_log dedup key)
+ * @param {string} moderatorPubkey
+ * @param {Object} env - Environment bindings (BLOSSOM_DB)
+ * @returns {Promise<'synced'|'skipped'|null>} null means malformed
+ *   (logged internally) and should count as an error, not synced/skipped.
+ */
+export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
+  const senderPubkey = rumor.pubkey;
+  const content = rumor.content;
+  const createdAt = rumor.created_at;
+
+  // NIP-17 gift wraps reach the moderator's inbox in two shapes:
+  //   1. Inbound: someone writes to moderator. rumor.pubkey = them,
+  //      rumor's ['p'] tag = moderator.
+  //   2. Outbound self-copy: moderator writes to someone else, client
+  //      also wraps a copy addressed to moderator so sent messages
+  //      aren't lost. rumor.pubkey = moderator, rumor's ['p'] tag =
+  //      real recipient.
+  // Without handling (2), outgoing replies get stored with
+  // sender = recipient = moderator, which produces a separate
+  // conversation_id (moderator+moderator) and breaks threading.
+  const isOutgoing = senderPubkey === moderatorPubkey;
+  let counterpartyPubkey = null;
+  if (isOutgoing) {
+    // Find the real recipient in rumor tags: first 'p' tag whose value
+    // is not the moderator itself. A valid NIP-17 outgoing rumor must
+    // have one; if it doesn't, the gift wrap is malformed and we can't
+    // thread it correctly. Skip rather than store as a self-conversation
+    // that would later disappear from the admin UI.
+    const pTags = Array.isArray(rumor.tags)
+      ? rumor.tags.filter((t) => Array.isArray(t) && t[0] === 'p' && t[1])
+      : [];
+    const other = pTags.find((t) => t[1] !== moderatorPubkey);
+    if (!other) {
+      console.warn(
+        `[DM-READER] Outgoing rumor has no non-moderator 'p' tag; skipping event ${giftWrapId}. rumor.tags=${JSON.stringify(rumor.tags || [])}`
+      );
+      return null;
+    }
+    counterpartyPubkey = other[1];
+  } else {
+    counterpartyPubkey = senderPubkey;
+  }
+
+  const recipientPubkey = isOutgoing ? counterpartyPubkey : moderatorPubkey;
+  const direction = isOutgoing ? 'outgoing' : 'incoming';
+  // Compute conversation ID against the non-moderator side so inbound
+  // and outbound messages in the same thread share a conversation_id.
+  const conversationId = computeConversationId(moderatorPubkey, counterpartyPubkey);
+
+  // syncInbox deliberately overlaps two days of gift wraps on every tick for
+  // NIP-17 timestamp randomization, so the same gift wrap is re-processed for
+  // up to two days. Look up whether it already reached dm_log, but don't
+  // return yet: a dm_log row proves the DM was stored, not that its report
+  // was. The report write below warns and continues, and logDm runs either
+  // way, so returning here would make a transient failure permanent -- the
+  // next tick would skip before it ever retried. Each side is deduped against
+  // its own row instead.
+  const alreadyLogged = env.BLOSSOM_DB
+    ? await findDmByNostrEventId(env.BLOSSOM_DB, giftWrapId)
+    : null;
+
+  // Structured report data travels as NIP-17 tags on the rumor, not as
+  // JSON-encoded content -- content stays plain human-readable text
+  // (matching NIP-17's "content MUST be plain text" convention) so the
+  // admin Messages UI can keep rendering it as-is. A report DM carries the
+  // same NIP-32 ['L'/'l', ...] label pair its kind-1984 sibling publishes,
+  // plus a coarse ['report_type', <nip-56 type>] fallback; only content
+  // reports also carry ['sha256', <hash>], because user reports and
+  // DM-message reports have no resolvable Blossom blob hash (by design: see
+  // divine-mobile#6593 plan's "Non-goals"). So the label classifies the
+  // message and sha256 gates the user_reports row.
+  //
+  // extractReportType is the relay poller's resolver, shared deliberately:
+  // both paths write the same (sha256, reporter_pubkey) row under
+  // INSERT OR IGNORE, so if they disagreed on vocabulary whichever ingested
+  // first would pin its answer permanently.
+  const rumorTags = Array.isArray(rumor.tags) ? rumor.tags : [];
+  const shaTag = rumorTags.find((t) => Array.isArray(t) && t[0] === 'sha256' && t[1]);
+  const hasReportTag = rumorTags.some(
+    (t) => Array.isArray(t) && (
+      (t[0] === 'report_type' && t[1])
+      || (t[0] === 'l' && t[1] && t[2] === 'social.nos.ontology')
+    )
+  );
+  const rawSha256 = typeof shaTag?.[1] === 'string' ? shaTag[1].toLowerCase() : null;
+  const relatedSha256 = rawSha256 && isValidSha256(rawSha256) ? rawSha256 : null;
+  const reportType = hasReportTag ? extractReportType(rumor) : 'dm_report';
+
+  if (rawSha256 && !relatedSha256) {
+    console.warn(`[DM-READER] Ignoring invalid sha256 tag on report DM ${giftWrapId}`);
+  }
+
+  // user_reports.sha256 is NOT NULL (it exists to count distinct
+  // reporters per piece of content for escalation policy -- see
+  // reports.mjs), so this can only ever fire when a sha256 tag is
+  // present. Skip for outgoing self-copies: the reporter is the
+  // counterparty, not the moderator (who is echoing their own sent
+  // message).
+  // No allowAutoAgeRestrict override: a report DM is the least verified
+  // report we accept. The sender is any key that can reach the moderation
+  // inbox, the sha256 is client-supplied, and unlike the relay poller this
+  // path does not fetch the target event, require a Divine client, or pass
+  // the processed-key gate. So it records the report and leaves the call to
+  // a human -- `source: 'dm-report'` takes the REVIEW-only default, which
+  // is what the relay path (`'relay-report'`) already takes. Only the
+  // authenticated HTTP report API still auto-escalates.
+  //
+  // On a re-poll, skip only once this reporter's row and the review row both
+  // exist for this sha256.
+  // recordReportForReview is not idempotent for a report whose timestamp fell
+  // back to receipt time: moderated_at moves and the AI telemetry event_key
+  // (report:<sha>:<type>:<createdAt>) changes, so INSERT OR IGNORE stops
+  // deduping it. Keying the skip on the completed report+review pair, rather
+  // than the dm_log row alone or user_reports alone, suppresses that without
+  // also suppressing the retry a partial failed write needs.
+  if (relatedSha256 && env.BLOSSOM_DB && !isOutgoing) {
+    const alreadyRecorded = alreadyLogged
+      && await findReportByReporter(env.BLOSSOM_DB, relatedSha256, senderPubkey)
+      && await findModerationResultBySha(env.BLOSSOM_DB, relatedSha256);
+    if (!alreadyRecorded) {
+      try {
+        await recordReportForReview(env.BLOSSOM_DB, {
+          sha256: relatedSha256,
+          reporterPubkey: senderPubkey,
+          reportType,
+          reason: content,
+          source: 'dm-report',
+          reportedAt: resolveReportedAt(createdAt),
+        });
+      } catch (reportErr) {
+        console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);
+      }
+    }
+  }
+
+  // The DM side is settled once dm_log holds this gift wrap. Returning here
+  // rather than letting logDm's own dedup decide keeps the outcome honest:
+  // logDm hands back the *existing* row on a dedup hit, whose truthy .id is
+  // indistinguishable from a fresh insert, so a re-poll used to count as
+  // 'synced'.
+  if (alreadyLogged) {
+    return 'skipped';
+  }
+
+  // Log to dm_log (dedup by nostr_event_id). Either machine-readable tag
+  // marks the DM as a report: the report tags are present on all three
+  // report variants, sha256 only on content reports. Keying the badge off
+  // sha256 alone would render a user report or a DM-message report as an
+  // ordinary reply in the admin Messages UI, which is a display gap rather
+  // than the deliberate user_reports non-goal above.
+  const messageType = (relatedSha256 || hasReportTag)
+    ? 'conversation_report'
+    : (isOutgoing ? 'moderator_reply' : 'creator_reply');
+  const result = await logDm(env.BLOSSOM_DB, {
+    conversationId,
+    nostrEventId: giftWrapId,
+    senderPubkey,
+    recipientPubkey,
+    content,
+    direction,
+    messageType,
+    sha256: relatedSha256
+  });
+
+  return result && result.id ? 'synced' : 'skipped';
 }
 
 /**

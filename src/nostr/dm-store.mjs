@@ -27,12 +27,38 @@ export async function initDmLogTable(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_conversation ON dm_log(conversation_id)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_log(recipient_pubkey)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_sha256 ON dm_log(sha256)').run();
+  await initDmReadStateTable(db);
+}
+
+/**
+ * Create the per-conversation read-state table if it doesn't exist.
+ *
+ * Callable on its own, not just via initDmLogTable, because CI deploys the
+ * worker on every push to main but never runs `wrangler d1 migrations apply`.
+ * Without an ensure on the DM read paths, merging the migration that adds
+ * this table would still ship a getConversations() that LEFT JOINs a table
+ * production does not have yet, and the admin Messages UI would 500 until
+ * someone applied migration 012 by hand.
+ * @param {D1Database} db
+ */
+export async function initDmReadStateTable(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS dm_conversation_read_state (
+      conversation_id TEXT PRIMARY KEY,
+      read_at TEXT NOT NULL
+    )
+  `).run();
+}
+
+export async function findDmByNostrEventId(db, nostrEventId) {
+  if (!nostrEventId) return null;
+  return db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(nostrEventId).first();
 }
 
 export async function logDm(db, { conversationId, sha256, direction, senderPubkey, recipientPubkey, messageType, content, nostrEventId }) {
   // Dedup by nostr_event_id if provided
   if (nostrEventId) {
-    const existing = await db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(nostrEventId).first();
+    const existing = await findDmByNostrEventId(db, nostrEventId);
     if (existing) return existing;
   }
 
@@ -42,6 +68,23 @@ export async function logDm(db, { conversationId, sha256, direction, senderPubke
   `).bind(conversationId, sha256 || null, direction, senderPubkey, recipientPubkey, messageType || null, content, nostrEventId || null).run();
 
   return { id: result.meta.last_row_id };
+}
+
+/**
+ * Mark a conversation as read as of now. Monotonic: a concurrent call that
+ * resolves its own CURRENT_TIMESTAMP earlier than the row's current value
+ * (per SQLite/D1's write serialization this shouldn't happen in practice,
+ * but the guard is free) is a no-op rather than moving read_at backwards.
+ * @param {D1Database} db
+ * @param {string} conversationId
+ */
+export async function markConversationRead(db, conversationId) {
+  await db.prepare(`
+    INSERT INTO dm_conversation_read_state (conversation_id, read_at)
+    VALUES (?, CURRENT_TIMESTAMP)
+    ON CONFLICT(conversation_id) DO UPDATE SET read_at = CURRENT_TIMESTAMP
+    WHERE CURRENT_TIMESTAMP > dm_conversation_read_state.read_at
+  `).bind(conversationId).run();
 }
 
 export async function getConversations(db, { limit = 20, offset = 0, moderatorPubkey } = {}) {
@@ -63,6 +106,17 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       SELECT conversation_id, MAX(id) AS max_id, COUNT(*) AS message_count
       FROM dm_log
       GROUP BY conversation_id
+    ),
+    latest_incoming AS (
+      -- The most recent INCOMING message per conversation, used for the
+      -- unread computation below. Deliberately separate from the "latest"
+      -- CTE above (which is the most recent message in either direction,
+      -- used for the row's display columns): a moderator's own outgoing
+      -- reply must not mark their own inbox as unread to themselves.
+      SELECT conversation_id, MAX(created_at) AS latest_incoming_at
+      FROM dm_log
+      WHERE direction = 'incoming'
+      GROUP BY conversation_id
     )
     SELECT
       dl.conversation_id,
@@ -73,9 +127,20 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       dl.content as last_message,
       dl.sha256 as last_sha256,
       dl.message_type as last_message_type,
-      latest.message_count
+      latest.message_count,
+      CASE
+        WHEN li.latest_incoming_at IS NULL THEN 0
+        WHEN rs.read_at IS NULL THEN 1
+        -- Both timestamps use SQLite/D1 CURRENT_TIMESTAMP, which has
+        -- one-second resolution. A message logged in the same second as
+        -- mark-read is treated as read until a later incoming message arrives.
+        WHEN li.latest_incoming_at > rs.read_at THEN 1
+        ELSE 0
+      END AS unread
     FROM latest
     JOIN dm_log dl ON dl.id = latest.max_id
+    LEFT JOIN latest_incoming li ON li.conversation_id = latest.conversation_id
+    LEFT JOIN dm_conversation_read_state rs ON rs.conversation_id = latest.conversation_id
     ORDER BY last_message_at DESC, dl.id DESC
     LIMIT ? OFFSET ?
   `).bind(limit, offset).all();

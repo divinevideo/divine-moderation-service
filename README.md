@@ -11,7 +11,7 @@ It is a single [Cloudflare Worker](https://developers.cloudflare.com/workers/) (
 
 The service runs in **reactive mode** (`REACTIVE_MODERATION_ONLY = "true"`). Rather than machine-scanning every upload, it acts on signals that something needs a human look:
 
-1. **Reports come in** — from authenticated Divine clients (`POST /api/v1/report`) and from public NIP-56 (kind `1984`) report events polled off `relay.divine.video`. Each report is written to D1 as a review row.
+1. **Reports come in** — from authenticated Divine clients (`POST /api/v1/report`), from public NIP-56 (kind `1984`) report events polled off `relay.divine.video`, and from NIP-17 report DMs sent to the moderation@ inbox. Each report is written to D1 as a review row.
 2. **A moderator triages** — the admin dashboard presents a swipe-review queue of untriaged content, with video playback, uploader context, and any available provenance/AI signals.
 3. **A decision is applied** — the moderator picks an action, and the worker fans it out: it records the decision, publishes Nostr labels/reports, notifies the relay (ban/unban/delete via the relay-admin service binding) and Blossom (blob delete), and hands labels to the ATProto labeler webhook.
 
@@ -22,7 +22,7 @@ Because the service is report-driven, the queue consumer for the legacy `video-m
 ## Features
 
 - **Human review dashboard** — swipe-review queue, per-category verification (confirm/reject an individual detection), direct-message templates for creator communication, stats, and tunable classifier thresholds. Served behind Cloudflare Access on `moderation.admin.divine.video`.
-- **Report ingestion** — authenticated client reports plus inbound public NIP-56 (kind `1984`) reports polled from the relay. Relay-originated reports are review-only and never auto-escalate, since client tags and reporter pubkeys are self-asserted public signals.
+- **Report ingestion** — authenticated client reports, inbound public NIP-56 (kind `1984`) reports polled from the relay, and NIP-17 report DMs to the moderation@ inbox. Both Nostr paths are review-only and never auto-escalate, since client tags and reporter pubkeys are self-asserted public signals; report DMs additionally do not count toward the distinct-reporter threshold that the authenticated path escalates on. Only `POST /api/v1/report` can produce an automatic `AGE_RESTRICTED`.
 - **Content categories** — nudity/NSFW, violence, gore, weapons, recreational drugs, self-harm, hate speech / offensive symbols, AI-generated, and deepfake, plus content-warning labels for alcohol, tobacco, medical, and gambling.
 - **AI-generation & provenance signals** (surfaced to moderators as review context, not auto-enforcement):
   - `divine-ai-detector` for per-signal detection, with vendor fallback to Hive and Reality Defender.

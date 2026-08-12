@@ -25,10 +25,16 @@ export async function recordReportForReview(db, {
     report_type: reportType,
     reason,
     created_at: reportedAt,
+    source,
   });
 
   const isNsfw = isNsfwReportType(reportType);
-  const action = (allowAutoAgeRestrict && isNsfw && result.distinctReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
+  // Gate on escalationReporterCount, not distinctReporterCount: the two differ
+  // exactly when a source that may not drive automatic outcomes (a report DM)
+  // has also reported this sha256. Counting those would let one actor supply
+  // half the threshold for free, which is the same trust boundary that keeps
+  // the DM path itself REVIEW-only.
+  const action = (allowAutoAgeRestrict && isNsfw && result.escalationReporterCount >= 2) ? 'AGE_RESTRICTED' : 'REVIEW';
   const moderatedAt = reportedAt || new Date().toISOString();
   const categories = isNsfw ? ['adult'] : [];
   let moderationResultRecorded = false;
@@ -74,6 +80,7 @@ export async function recordReportForReview(db, {
         reportType,
         reportedBy: reporterPubkey,
         distinctReporterCount: result.distinctReporterCount,
+        escalationReporterCount: result.escalationReporterCount,
         reason,
         reportEventId,
         targetEventId,
