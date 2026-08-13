@@ -522,6 +522,46 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       }
     });
 
+    it('reports an unusable override as a DEFINITIVE non-send, so warnings are not swallowed', async () => {
+      // `definitive` decides what the community-strike sweep does with a failure.
+      // A no-send that is definitive releases the claim; a non-definitive one is
+      // ambiguous, so the sweep RETAINS the claim and never resends. That is the
+      // outcome the throw exists to avoid, reached by a different route than the
+      // empty-list return the parser guards against.
+      //
+      // Nothing pinned this: moving `publishAttempted = true` above the discovery
+      // call turns every misconfigured warning into a permanent silent swallow,
+      // and the whole suite still passed.
+      const sockets = [];
+      class SpyWS {
+        constructor(url) {
+          sockets.push(url);
+          this.readyState = 3;
+        }
+        addEventListener() {}
+        close() {}
+        send() {}
+      }
+      vi.stubGlobal('WebSocket', SpyWS);
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: ['ws://127.0.0.1:4444'],
+        };
+
+        const result = await sendCommunityStrikeWarning(
+          'b'.repeat(64), 'warning', 'c'.repeat(64), env, null,
+        );
+
+        expect(result.sent).toBe(false);
+        expect(result.definitive).toBe(true);
+        expect(sockets).toEqual([]);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
     it('leaves the production default alone when DM_RELAY_URLS is absent', async () => {
       mockKV.get.mockResolvedValue(null);
 

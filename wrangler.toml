@@ -161,17 +161,25 @@ AI_DETECTOR_GATE_WATERMARK_VISIBLE = "0.8"
 # form DM_RELAY_URLS = ["ws://..."] deploys cleanly and arrives as an array;
 # that is refused at send time rather than silently falling back to production.
 #
-# Setting it contains both paths that publish with NOSTR_PRIVATE_KEY: the DM send
-# path, and the kind-10050 inbox announcement.
+# Setting it contains the two paths that PUBLISH NOSTR EVENTS with
+# NOSTR_PRIVATE_KEY: the DM send path, and the kind-10050 inbox announcement.
 #
-# The announcement additionally needs RELAY_POLLING_RELAY_URL, because that is
-# what it announces AS the inbox and its fallback is the production relay. Set
-# DM_RELAY_URLS without it and the announcement is skipped rather than published
-# to production; the log says so.
+# The announcement also needs RELAY_POLLING_RELAY_URL to name one of these relays,
+# because that is what it announces AS the inbox. If it names anything else the
+# announcement is skipped rather than published outside the containment, and the
+# log says which relay was refused. Note this file sets RELAY_POLLING_RELAY_URL to
+# the production relay below, so a contained run must override it.
 #
-# Still not contained: profile-resolver's kind-0 read reaches relay.divine.video.
-# It publishes nothing and contacts no user, so DM containment holds, but a
-# non-production run is not fully offline.
+# NOT contained, and worth knowing before you run this with a real key:
+#
+#   - notifyRelay (src/relay-notifier.mjs) signs a NIP-98 token with the same key
+#     and POSTs to FUNNELCAKE_ADMIN_URL, which this file also points at
+#     relay.divine.video. It fires on ordinary moderation actions, so a QUARANTINE
+#     from a contained run hides a real video on the production relay. Override
+#     FUNNELCAKE_ADMIN_URL too, or leave enforcement alone in a non-prod run.
+#   - The read paths (dm-reader, report-poller, relay-poller, profile-resolver)
+#     read from production by default. They publish nothing and contact no user,
+#     so DM containment holds, but a contained run is not offline.
 
 # Relay Polling Configuration
 RELAY_POLLING_ENABLED = "true"                    # Enable/disable relay polling

@@ -7,7 +7,7 @@
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { Relay } from 'nostr-tools/relay';
 import { hexToBytes } from '@noble/hashes/utils';
-import { isContained } from './relay-override.mjs';
+import { isContained, parseRelayOverride } from './relay-override.mjs';
 
 /**
  * NIP-32 label mapping for content categories
@@ -456,16 +456,36 @@ export async function publishDmInboxRelayList(env, { connect = Relay.connect } =
   // freshly-signed REPLACEABLE kind-10050 to relay.divine.video with the real key.
   // Containment must not depend on remembering a second variable, so with nothing
   // safe to announce, it does not announce.
-  if (contained && !env.RELAY_POLLING_RELAY_URL) {
-    console.warn(
-      '[DM-INBOX] DM_RELAY_URLS is set but RELAY_POLLING_RELAY_URL is not. ' +
-        'Skipping the kind-10050 announcement rather than publishing to the ' +
-        'production relay from a run declared contained.',
-    );
-    return { published: false, reason: 'Contained run without RELAY_POLLING_RELAY_URL' };
-  }
-
   const homeRelay = env.RELAY_POLLING_RELAY_URL || 'wss://relay.divine.video';
+
+  if (contained) {
+    // Check the TARGET, not which variables happen to be defined. The previous
+    // version asked whether RELAY_POLLING_RELAY_URL was UNSET -- but wrangler.toml
+    // sets it to wss://relay.divine.video in the single shared [vars] block, so it
+    // is set in every deploy and every `wrangler dev`. The guard never fired in any
+    // configuration this repo ships, and a run declared contained published a
+    // freshly-signed, replaceable kind-10050 to the production relay with the real
+    // key.
+    //
+    // A parse failure means nothing is allowed, which is the same answer as an
+    // empty allowlist. Caught rather than propagated because this function has
+    // never thrown and its callers do not expect it to.
+    let allowed = [];
+    try {
+      allowed = parseRelayOverride(env);
+    } catch {
+      allowed = [];
+    }
+    if (!allowed.includes(homeRelay)) {
+      console.warn(
+        `[DM-INBOX] Skipping the kind-10050 announcement: this run is contained by ` +
+          `DM_RELAY_URLS but its inbox relay (${homeRelay}) is not in that list, so ` +
+          `announcing would publish outside the containment. Set ` +
+          `RELAY_POLLING_RELAY_URL to one of the DM_RELAY_URLS relays.`,
+      );
+      return { published: false, reason: 'Contained run: home relay is not in DM_RELAY_URLS' };
+    }
+  }
   const inboxRelays = [homeRelay];
 
   // Discovery targets: where we publish the event so clients can resolve it.

@@ -8,7 +8,7 @@ import { wrapEvent } from 'nostr-tools/nip17';
 import { hexToBytes } from '@noble/hashes/utils';
 import { getPublicKey } from 'nostr-tools/pure';
 import { logDm, computeConversationId } from './dm-store.mjs';
-import { parseRelayOverride } from './relay-override.mjs';
+import { parseRelayOverride, MAX_RELAYS } from './relay-override.mjs';
 
 // Cache moderator keys per env object to avoid re-decoding
 const keyCache = new WeakMap();
@@ -21,7 +21,6 @@ const DEFAULT_RELAYS = [
 
 const DIVINE_RELAY = 'wss://relay.divine.video';
 
-const MAX_RELAYS = 5;
 const RATE_LIMIT_WINDOW_SEC = 60;
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_TTL_SEC = 120;
