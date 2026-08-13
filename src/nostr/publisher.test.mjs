@@ -443,6 +443,55 @@ describe('DM inbox relay list (kind 10050)', () => {
     expect(inboxRelays).toEqual(['wss://relay.divine.video']);
   });
 
+  it.each([
+    ['a TOML array, which wrangler accepts in vars', ['ws://127.0.0.1:4444']],
+    ['a number', 4444],
+    ['whitespace only', '   '],
+    ['separators only', ' , , '],
+    ['an empty string', ''],
+  ])('treats a present-but-unusable DM_RELAY_URLS as contained: %s', async (_name, value) => {
+    // The DM path refuses to send on these values. If this path disagreed and
+    // took the production branch, the exact misconfiguration the refusal exists
+    // to catch would announce moderation@'s DM inbox to purplepag.es,
+    // relay.nostr.band and relay.damus.io, overwriting the real record there.
+    //
+    // Present-and-unparseable means refuse, never "carry on as production".
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'ws://127.0.0.1:4444',
+      DM_RELAY_URLS: value,
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    const targets = connect.mock.calls.map((c) => c[0]);
+    expect(targets).not.toContain('wss://purplepag.es');
+    expect(targets).not.toContain('wss://relay.nostr.band');
+    expect(targets).not.toContain('wss://relay.damus.io');
+  });
+
+  it('refuses to announce at all when contained without an explicit home relay', async () => {
+    // homeRelay falls back to the production relay and is unconditionally a
+    // target, so suppressing the discovery relays alone does not contain this
+    // path: a run declared contained still publishes a freshly-signed,
+    // REPLACEABLE kind-10050 to relay.divine.video with the real key.
+    //
+    // Containment must not depend on remembering a second, undocumented variable.
+    // With no explicit home relay there is nothing safe to announce, so it skips.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const result = await publishDmInboxRelayList(env, { connect });
+
+    expect(connect).not.toHaveBeenCalled();
+    expect(result.published).toBe(false);
+    expect(result.reason).toMatch(/RELAY_POLLING_RELAY_URL/);
+  });
+
   it('does not announce to public relays when DM_RELAY_URLS contains the run', async () => {
     // DM_RELAY_URLS says "this run must not reach outside these relays". This is
     // the second path that publishes with the signing key, and its discovery

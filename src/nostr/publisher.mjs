@@ -7,6 +7,7 @@
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { Relay } from 'nostr-tools/relay';
 import { hexToBytes } from '@noble/hashes/utils';
+import { isContained } from './relay-override.mjs';
 
 /**
  * NIP-32 label mapping for content categories
@@ -432,21 +433,48 @@ export async function publishDmInboxRelayList(env, { connect = Relay.connect } =
     return { published: false, reason: 'No signing key configured' };
   }
 
+  // DM_RELAY_URLS declares a non-production run, and this is the second path that
+  // publishes with the signing key. Announcing widely is right in production and
+  // wrong here: a contained run would tell purplepag.es, relay.nostr.band and
+  // relay.damus.io that moderation@'s DM inbox is a localhost relay, replacing
+  // the real kind-10050 on the relays clients actually consult. Strict NIP-17
+  // clients could then not deliver DMs to the moderation account until it was
+  // republished.
+  //
+  // `isContained` is true whenever the variable is PRESENT, including when its
+  // value is unusable, and it is shared with the DM path on purpose. When the two
+  // parsed it separately they disagreed: a TOML array made the DM path refuse
+  // while this one took the production branch, so the exact misconfiguration the
+  // refusal exists to catch produced the exact harm it exists to prevent.
+  const contained = isContained(env);
+
   // Inbox = where dm-reader actually polls for gift-wrapped DMs. Keep in sync with it.
+  //
+  // Suppressing the discovery relays is not enough to contain this path, because
+  // homeRelay is unconditionally a target and its fallback is the production
+  // relay. A contained run with no explicit home relay would still publish a
+  // freshly-signed REPLACEABLE kind-10050 to relay.divine.video with the real key.
+  // Containment must not depend on remembering a second variable, so with nothing
+  // safe to announce, it does not announce.
+  if (contained && !env.RELAY_POLLING_RELAY_URL) {
+    console.warn(
+      '[DM-INBOX] DM_RELAY_URLS is set but RELAY_POLLING_RELAY_URL is not. ' +
+        'Skipping the kind-10050 announcement rather than publishing to the ' +
+        'production relay from a run declared contained.',
+    );
+    return { published: false, reason: 'Contained run without RELAY_POLLING_RELAY_URL' };
+  }
+
   const homeRelay = env.RELAY_POLLING_RELAY_URL || 'wss://relay.divine.video';
   const inboxRelays = [homeRelay];
 
   // Discovery targets: where we publish the event so clients can resolve it.
-  //
-  // DM_RELAY_URLS contains a non-production run, and this is the second path that
-  // publishes with the signing key. Announcing widely is right in production and
-  // wrong here: a contained run would tell purplepag.es, relay.nostr.band and
-  // relay.damus.io that moderation@'s DM inbox is a localhost relay, overwriting
-  // the real kind-10050 on the relays clients actually consult. Strict NIP-17
-  // clients would then be unable to deliver DMs to the moderation account until
-  // it was republished. So when the run is contained, the announcement is too.
-  const contained = typeof env.DM_RELAY_URLS === 'string'
-    && env.DM_RELAY_URLS.split(',').map((r) => r.trim()).filter(Boolean).length > 0;
+  if (contained && env.DM_INBOX_DISCOVERY_RELAYS) {
+    console.warn(
+      '[DM-INBOX] Ignoring DM_INBOX_DISCOVERY_RELAYS because DM_RELAY_URLS is set. ' +
+        'A contained run announces only to its own home relay.',
+    );
+  }
   const discoveryRelays = contained
     ? []
     : env.DM_INBOX_DISCOVERY_RELAYS

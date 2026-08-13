@@ -489,6 +489,39 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       });
     }
 
+    it('sends nothing when the override is unusable, rather than falling back', async () => {
+      // Proving parseRelayOverride throws is not the same as proving no DM is
+      // sent. All three send entry points wrap discovery in a catch-all, so a
+      // try/catch that restored the production list would swallow the refusal
+      // and pass every other test in this file.
+      const sockets = [];
+      class SpyWS {
+        constructor(url) {
+          sockets.push(url);
+          this.readyState = 3;
+        }
+        addEventListener() {}
+        close() {}
+        send() {}
+      }
+      vi.stubGlobal('WebSocket', SpyWS);
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: ['ws://127.0.0.1:4444'],
+        };
+
+        const result = await sendModerationDM('b'.repeat(64), 'hello', env);
+
+        expect(result.sent).toBe(false);
+        // The point: no socket to any relay, production or otherwise.
+        expect(sockets).toEqual([]);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
     it('leaves the production default alone when DM_RELAY_URLS is absent', async () => {
       mockKV.get.mockResolvedValue(null);
 

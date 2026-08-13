@@ -8,6 +8,7 @@ import { wrapEvent } from 'nostr-tools/nip17';
 import { hexToBytes } from '@noble/hashes/utils';
 import { getPublicKey } from 'nostr-tools/pure';
 import { logDm, computeConversationId } from './dm-store.mjs';
+import { parseRelayOverride } from './relay-override.mjs';
 
 // Cache moderator keys per env object to avoid re-decoding
 const keyCache = new WeakMap();
@@ -331,64 +332,6 @@ async function recordRateLimit(recipientPubkey, env) {
 }
 
 // --- Relay Discovery ---
-
-/**
- * Parse the `DM_RELAY_URLS` publish-target override.
- *
- * Unset (the production default) returns [] and every caller keeps today's
- * behaviour: discovered relays, DIVINE_RELAY, DEFAULT_RELAYS.
- *
- * Set, it pins outbound DMs to exactly these relays. That containment is what
- * makes it safe to run this Worker outside production with a real signing key:
- * DIVINE_RELAY and DEFAULT_RELAYS are module constants, so without an override
- * every DM path publishes to relay.divine.video and to three public relays
- * regardless of environment.
- *
- * Present but unusable THROWS. Setting this variable is a statement that DMs must
- * not leave a known list, so falling back to DIVINE_RELAY and DEFAULT_RELAYS on a
- * bad value does the opposite of what was asked, and does it silently: there is
- * no log distinguishing a malformed value from an unset one. The case is not
- * exotic. `vars` in wrangler.toml accepts any JSON, so the natural TOML spelling
- *
- *     DM_RELAY_URLS = ["ws://127.0.0.1:4444"]
- *
- * deploys cleanly and arrives here as an array, not a string.
- *
- * Returning [] instead of throwing is not an option: zero relays reads downstream
- * as success===0 with no rejections, which sendModeratorMessage reports as a
- * non-definitive send, and the community-strike sweep then retains its warning
- * claim and never resends. A misconfiguration would silently swallow warnings.
- *
- * Unset remains the production default and is unaffected.
- *
- * @param {Object} env
- * @returns {string[]} Relay URLs, deduped and capped at MAX_RELAYS; [] when unset
- * @throws {Error} when DM_RELAY_URLS is present but yields no usable relay
- */
-function parseRelayOverride(env) {
-  const raw = env?.DM_RELAY_URLS;
-  if (raw === undefined || raw === null) return [];
-
-  const parsed =
-    typeof raw === 'string'
-      ? raw.split(',').map((r) => r.trim()).filter(Boolean)
-      : [];
-
-  if (parsed.length === 0) {
-    throw new Error(
-      `DM_RELAY_URLS is set but yields no usable relay (${typeof raw}). ` +
-        'Expected a comma-separated string of relay URLs. Refusing to send: ' +
-        'falling back to the production relays would defeat the containment ' +
-        'this setting exists to provide. Unset it to use production defaults.',
-    );
-  }
-
-  // Dedupe BEFORE the cap. Capping first lets duplicates consume the budget and
-  // silently drop a relay that was actually distinct, while the send path still
-  // counts one success per socket -- so a single-relay delivery reports as
-  // MAX_RELAYS-way redundancy.
-  return [...new Set(parsed)].slice(0, MAX_RELAYS);
-}
 
 /**
  * Discover relays a user reads from, via kind 10002 (NIP-65 relay list).

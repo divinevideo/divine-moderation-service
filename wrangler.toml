@@ -161,11 +161,17 @@ AI_DETECTOR_GATE_WATERMARK_VISIBLE = "0.8"
 # form DM_RELAY_URLS = ["ws://..."] deploys cleanly and arrives as an array;
 # that is refused at send time rather than silently falling back to production.
 #
-# It contains the DM send path and the kind-10050 inbox announcement. It does NOT
-# contain everything: RELAY_POLLING_RELAY_URL (where dm-reader polls), and
-# profile-resolver's kind-0 read, still reach relay.divine.video. The kind-0 read
-# publishes nothing and contacts no user, so it does not break DM containment,
-# but a non-production run is not fully offline.
+# Setting it contains both paths that publish with NOSTR_PRIVATE_KEY: the DM send
+# path, and the kind-10050 inbox announcement.
+#
+# The announcement additionally needs RELAY_POLLING_RELAY_URL, because that is
+# what it announces AS the inbox and its fallback is the production relay. Set
+# DM_RELAY_URLS without it and the announcement is skipped rather than published
+# to production; the log says so.
+#
+# Still not contained: profile-resolver's kind-0 read reaches relay.divine.video.
+# It publishes nothing and contacts no user, so DM containment holds, but a
+# non-production run is not fully offline.
 
 # Relay Polling Configuration
 RELAY_POLLING_ENABLED = "true"                    # Enable/disable relay polling
