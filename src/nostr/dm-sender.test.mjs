@@ -23,6 +23,7 @@ import {
   renderComposeTemplate,
   publishToRelays,
 } from './dm-sender.mjs';
+import { isContained, parseRelayOverride } from './relay-override.mjs';
 import { createMockKV } from '../test/helpers.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
@@ -345,6 +346,31 @@ describe('DM Sender - discoverUserRelays', () => {
   });
 });
 
+// vitest-pool-workers does not reliably honor vi.stubGlobal('WebSocket').
+// Assigning globalThis.WebSocket and using reserved-domain hosts is the
+// pattern the rest of this file already uses: 127.0.0.1 and relay.divine.video
+// construct a real socket and wedge the worker RPC (CI Test on this PR hung
+// for 60s after the contained happy-path test, then died on onTaskUpdate).
+function installRecordingWebSocket() {
+  const sockets = [];
+  const original = globalThis.WebSocket;
+  class FakeWS {
+    constructor(url) {
+      sockets.push(url);
+      this._cbs = {};
+      queueMicrotask(() => this._cbs.error && this._cbs.error());
+    }
+    addEventListener(type, cb) { this._cbs[type] = cb; }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = FakeWS;
+  return {
+    sockets,
+    restore() { globalThis.WebSocket = original; },
+  };
+}
+
 describe('DM Sender - DM_RELAY_URLS override', () => {
   let mockKV;
 
@@ -437,26 +463,16 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
     // a "contained" run opening a socket to the production relay on every DM,
     // invisibly. Assert the calls that must not happen, not just the answer.
     mockKV.get.mockResolvedValue(null);
-    const sockets = [];
-    class SpyWS {
-      constructor(url) {
-        sockets.push(url);
-        this.readyState = 3;
-      }
-      addEventListener() {}
-      close() {}
-      send() {}
-    }
-    vi.stubGlobal('WebSocket', SpyWS);
+    const ws = installRecordingWebSocket();
     try {
       const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: 'ws://127.0.0.1:4444' };
 
       await discoverUserRelays('b'.repeat(64), env);
 
       expect(mockKV.get).not.toHaveBeenCalled();
-      expect(sockets).toEqual([]);
+      expect(ws.sockets).toEqual([]);
     } finally {
-      vi.unstubAllGlobals();
+      ws.restore();
     }
   });
 
@@ -499,17 +515,7 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       // sent. All three send entry points wrap discovery in a catch-all, so a
       // try/catch that restored the production list would swallow the refusal
       // and pass every other test in this file.
-      const sockets = [];
-      class SpyWS {
-        constructor(url) {
-          sockets.push(url);
-          this.readyState = 3;
-        }
-        addEventListener() {}
-        close() {}
-        send() {}
-      }
-      vi.stubGlobal('WebSocket', SpyWS);
+      const ws = installRecordingWebSocket();
       try {
         const env = {
           NOSTR_PRIVATE_KEY: 'a'.repeat(64),
@@ -527,9 +533,9 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
 
         expect(result.sent).toBe(false);
         // The point: no socket to any relay, production or otherwise.
-        expect(sockets).toEqual([]);
+        expect(ws.sockets).toEqual([]);
       } finally {
-        vi.unstubAllGlobals();
+        ws.restore();
       }
     });
 
@@ -543,17 +549,7 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       // Nothing pinned this: moving `publishAttempted = true` above the discovery
       // call turns every misconfigured warning into a permanent silent swallow,
       // and the whole suite still passed.
-      const sockets = [];
-      class SpyWS {
-        constructor(url) {
-          sockets.push(url);
-          this.readyState = 3;
-        }
-        addEventListener() {}
-        close() {}
-        send() {}
-      }
-      vi.stubGlobal('WebSocket', SpyWS);
+      const ws = installRecordingWebSocket();
       try {
         const env = {
           NOSTR_PRIVATE_KEY: 'a'.repeat(64),
@@ -572,9 +568,9 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
         expect(result.sent).toBe(false);
         expect(result.definitive).toBe(true);
         expect(result.reason).toMatch(/DM_RELAY_URLS/);
-        expect(sockets).toEqual([]);
+        expect(ws.sockets).toEqual([]);
       } finally {
-        vi.unstubAllGlobals();
+        ws.restore();
       }
     });
 
@@ -584,47 +580,62 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       // publishToRelays is actually handed once containment succeeds: appending
       // the production relay to the list at all three call sites passed the full
       // 1579-test suite. Assert the transport, not the answer.
-      const sockets = [];
-      class SpyWS {
-        constructor(url) {
-          sockets.push(url);
-          this.readyState = 3;
-          this.listeners = {};
-          // Fire 'error' via addEventListener, which is what publishToSingleRelay
-          // actually listens on. A no-op listener leaves it waiting out the full
-          // 5s RELAY_TIMEOUT_MS per relay, which stalls the whole file.
-          setTimeout(() => (this.listeners.error || []).forEach((f) => f()), 0);
-        }
-        addEventListener(evt, fn) {
-          (this.listeners[evt] = this.listeners[evt] || []).push(fn);
-        }
-        close() {}
-        send() {}
-      }
-      vi.stubGlobal('WebSocket', SpyWS);
+      //
+      // Use reserved-domain hosts. A real constructor against 127.0.0.1 or
+      // relay.divine.video wedges vitest-pool-workers even when the test
+      // intended to fake WebSocket (CI Test on this head: worker onTaskUpdate
+      // timeout after the real sockets logged their errors).
+      const ws = installRecordingWebSocket();
       try {
         const env = {
-          NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+          NOSTR_PRIVATE_KEY: testHex,
           MODERATION_KV: mockKV,
-          DM_RELAY_URLS: 'ws://127.0.0.1:4444,ws://127.0.0.1:5555',
+          DM_RELAY_URLS: 'wss://relay.example.com,wss://other.example.com',
         };
 
         await sendModerationDM(recipient, 'c'.repeat(64), 'QUARANTINE', 'reason', env, null);
 
-        expect([...new Set(sockets)].sort()).toEqual(
-          ['ws://127.0.0.1:4444', 'ws://127.0.0.1:5555'],
+        expect([...new Set(ws.sockets)].sort()).toEqual(
+          ['wss://other.example.com', 'wss://relay.example.com'],
         );
       } finally {
-        vi.unstubAllGlobals();
+        ws.restore();
       }
     });
 
-    it('leaves the production default alone when DM_RELAY_URLS is absent', async () => {
-      mockKV.get.mockResolvedValue(null);
+    it('opens the same override sockets on the community-warning send path', async () => {
+      const ws = installRecordingWebSocket();
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: testHex,
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: 'wss://relay.example.com,wss://other.example.com',
+        };
+        const fakeWrap = () => ({
+          id: 'e'.repeat(64),
+          kind: 1059,
+          pubkey: 'f'.repeat(64),
+          created_at: 1,
+          tags: [['p', recipient]],
+          content: 'wrapped',
+          sig: '0'.repeat(128),
+        });
 
-      const relays = await discoverUserRelays('b'.repeat(64), { MODERATION_KV: mockKV });
+        await sendCommunityStrikeWarning(
+          recipient, 'warning', 'c'.repeat(64), env, null, { wrap: fakeWrap },
+        );
 
-      expect(relays).toContain('wss://relay.divine.video');
+        expect([...new Set(ws.sockets)].sort()).toEqual(
+          ['wss://other.example.com', 'wss://relay.example.com'],
+        );
+      } finally {
+        ws.restore();
+      }
+    });
+
+    it('treats an absent DM_RELAY_URLS as not contained', () => {
+      expect(isContained({})).toBe(false);
+      expect(parseRelayOverride({})).toEqual([]);
     });
   });
 });
