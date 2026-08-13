@@ -123,9 +123,27 @@ export function extractReportType(reportEvent) {
     || 'other';
 }
 
-export function isDivineClientReport(reportEvent) {
+// Kept in step with divine-relay-manager's TRUSTED_CLIENTS allowlist. The
+// single 'divine' literal this replaced predated divine-web, which tags
+// 'divine-web' and so failed the match for every report it ever sent.
+export const DEFAULT_TRUSTED_REPORT_CLIENTS = Object.freeze(['diVine', 'divine-web', 'divine-mobile']);
+
+export function parseTrustedReportClients(configured) {
+  const raw = typeof configured === 'string' ? configured : '';
+  const parsed = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
+  return (parsed.length ? parsed : DEFAULT_TRUSTED_REPORT_CLIENTS).map((entry) => entry.toLowerCase());
+}
+
+// A trust signal, never an ingestion gate. NIP-89 makes the `client` tag
+// optional and asks clients to let users opt out of it, NIP-56 defines no such
+// tag at all, and nothing signs it -- so its absence says nothing about the
+// report, and its presence proves nothing either. It may narrow what happens
+// automatically; it may not decide what gets seen.
+export function isTrustedClientReport(reportEvent, trustedClients = DEFAULT_TRUSTED_REPORT_CLIENTS) {
   const client = getEventTagValue(reportEvent?.tags || [], 'client');
-  return typeof client === 'string' && client.toLowerCase() === 'divine';
+  if (typeof client !== 'string') return false;
+  const normalized = client.trim().toLowerCase();
+  return trustedClients.some((trusted) => trusted.toLowerCase() === normalized);
 }
 
 export function shouldAcceptReportTarget(targetEvent) {
@@ -308,13 +326,15 @@ export async function pollRelayForReports(env, options = {}) {
   if (env.BLOSSOM_DB?.prepare) {
     await initReportsTable(env.BLOSSOM_DB);
   }
-  const requireDivineClient = env.RELAY_REPORTS_REQUIRE_DIVINE_CLIENT !== 'false';
+  const trustedClients = parseTrustedReportClients(env.TRUSTED_REPORT_CLIENTS);
 
   const results = {
     totalReports: 0,
     recorded: 0,
+    recordedUntrustedClient: 0,
     alreadyProcessed: 0,
     skipped: 0,
+    skippedByStatus: {},
     targetUnavailable: 0,
     errors: [],
     reports: [],
@@ -362,7 +382,7 @@ export async function pollRelayForReports(env, options = {}) {
           try {
             const outcome = await processReportEvent(report, {
               kv: env.MODERATION_KV,
-              requireDivineClient,
+              trustedClients,
               fetchTargetEvent,
               recordReport,
             });
@@ -370,6 +390,9 @@ export async function pollRelayForReports(env, options = {}) {
             results.reports.push(outcome);
             if (outcome.status === 'recorded') {
               results.recorded++;
+              if (outcome.trustedClient === false) {
+                results.recordedUntrustedClient++;
+              }
             } else if (outcome.status === 'already_processed') {
               results.alreadyProcessed++;
             } else if (outcome.status === 'target_unavailable') {
@@ -392,6 +415,10 @@ export async function pollRelayForReports(env, options = {}) {
               }
             } else {
               results.skipped++;
+              // A single `skipped` total is what let a 28.8% terminal drop rate
+              // look like normal operation for months. Keep the breakdown.
+              const status = outcome.status || 'unknown';
+              results.skippedByStatus[status] = (results.skippedByStatus[status] || 0) + 1;
             }
 
             if (
@@ -488,7 +515,7 @@ async function markProcessed(kv, key, payload, expirationTtl) {
 
 export async function processReportEvent(reportEvent, {
   kv,
-  requireDivineClient = true,
+  trustedClients = DEFAULT_TRUSTED_REPORT_CLIENTS,
   fetchTargetEvent,
   recordReport,
 } = {}) {
@@ -518,12 +545,7 @@ export async function processReportEvent(reportEvent, {
     return { status: 'skipped_invalid_reporter_pubkey' };
   }
 
-  if (requireDivineClient && !isDivineClientReport(reportEvent)) {
-    await markProcessed(kv, processedKey, {
-      status: 'skipped_non_divine_client',
-    }, TERMINAL_SKIP_TTL_SECONDS);
-    return { status: 'skipped_non_divine_client' };
-  }
+  const trustedClient = isTrustedClientReport(reportEvent, trustedClients);
 
   const targetEventId = extractReportTargetEventId(reportEvent);
   if (!targetEventId) {
@@ -557,7 +579,10 @@ export async function processReportEvent(reportEvent, {
     reporterPubkey: reportEvent.pubkey,
     reportType,
     reason: reportEvent.content || null,
-    source: 'relay-report',
+    // Untrusted-client reports are reviewed like any other, but land on a
+    // non-escalating source so they cannot contribute to the 2-reporter
+    // AGE_RESTRICTED threshold a later authenticated report would cross.
+    source: trustedClient ? 'relay-report' : 'relay-report-untrusted',
     reportedAt,
     reportEventId,
     targetEventId,
@@ -579,11 +604,13 @@ export async function processReportEvent(reportEvent, {
     sha256,
     reportType,
     targetEventId,
+    trustedClient,
     action: recordResult.action,
   }, RECORDED_TTL_SECONDS);
 
   return {
     status: 'recorded',
+    trustedClient,
     sha256,
     reportType,
     targetEventId,

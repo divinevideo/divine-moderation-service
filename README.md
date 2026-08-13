@@ -22,7 +22,7 @@ Because the service is report-driven, the queue consumer for the legacy `video-m
 ## Features
 
 - **Human review dashboard** — swipe-review queue, per-category verification (confirm/reject an individual detection), direct-message templates for creator communication, stats, and tunable classifier thresholds. Served behind Cloudflare Access on `moderation.admin.divine.video`.
-- **Report ingestion** — authenticated client reports, inbound public NIP-56 (kind `1984`) reports polled from the relay, and NIP-17 report DMs to the moderation@ inbox. Both Nostr paths are review-only and never auto-escalate, since client tags and reporter pubkeys are self-asserted public signals; report DMs additionally do not count toward the distinct-reporter threshold that the authenticated path escalates on. Only `POST /api/v1/report` can produce an automatic `AGE_RESTRICTED`.
+- **Report ingestion** — authenticated client reports, inbound public NIP-56 (kind `1984`) reports polled from the relay, and NIP-17 report DMs to the moderation@ inbox. Both Nostr paths are review-only and never auto-escalate, since client tags and reporter pubkeys are self-asserted public signals. A relay report is ingested whatever client it came from; the NIP-89 `client` tag only decides whether its reporter counts toward the distinct-reporter threshold the authenticated path escalates on — reports from clients outside `TRUSTED_REPORT_CLIENTS`, like report DMs, do not. Only `POST /api/v1/report` can produce an automatic `AGE_RESTRICTED`.
 - **Content categories** — nudity/NSFW, violence, gore, weapons, recreational drugs, self-harm, hate speech / offensive symbols, AI-generated, and deepfake, plus content-warning labels for alcohol, tobacco, medical, and gambling.
 - **AI-generation & provenance signals** (surfaced to moderators as review context, not auto-enforcement):
   - `divine-ai-detector` for per-signal detection, with vendor fallback to Hive and Reality Defender.
@@ -76,7 +76,7 @@ Bindings, routes, feature flags, and non-secret vars live in `wrangler.toml`. Hi
 | `TEAM_DOMAIN` | Cloudflare Access team domain for Zero Trust JWT verification. |
 | `RELAY_POLLING_*` | Relay video-event polling (URL, lookback, limit, enable). |
 | `REPORT_POLLING_*` | Inbound NIP-56 report polling (URL, lookback, limit, max pages). |
-| `RELAY_REPORTS_REQUIRE_DIVINE_CLIENT` | Only ingest reports tagged as sent by the Divine client. |
+| `TRUSTED_REPORT_CLIENTS` | Comma-separated NIP-89 `client` tags whose relay reports may drive automatic outcomes. Reports from any other client are still recorded for review, on a non-escalating source. |
 | `CREATOR_DELETE_PIPELINE_ENABLED` | Enable the kind `5` creator-delete cron. |
 | `AI_DETECTOR_BASE_URL` / `AI_DETECTOR_MODE_*` | `divine-ai-detector` endpoint and per-signal cutover mode. |
 | `INQUISITOR_BASE_URL` | `divine-inquisitor` C2PA / ProofMode service. |

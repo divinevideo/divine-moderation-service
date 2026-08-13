@@ -143,6 +143,61 @@ describe('reports', () => {
       expect(third).toMatchObject({ distinctReporterCount: 3, escalationReporterCount: 2 });
     });
 
+    // divine-mobile#6592: an untrusted-client relay report is reviewable, but
+    // its `client` tag is unsigned and user-suppressible, so it may not supply
+    // half the 2-reporter AGE_RESTRICTED threshold for a later real report.
+    it('counts a relay-report-untrusted reporter for display but not for escalation', async () => {
+      const first = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'relay-report-untrusted',
+      });
+      expect(first).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 0 });
+
+      const second = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER2,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+      expect(second).toMatchObject({ distinctReporterCount: 2, escalationReporterCount: 1 });
+    });
+
+    it('upgrades a relay-report-untrusted reporter who later reports through a trusted path', async () => {
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'relay-report-untrusted',
+      });
+
+      const afterTrusted = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'relay-report',
+      });
+      expect(afterTrusted).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+    });
+
+    it('never downgrades an escalation-eligible reporter to relay-report-untrusted', async () => {
+      await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'user-report',
+      });
+
+      const afterUntrusted = await addReport(db, {
+        sha256: SHA256,
+        reporter_pubkey: REPORTER1,
+        report_type: 'nudity',
+        source: 'relay-report-untrusted',
+      });
+      expect(afterUntrusted).toMatchObject({ distinctReporterCount: 1, escalationReporterCount: 1 });
+    });
+
     it('counts rows written before the source column toward escalation', async () => {
       // insertReport() writes no source, exactly like every row that predates
       // the column. Those came from the HTTP or relay paths, so they keep

@@ -5211,8 +5211,10 @@ async function runMigration() {
           const pollStats = {
             totalReports: results.totalReports,
             recorded: results.recorded,
+            recordedUntrustedClient: results.recordedUntrustedClient,
             alreadyProcessed: results.alreadyProcessed,
             skipped: results.skipped,
+            skippedByStatus: results.skippedByStatus,
             targetUnavailable: results.targetUnavailable,
             errors: results.errors.length,
             safeCheckpoint: results.safeCheckpoint,
