@@ -24,8 +24,7 @@ export const MAX_RELAYS = 5;
  * @returns {boolean}
  */
 export function isContained(env) {
-  const raw = env?.DM_RELAY_URLS;
-  return raw !== undefined && raw !== null;
+  return env != null && Object.prototype.hasOwnProperty.call(env, 'DM_RELAY_URLS');
 }
 
 /**

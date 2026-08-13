@@ -493,6 +493,8 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
     // downstream as success===0, an ambiguous send that makes the sweep retain a
     // warning claim and never resend it.
     for (const [name, value] of [
+      ['null', null],
+      ['explicit undefined', undefined],
       ['a TOML array, which wrangler accepts in vars', ['ws://127.0.0.1:4444']],
       ['a number', 4444],
       ['an object', { url: 'ws://127.0.0.1:4444' }],
@@ -510,7 +512,10 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       });
     }
 
-    it('sends nothing when the override is unusable, rather than falling back', async () => {
+    it.each([
+      ['null', null],
+      ['a TOML array', ['ws://127.0.0.1:4444']],
+    ])('sends nothing when the override is %s, rather than falling back', async (_name, value) => {
       // Proving parseRelayOverride throws is not the same as proving no DM is
       // sent. All three send entry points wrap discovery in a catch-all, so a
       // try/catch that restored the production list would swallow the refusal
@@ -520,7 +525,7 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
         const env = {
           NOSTR_PRIVATE_KEY: 'a'.repeat(64),
           MODERATION_KV: mockKV,
-          DM_RELAY_URLS: ['ws://127.0.0.1:4444'],
+          DM_RELAY_URLS: value,
         };
 
         // Real recipient pubkey and the real 7-arg signature. An earlier version

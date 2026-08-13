@@ -444,6 +444,8 @@ describe('DM inbox relay list (kind 10050)', () => {
   });
 
   it.each([
+    ['null', null],
+    ['explicit undefined', undefined],
     ['a TOML array, which wrangler accepts in vars', ['ws://127.0.0.1:4444']],
     ['a number', 4444],
     ['whitespace only', '   '],
