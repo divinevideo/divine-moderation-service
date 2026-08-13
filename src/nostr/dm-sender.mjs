@@ -8,6 +8,7 @@ import { wrapEvent } from 'nostr-tools/nip17';
 import { hexToBytes } from '@noble/hashes/utils';
 import { getPublicKey } from 'nostr-tools/pure';
 import { logDm, computeConversationId } from './dm-store.mjs';
+import { parseRelayOverride, MAX_RELAYS } from './relay-override.mjs';
 
 // Cache moderator keys per env object to avoid re-decoding
 const keyCache = new WeakMap();
@@ -20,7 +21,6 @@ const DEFAULT_RELAYS = [
 
 const DIVINE_RELAY = 'wss://relay.divine.video';
 
-const MAX_RELAYS = 5;
 const RATE_LIMIT_WINDOW_SEC = 60;
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_TTL_SEC = 120;
@@ -337,11 +337,24 @@ async function recordRateLimit(recipientPubkey, env) {
  * Checks KV cache first, then queries relay.divine.video.
  * Always includes relay.divine.video. Caps at MAX_RELAYS.
  *
+ * When `DM_RELAY_URLS` is set it short-circuits all of that and becomes the
+ * exact publish target list. See parseRelayOverride.
+ *
  * @param {string} pubkey - Hex pubkey of user
  * @param {Object} env
  * @returns {Promise<string[]>} Relay URLs
  */
 export async function discoverUserRelays(pubkey, env) {
+  // A configured override is the complete target list: no cache read, no
+  // kind-10002 discovery, no implicit DIVINE_RELAY. Both of those would
+  // otherwise reintroduce a production relay, which is the whole thing this
+  // exists to prevent.
+  const override = parseRelayOverride(env);
+  if (override.length > 0) {
+    console.log(`[DM] Using DM_RELAY_URLS override (${override.length} relays)`);
+    return override;
+  }
+
   // Check KV cache
   if (env.MODERATION_KV) {
     try {

@@ -23,6 +23,7 @@ import {
   renderComposeTemplate,
   publishToRelays,
 } from './dm-sender.mjs';
+import { isContained, parseRelayOverride } from './relay-override.mjs';
 import { createMockKV } from '../test/helpers.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
@@ -342,6 +343,305 @@ describe('DM Sender - discoverUserRelays', () => {
 
     expect(relays.length).toBeGreaterThan(0);
     expect(relays).toContain('wss://relay.divine.video');
+  });
+});
+
+// vitest-pool-workers does not reliably honor vi.stubGlobal('WebSocket').
+// Assigning globalThis.WebSocket and using reserved-domain hosts is the
+// pattern the rest of this file already uses: 127.0.0.1 and relay.divine.video
+// construct a real socket and wedge the worker RPC (CI Test on this PR hung
+// for 60s after the contained happy-path test, then died on onTaskUpdate).
+function installRecordingWebSocket() {
+  const sockets = [];
+  const original = globalThis.WebSocket;
+  class FakeWS {
+    constructor(url) {
+      sockets.push(url);
+      this._cbs = {};
+      queueMicrotask(() => this._cbs.error && this._cbs.error());
+    }
+    addEventListener(type, cb) { this._cbs[type] = cb; }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = FakeWS;
+  return {
+    sockets,
+    restore() { globalThis.WebSocket = original; },
+  };
+}
+
+describe('DM Sender - DM_RELAY_URLS override', () => {
+  let mockKV;
+
+  beforeEach(() => {
+    mockKV = { get: vi.fn(), put: vi.fn() };
+  });
+
+  it('publishes only to DM_RELAY_URLS when set', async () => {
+    mockKV.get.mockResolvedValue(null);
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://127.0.0.1:4444']);
+    expect(relays).not.toContain('wss://relay.divine.video');
+  });
+
+  it('ignores the KV relay cache when DM_RELAY_URLS is set', async () => {
+    // Containment must not be defeatable by a cache entry written before the
+    // override was configured.
+    mockKV.get.mockResolvedValue(JSON.stringify(['wss://relay.damus.io']));
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://127.0.0.1:4444']);
+  });
+
+  it('does not write the override list back into the KV cache', async () => {
+    // Caching it would leak a local/staging relay into a later prod-configured
+    // run of the same worker against the same namespace.
+    mockKV.get.mockResolvedValue(null);
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    await discoverUserRelays('b'.repeat(64), env);
+
+    expect(mockKV.put).not.toHaveBeenCalled();
+  });
+
+  it('parses a comma-separated list, trimming blanks', async () => {
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: ' ws://127.0.0.1:4444 , ,ws://127.0.0.1:5555 ',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://127.0.0.1:4444', 'ws://127.0.0.1:5555']);
+  });
+
+  it('still caps the override at MAX_RELAYS', async () => {
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: [
+        'ws://r1', 'ws://r2', 'ws://r3', 'ws://r4', 'ws://r5', 'ws://r6',
+      ].join(','),
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toHaveLength(5);
+  });
+
+  it('dedupes before capping, so a distinct relay is not crowded out', async () => {
+    // Without dedupe the cap consumes the duplicates and drops the one relay
+    // that was actually different, while the send path still reports five
+    // successes -- a single-relay delivery that reads as five-relay redundancy.
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://a,ws://a,ws://a,ws://a,ws://a,ws://b',
+    };
+
+    const relays = await discoverUserRelays('b'.repeat(64), env);
+
+    expect(relays).toEqual(['ws://a', 'ws://b']);
+  });
+
+  it('does not read the cache or open a discovery socket when the override is set', async () => {
+    // The other override tests assert the resulting list, which stays correct
+    // even if discovery still runs and its result is discarded. That would mean
+    // a "contained" run opening a socket to the production relay on every DM,
+    // invisibly. Assert the calls that must not happen, not just the answer.
+    mockKV.get.mockResolvedValue(null);
+    const ws = installRecordingWebSocket();
+    try {
+      const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: 'ws://127.0.0.1:4444' };
+
+      await discoverUserRelays('b'.repeat(64), env);
+
+      expect(mockKV.get).not.toHaveBeenCalled();
+      expect(ws.sockets).toEqual([]);
+    } finally {
+      ws.restore();
+    }
+  });
+
+  describe('set but unusable', () => {
+    // A real x-only pubkey. Crypto in this path is real, not mocked, so a made-up
+    // hex string throws inside wrapEvent long before containment is consulted --
+    // which is exactly how two tests in this block came to assert nothing.
+    const recipient = getPublicKey(generateSecretKey());
+
+    // The whole point of this variable is that an operator who sets it has said
+    // "do not send outside this list". Quietly falling back to the production
+    // defaults honours the opposite of what they asked for, and does it silently:
+    // there is no log distinguishing a bad value from an unset one.
+    //
+    // So a value that is PRESENT and unusable is a configuration error, and it
+    // refuses rather than sends. Unset remains the production default and is
+    // unaffected. Returning an empty list instead is not an option -- it reads
+    // downstream as success===0, an ambiguous send that makes the sweep retain a
+    // warning claim and never resend it.
+    for (const [name, value] of [
+      ['null', null],
+      ['explicit undefined', undefined],
+      ['a TOML array, which wrangler accepts in vars', ['ws://127.0.0.1:4444']],
+      ['a number', 4444],
+      ['an object', { url: 'ws://127.0.0.1:4444' }],
+      ['whitespace only', '   '],
+      ['separators only', ' , , '],
+      ['an empty string', ''],
+    ]) {
+      it(`refuses to send when DM_RELAY_URLS is ${name}`, async () => {
+        mockKV.get.mockResolvedValue(null);
+        const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: value };
+
+        await expect(discoverUserRelays('b'.repeat(64), env)).rejects.toThrow(
+          /DM_RELAY_URLS/,
+        );
+      });
+    }
+
+    it.each([
+      ['null', null],
+      ['a TOML array', ['ws://127.0.0.1:4444']],
+    ])('sends nothing when the override is %s, rather than falling back', async (_name, value) => {
+      // Proving parseRelayOverride throws is not the same as proving no DM is
+      // sent. All three send entry points wrap discovery in a catch-all, so a
+      // try/catch that restored the production list would swallow the refusal
+      // and pass every other test in this file.
+      const ws = installRecordingWebSocket();
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: value,
+        };
+
+        // Real recipient pubkey and the real 7-arg signature. An earlier version
+        // of this test passed 3 args, so `env` landed in the `action` slot and the
+        // function crashed on an undefined env before reaching any containment
+        // code -- it passed with DM_RELAY_URLS support deleted entirely.
+        const result = await sendModerationDM(
+          recipient, 'c'.repeat(64), 'QUARANTINE', 'reason', env, null,
+        );
+
+        expect(result.sent).toBe(false);
+        // The point: no socket to any relay, production or otherwise.
+        expect(ws.sockets).toEqual([]);
+      } finally {
+        ws.restore();
+      }
+    });
+
+    it('reports an unusable override as a DEFINITIVE non-send, so warnings are not swallowed', async () => {
+      // `definitive` decides what the community-strike sweep does with a failure.
+      // A no-send that is definitive releases the claim; a non-definitive one is
+      // ambiguous, so the sweep RETAINS the claim and never resends. That is the
+      // outcome the throw exists to avoid, reached by a different route than the
+      // empty-list return the parser guards against.
+      //
+      // Nothing pinned this: moving `publishAttempted = true` above the discovery
+      // call turns every misconfigured warning into a permanent silent swallow,
+      // and the whole suite still passed.
+      const ws = installRecordingWebSocket();
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: ['ws://127.0.0.1:4444'],
+        };
+
+        // A REAL pubkey. With 'b'.repeat(64) the real wrapEvent throws first
+        // ("Cannot find square root"), so the definitive:true being asserted came
+        // from an invalid-pubkey crypto failure rather than from the containment
+        // refusal -- and the mutation this test exists to catch survived.
+        const result = await sendCommunityStrikeWarning(
+          recipient, 'warning', 'c'.repeat(64), env, null,
+        );
+
+        expect(result.sent).toBe(false);
+        expect(result.definitive).toBe(true);
+        expect(result.reason).toMatch(/DM_RELAY_URLS/);
+        expect(ws.sockets).toEqual([]);
+      } finally {
+        ws.restore();
+      }
+    });
+
+    it('opens sockets to exactly the override relays on the contained happy path', async () => {
+      // Everything else here pins discoverUserRelays' RETURN VALUE, or pins that
+      // nothing is sent when the override is unusable. Neither sees what
+      // publishToRelays is actually handed once containment succeeds: appending
+      // the production relay to the list at all three call sites passed the full
+      // 1579-test suite. Assert the transport, not the answer.
+      //
+      // Use reserved-domain hosts. A real constructor against 127.0.0.1 or
+      // relay.divine.video wedges vitest-pool-workers even when the test
+      // intended to fake WebSocket (CI Test on this head: worker onTaskUpdate
+      // timeout after the real sockets logged their errors).
+      const ws = installRecordingWebSocket();
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: testHex,
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: 'wss://relay.example.com,wss://other.example.com',
+        };
+
+        await sendModerationDM(recipient, 'c'.repeat(64), 'QUARANTINE', 'reason', env, null);
+
+        expect([...new Set(ws.sockets)].sort()).toEqual(
+          ['wss://other.example.com', 'wss://relay.example.com'],
+        );
+      } finally {
+        ws.restore();
+      }
+    });
+
+    it('opens the same override sockets on the community-warning send path', async () => {
+      const ws = installRecordingWebSocket();
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: testHex,
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: 'wss://relay.example.com,wss://other.example.com',
+        };
+        const fakeWrap = () => ({
+          id: 'e'.repeat(64),
+          kind: 1059,
+          pubkey: 'f'.repeat(64),
+          created_at: 1,
+          tags: [['p', recipient]],
+          content: 'wrapped',
+          sig: '0'.repeat(128),
+        });
+
+        await sendCommunityStrikeWarning(
+          recipient, 'warning', 'c'.repeat(64), env, null, { wrap: fakeWrap },
+        );
+
+        expect([...new Set(ws.sockets)].sort()).toEqual(
+          ['wss://other.example.com', 'wss://relay.example.com'],
+        );
+      } finally {
+        ws.restore();
+      }
+    });
+
+    it('treats an absent DM_RELAY_URLS as not contained', () => {
+      expect(isContained({})).toBe(false);
+      expect(parseRelayOverride({})).toEqual([]);
+    });
   });
 });
 

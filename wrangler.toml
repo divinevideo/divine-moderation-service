@@ -144,6 +144,54 @@ AI_DETECTOR_MODE_WATERMARK_VISIBLE = "shadow"
 # threshold; 0.7 is moderate. Tune from shadow-mode agreement data.
 AI_DETECTOR_GATE_WATERMARK_VISIBLE = "0.8"
 
+# Outbound NIP-17 DM publish targets. UNSET in production on purpose: the DM
+# paths then use their built-in list (relay.divine.video plus the user's own
+# NIP-65 read relays, falling back to damus/primal/nos.lol).
+#
+# Set it — comma-separated — and it becomes the exact and only publish target
+# list, skipping both the KV relay cache and kind-10002 discovery. That is the
+# only way to run this Worker outside production with a real signing key without
+# DMs reaching real users, because the default relays are module constants in
+# src/nostr/dm-sender.mjs and are otherwise unreachable from config.
+#
+# Any non-production deployment that sets NOSTR_PRIVATE_KEY must set this too.
+# DM_RELAY_URLS = "ws://127.0.0.1:4444"
+#
+# Must be a comma-separated STRING. `vars` accepts any JSON, so the TOML list
+# form DM_RELAY_URLS = ["ws://..."] deploys cleanly and arrives as an array;
+# that is refused at send time rather than silently falling back to production.
+#
+# Setting it contains two of the five paths that PUBLISH NOSTR EVENTS with
+# NOSTR_PRIVATE_KEY: the DM send path, and the kind-10050 inbox announcement.
+# It is NOT a global containment switch. Read the list below before running this
+# with a real key.
+#
+# The announcement also needs RELAY_POLLING_RELAY_URL to name one of these relays,
+# because that is what it announces AS the inbox. If it names anything else the
+# announcement is skipped rather than published outside the containment, and the
+# log says which relay was refused. Note this file sets RELAY_POLLING_RELAY_URL to
+# the production relay below, so a contained run must override it.
+#
+# NOT contained, and worth knowing before you run this with a real key:
+#
+#   - notifyRelay (src/relay-notifier.mjs) signs a NIP-98 token with the same key
+#     and POSTs to FUNNELCAKE_ADMIN_URL, which this file also points at
+#     relay.divine.video. It fires on ordinary moderation actions, so a QUARANTINE
+#     from a contained run hides a real video on the production relay. Override
+#     FUNNELCAKE_ADMIN_URL too, or leave enforcement alone in a non-prod run.
+#   - publishToFaro (kind 1984) -> FARO_RELAY_URL, publishToContentRelay
+#     (kind 1984) -> NOSTR_RELAY_URL, and publishPreparedLabelEvent (kind 1985
+#     content-warning labels) -> NOSTR_RELAY_URL || FARO_RELAY_URL. All three sign
+#     with the same key. Both variables are SECRETS rather than vars, so leaving
+#     them unset is working containment: publishToFaro throws and the other two
+#     return early. That is real but non-obvious, and it breaks the moment someone
+#     copies production secrets into a staging deploy -- a normal thing to do.
+#     The community sweep publishes a kind-1985 label alongside the (contained)
+#     strike DM, so that is the likeliest way to trip it.
+#   - The read paths (dm-reader, report-poller, relay-poller, profile-resolver)
+#     read from production by default. They publish nothing and contact no user,
+#     so DM containment holds, but a contained run is not offline.
+
 # Relay Polling Configuration
 RELAY_POLLING_ENABLED = "true"                    # Enable/disable relay polling
 RELAY_POLLING_RELAY_URL = "wss://relay.divine.video"  # Relay to poll for new video events

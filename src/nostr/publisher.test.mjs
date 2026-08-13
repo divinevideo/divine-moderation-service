@@ -443,6 +443,135 @@ describe('DM inbox relay list (kind 10050)', () => {
     expect(inboxRelays).toEqual(['wss://relay.divine.video']);
   });
 
+  it.each([
+    ['null', null],
+    ['explicit undefined', undefined],
+    ['a TOML array, which wrangler accepts in vars', ['ws://127.0.0.1:4444']],
+    ['a number', 4444],
+    ['whitespace only', '   '],
+    ['separators only', ' , , '],
+    ['an empty string', ''],
+  ])('treats a present-but-unusable DM_RELAY_URLS as contained: %s', async (_name, value) => {
+    // The DM path refuses to send on these values. If this path disagreed and
+    // took the production branch, the exact misconfiguration the refusal exists
+    // to catch would announce moderation@'s DM inbox to purplepag.es,
+    // relay.nostr.band and relay.damus.io, overwriting the real record there.
+    //
+    // Present-and-unparseable means refuse, never "carry on as production".
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'ws://127.0.0.1:4444',
+      DM_RELAY_URLS: value,
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    // An unusable override means nothing is allowed, so nothing is announced.
+    // Asserting only that the aggregators are absent is what hid a home relay
+    // pointing at production.
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the home relay is not in the override, even though it is set', async () => {
+    // The guard used to ask whether RELAY_POLLING_RELAY_URL was UNSET. wrangler.toml
+    // sets it to wss://relay.divine.video in the single shared [vars] block, so it
+    // is set in every deploy and every `wrangler dev` -- the guard never fired in
+    // any configuration this repo ships, and a contained run published a signed,
+    // replaceable kind-10050 to the production relay.
+    //
+    // Containment is a property of the TARGET, not of which variables happen to be
+    // defined. This fixture is deliberately the one no other test here uses: a home
+    // relay that is NOT the override value.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const result = await publishDmInboxRelayList(env, { connect });
+
+    expect(connect).not.toHaveBeenCalled();
+    expect(result.published).toBe(false);
+  });
+
+  it('announces when the home relay IS in the override', async () => {
+    // The pair: a genuinely contained run still gets its announcement, to its own
+    // relay only. Without this the guard could be satisfied by refusing always.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'ws://127.0.0.1:4444',
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444,ws://127.0.0.1:5555',
+    };
+
+    const result = await publishDmInboxRelayList(env, { connect });
+
+    expect(connect.mock.calls.map((c) => c[0])).toEqual(['ws://127.0.0.1:4444']);
+    expect(result.published).toBe(true);
+  });
+
+  it('refuses to announce at all when contained without an explicit home relay', async () => {
+    // homeRelay falls back to the production relay and is unconditionally a
+    // target, so suppressing the discovery relays alone does not contain this
+    // path: a run declared contained still publishes a freshly-signed,
+    // REPLACEABLE kind-10050 to relay.divine.video with the real key.
+    //
+    // Containment must not depend on remembering a second, undocumented variable.
+    // With no explicit home relay there is nothing safe to announce, so it skips.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    const result = await publishDmInboxRelayList(env, { connect });
+
+    expect(connect).not.toHaveBeenCalled();
+    expect(result.published).toBe(false);
+    expect(result.reason).toMatch(/DM_RELAY_URLS/);
+  });
+
+  it('does not announce to public relays when DM_RELAY_URLS contains the run', async () => {
+    // DM_RELAY_URLS says "this run must not reach outside these relays". This is
+    // the second path that publishes with the signing key, and its discovery
+    // fallback is three public relays plus the production one.
+    //
+    // Uncontained, a local run announces "moderation@'s DM inbox is
+    // ws://127.0.0.1:4444" to purplepag.es, relay.nostr.band and relay.damus.io,
+    // overwriting the real kind-10050 there. Strict NIP-17 clients then cannot
+    // deliver DMs to the moderation account until it is republished.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'ws://127.0.0.1:4444',
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    const targets = connect.mock.calls.map((c) => c[0]);
+    expect(targets).toEqual(['ws://127.0.0.1:4444']);
+    expect(targets).not.toContain('wss://purplepag.es');
+    expect(targets).not.toContain('wss://relay.divine.video');
+  });
+
+  it('still announces to the public discovery relays in production', async () => {
+    // The pair to the above: unset DM_RELAY_URLS is production, where announcing
+    // widely is the entire point of a kind-10050.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    const targets = connect.mock.calls.map((c) => c[0]);
+    expect(targets).toContain('wss://purplepag.es');
+  });
+
   it('returns {published:false} when no signing key is configured', async () => {
     const result = await publishDmInboxRelayList({});
     expect(result.published).toBe(false);
