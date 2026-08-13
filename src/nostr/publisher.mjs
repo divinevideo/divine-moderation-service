@@ -471,19 +471,33 @@ export async function publishDmInboxRelayList(env, { connect = Relay.connect } =
     // empty allowlist. Caught rather than propagated because this function has
     // never thrown and its callers do not expect it to.
     let allowed = [];
+    let parseError = null;
     try {
       allowed = parseRelayOverride(env);
-    } catch {
+    } catch (err) {
+      // Keep the message. Discarding it left the operator with the skip warning
+      // below telling them to fix RELAY_POLLING_RELAY_URL when that variable was
+      // already correct and the real fault was an unparseable list -- advice that
+      // could not work, for a problem it did not name.
+      parseError = err.message;
       allowed = [];
     }
     if (!allowed.includes(homeRelay)) {
       console.warn(
-        `[DM-INBOX] Skipping the kind-10050 announcement: this run is contained by ` +
-          `DM_RELAY_URLS but its inbox relay (${homeRelay}) is not in that list, so ` +
-          `announcing would publish outside the containment. Set ` +
-          `RELAY_POLLING_RELAY_URL to one of the DM_RELAY_URLS relays.`,
+        parseError
+          ? `[DM-INBOX] Skipping the kind-10050 announcement: DM_RELAY_URLS is set ` +
+            `but unusable, so nothing is allowed. ${parseError}`
+          : `[DM-INBOX] Skipping the kind-10050 announcement: this run is contained ` +
+            `by DM_RELAY_URLS but its inbox relay (${homeRelay}) is not in that list, ` +
+            `so announcing would publish outside the containment. Set ` +
+            `RELAY_POLLING_RELAY_URL to one of the DM_RELAY_URLS relays.`,
       );
-      return { published: false, reason: 'Contained run: home relay is not in DM_RELAY_URLS' };
+      return {
+        published: false,
+        reason: parseError
+          ? 'Contained run: DM_RELAY_URLS is unusable'
+          : 'Contained run: home relay is not in DM_RELAY_URLS',
+      };
     }
   }
   const inboxRelays = [homeRelay];

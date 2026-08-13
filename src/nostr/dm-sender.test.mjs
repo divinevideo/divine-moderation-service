@@ -461,6 +461,11 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
   });
 
   describe('set but unusable', () => {
+    // A real x-only pubkey. Crypto in this path is real, not mocked, so a made-up
+    // hex string throws inside wrapEvent long before containment is consulted --
+    // which is exactly how two tests in this block came to assert nothing.
+    const recipient = getPublicKey(generateSecretKey());
+
     // The whole point of this variable is that an operator who sets it has said
     // "do not send outside this list". Quietly falling back to the production
     // defaults honours the opposite of what they asked for, and does it silently:
@@ -512,7 +517,13 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
           DM_RELAY_URLS: ['ws://127.0.0.1:4444'],
         };
 
-        const result = await sendModerationDM('b'.repeat(64), 'hello', env);
+        // Real recipient pubkey and the real 7-arg signature. An earlier version
+        // of this test passed 3 args, so `env` landed in the `action` slot and the
+        // function crashed on an undefined env before reaching any containment
+        // code -- it passed with DM_RELAY_URLS support deleted entirely.
+        const result = await sendModerationDM(
+          recipient, 'c'.repeat(64), 'QUARANTINE', 'reason', env, null,
+        );
 
         expect(result.sent).toBe(false);
         // The point: no socket to any relay, production or otherwise.
@@ -550,13 +561,59 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
           DM_RELAY_URLS: ['ws://127.0.0.1:4444'],
         };
 
+        // A REAL pubkey. With 'b'.repeat(64) the real wrapEvent throws first
+        // ("Cannot find square root"), so the definitive:true being asserted came
+        // from an invalid-pubkey crypto failure rather than from the containment
+        // refusal -- and the mutation this test exists to catch survived.
         const result = await sendCommunityStrikeWarning(
-          'b'.repeat(64), 'warning', 'c'.repeat(64), env, null,
+          recipient, 'warning', 'c'.repeat(64), env, null,
         );
 
         expect(result.sent).toBe(false);
         expect(result.definitive).toBe(true);
+        expect(result.reason).toMatch(/DM_RELAY_URLS/);
         expect(sockets).toEqual([]);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('opens sockets to exactly the override relays on the contained happy path', async () => {
+      // Everything else here pins discoverUserRelays' RETURN VALUE, or pins that
+      // nothing is sent when the override is unusable. Neither sees what
+      // publishToRelays is actually handed once containment succeeds: appending
+      // the production relay to the list at all three call sites passed the full
+      // 1579-test suite. Assert the transport, not the answer.
+      const sockets = [];
+      class SpyWS {
+        constructor(url) {
+          sockets.push(url);
+          this.readyState = 3;
+          this.listeners = {};
+          // Fire 'error' via addEventListener, which is what publishToSingleRelay
+          // actually listens on. A no-op listener leaves it waiting out the full
+          // 5s RELAY_TIMEOUT_MS per relay, which stalls the whole file.
+          setTimeout(() => (this.listeners.error || []).forEach((f) => f()), 0);
+        }
+        addEventListener(evt, fn) {
+          (this.listeners[evt] = this.listeners[evt] || []).push(fn);
+        }
+        close() {}
+        send() {}
+      }
+      vi.stubGlobal('WebSocket', SpyWS);
+      try {
+        const env = {
+          NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+          MODERATION_KV: mockKV,
+          DM_RELAY_URLS: 'ws://127.0.0.1:4444,ws://127.0.0.1:5555',
+        };
+
+        await sendModerationDM(recipient, 'c'.repeat(64), 'QUARANTINE', 'reason', env, null);
+
+        expect([...new Set(sockets)].sort()).toEqual(
+          ['ws://127.0.0.1:4444', 'ws://127.0.0.1:5555'],
+        );
       } finally {
         vi.unstubAllGlobals();
       }
