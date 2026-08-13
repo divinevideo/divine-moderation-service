@@ -37,14 +37,6 @@ export async function initReportsTable(db) {
   }
 }
 
-// The one report source whose reporter identity is not established well enough
-// to count toward an automatic moderation outcome. A `dm-report` reporter is
-// whatever key reached the moderation inbox over NIP-17: nothing signs for the
-// reported sha256, nothing proves the key belongs to a distinct person, and
-// minting fresh keys is free. Such a report is still recorded and still shown
-// to a human -- it just cannot be one of the two "distinct reporters" that
-// auto age-restriction counts, or a single actor could supply both halves of
-// the threshold the authenticated path relies on.
 /**
  * Whether this reporter already has a row for this sha256.
  *
@@ -65,7 +57,14 @@ export async function findReportByReporter(db, sha256, reporterPubkey) {
   ).bind(sha256, reporterPubkey).first();
 }
 
-const NON_ESCALATING_SOURCE = 'dm-report';
+// Sources whose reporters may never drive an automatic outcome, and so are
+// excluded from escalationReporterCount. A report DM is the least verified
+// path; an untrusted-client relay report carries an unauthenticated, optional
+// NIP-89 `client` tag that anyone can forge, so neither may supply part of the
+// AGE_RESTRICTED threshold. Both are still recorded for human review.
+export const NON_ESCALATING_SOURCES = Object.freeze(['dm-report', 'relay-report-untrusted']);
+
+const nonEscalatingPlaceholders = NON_ESCALATING_SOURCES.map(() => '?').join(', ');
 
 /**
  * Insert a report and return two reporter counts, so callers can apply
@@ -105,17 +104,17 @@ export async function addReport(db, { sha256, reporter_pubkey, report_type, reas
   //
   // So upgrade on conflict, in one direction only: once a reporter has been
   // seen through a path that may drive an automatic outcome, that sticks. A
-  // later report DM never downgrades a reporter the HTTP or relay path
-  // already established. Everything else about the row stays first-write-wins
-  // -- `report_type`, `reason` and `created_at` keep the report of record as
-  // it was first filed.
+  // later report DM or untrusted-client relay report never downgrades a
+  // reporter the HTTP or trusted relay path already established. Everything
+  // else about the row stays first-write-wins -- `report_type`, `reason` and
+  // `created_at` keep the report of record as it was first filed.
   await db.prepare(`
     INSERT OR IGNORE INTO user_reports (sha256, reporter_pubkey, report_type, reason, created_at, source)
     VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)
     ON CONFLICT(sha256, reporter_pubkey) DO UPDATE SET source = excluded.source
-      WHERE user_reports.source = ?
+      WHERE user_reports.source IN (${nonEscalatingPlaceholders})
         AND excluded.source IS NOT NULL
-        AND excluded.source <> ?
+        AND excluded.source NOT IN (${nonEscalatingPlaceholders})
   `).bind(
     sha256,
     reporter_pubkey,
@@ -123,19 +122,19 @@ export async function addReport(db, { sha256, reporter_pubkey, report_type, reas
     reason ?? null,
     created_at ?? null,
     source ?? null,
-    NON_ESCALATING_SOURCE,
-    NON_ESCALATING_SOURCE,
+    ...NON_ESCALATING_SOURCES,
+    ...NON_ESCALATING_SOURCES,
   ).run();
 
   const row = await db.prepare(`
     SELECT
       COUNT(DISTINCT reporter_pubkey) AS cnt,
       COUNT(DISTINCT CASE
-        WHEN source IS NULL OR source <> ? THEN reporter_pubkey
+        WHEN source IS NULL OR source NOT IN (${nonEscalatingPlaceholders}) THEN reporter_pubkey
       END) AS escalation_cnt
     FROM user_reports
     WHERE sha256 = ?
-  `).bind(NON_ESCALATING_SOURCE, sha256).first();
+  `).bind(...NON_ESCALATING_SOURCES, sha256).first();
 
   return {
     distinctReporterCount: row?.cnt ?? 0,

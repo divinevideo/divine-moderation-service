@@ -3678,7 +3678,7 @@ describe('Report polling cron integration', () => {
       REPORT_POLLING_RELAY_URL: 'wss://reports.example.test',
       REPORT_POLLING_LOOKBACK_HOURS: '24',
       REPORT_POLLING_LIMIT: '100',
-      RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+      TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       BLOSSOM_DB: createDbMock({ moderationWrites }),
       MODERATION_KV: {
         async get(key) {

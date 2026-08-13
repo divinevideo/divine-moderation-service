@@ -6,6 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { recordReportForReview } from './report-review.mjs';
+import { NON_ESCALATING_SOURCES } from '../reports.mjs';
 
 const SHA = 'a'.repeat(64);
 const REPORTER = 'b'.repeat(64);
@@ -90,8 +91,9 @@ describe('recordReportForReview', () => {
       aiTelemetryRecorded: false,
     });
     expect(userReportWrites).toHaveLength(1);
-    // The trailing pair is the conflict guard: upgrade the stored source only
-    // when it is 'dm-report' and the incoming one is not.
+    // The row itself, then the conflict guard: upgrade the stored source only
+    // when it is one of the non-escalating sources and the incoming one is not.
+    // The guard binds that list twice — once per IN clause.
     expect(userReportWrites[0].bindings).toEqual([
       SHA,
       REPORTER,
@@ -99,8 +101,8 @@ describe('recordReportForReview', () => {
       'reported from relay',
       '2026-05-13T17:19:42.000Z',
       'relay-report',
-      'dm-report',
-      'dm-report',
+      ...NON_ESCALATING_SOURCES,
+      ...NON_ESCALATING_SOURCES,
     ]);
     expect(userReportWrites[0].sql).toMatch(/ON CONFLICT\(sha256, reporter_pubkey\) DO UPDATE SET source = excluded\.source/i);
     expect(moderationWrites).toHaveLength(1);

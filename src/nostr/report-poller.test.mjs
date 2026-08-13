@@ -11,7 +11,9 @@ import {
   fetchReportsFromRelay,
   getReportPollingStatus,
   getLastReportPollTimestamp,
-  isDivineClientReport,
+  isTrustedClientReport,
+  parseTrustedReportClients,
+  DEFAULT_TRUSTED_REPORT_CLIENTS,
   pollRelayForReports,
   processReportEvent,
   processedReportKey,
@@ -193,23 +195,33 @@ describe('kind 1984 parsing', () => {
     });
   });
 
-  it('detects reports from the diVine client tag', () => {
-    expect(isDivineClientReport({
-      kind: 1984,
-      tags: [['client', 'diVine']],
-    })).toBe(true);
+  it('trusts every first-party client tag, case-insensitively', () => {
+    for (const client of ['diVine', 'Divine', 'divine-web', 'divine-mobile', 'DIVINE-WEB']) {
+      expect(isTrustedClientReport({ kind: 1984, tags: [['client', client]] })).toBe(true);
+    }
   });
 
-  it('rejects non-diVine client reports when the client tag is absent', () => {
-    expect(isDivineClientReport({
+  it('does not trust third-party or absent client tags', () => {
+    expect(isTrustedClientReport({
       kind: 1984,
       tags: [['client', 'Amethyst']],
     })).toBe(false);
 
-    expect(isDivineClientReport({
+    expect(isTrustedClientReport({
       kind: 1984,
       tags: [],
     })).toBe(false);
+  });
+
+  it('falls back to the default allowlist when TRUSTED_REPORT_CLIENTS is unset or blank', () => {
+    for (const configured of [undefined, '', '   ', ',,']) {
+      expect(parseTrustedReportClients(configured))
+        .toEqual(DEFAULT_TRUSTED_REPORT_CLIENTS.map((entry) => entry.toLowerCase()));
+    }
+  });
+
+  it('parses a configured allowlist, trimming and lowercasing entries', () => {
+    expect(parseTrustedReportClients(' diVine , Nostria ')).toEqual(['divine', 'nostria']);
   });
 
   it('accepts only video target events with a media sha', () => {
@@ -250,7 +262,7 @@ describe('processReportEvent', () => {
       content: 'Reason: aiGenerated',
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async (eventId) => (eventId === TARGET_EVENT_ID ? TARGET : null),
       recordReport: async (payload) => {
         recorded.push(payload);
@@ -300,7 +312,7 @@ describe('processReportEvent', () => {
       content: 'Needs review',
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async () => TARGET,
       recordReport: async () => ({
         success: true,
@@ -334,7 +346,7 @@ describe('processReportEvent', () => {
       tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async () => {
         calls.fetchTargetEvent++;
         return TARGET;
@@ -350,7 +362,60 @@ describe('processReportEvent', () => {
     expect(kv.puts).toHaveLength(0);
   });
 
-  it('skips non-diVine client reports when configured', async () => {
+  // divine-mobile#6592: turning off NIP-89 client attribution stripped the
+  // `client` tag, and this path then dropped the report terminally for 90 days.
+  it('records a report with no client tag, on a non-escalating source', async () => {
+    const kv = createKv();
+    const recorded = [];
+
+    const result = await processReportEvent({
+      id: REPORT_EVENT_ID,
+      kind: 1984,
+      pubkey: REPORTER,
+      tags: [['e', TARGET_EVENT_ID, 'nudity']],
+    }, {
+      kv,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
+      fetchTargetEvent: async () => TARGET,
+      recordReport: async (payload) => {
+        recorded.push(payload);
+        return { action: 'REVIEW', distinctReporterCount: 1 };
+      },
+    });
+
+    expect(result.status).toBe('recorded');
+    expect(result.trustedClient).toBe(false);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].source).toBe('relay-report-untrusted');
+  });
+
+  // The active loss this fix ends: divine-web tags 'divine-web', which the old
+  // `=== 'divine'` literal rejected, so every web report was dropped.
+  it('records a divine-web report as trusted', async () => {
+    const kv = createKv();
+    const recorded = [];
+
+    const result = await processReportEvent({
+      id: REPORT_EVENT_ID,
+      kind: 1984,
+      pubkey: REPORTER,
+      tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'divine-web']],
+    }, {
+      kv,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
+      fetchTargetEvent: async () => TARGET,
+      recordReport: async (payload) => {
+        recorded.push(payload);
+        return { action: 'REVIEW', distinctReporterCount: 1 };
+      },
+    });
+
+    expect(result.status).toBe('recorded');
+    expect(result.trustedClient).toBe(true);
+    expect(recorded[0].source).toBe('relay-report');
+  });
+
+  it('records a third-party client report for review, but never as escalation-eligible', async () => {
     const kv = createKv();
     const recorded = [];
 
@@ -361,7 +426,7 @@ describe('processReportEvent', () => {
       tags: [['e', TARGET_EVENT_ID, 'spam'], ['client', 'Amethyst']],
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async () => TARGET,
       recordReport: async (payload) => {
         recorded.push(payload);
@@ -369,13 +434,12 @@ describe('processReportEvent', () => {
       },
     });
 
-    expect(result.status).toBe('skipped_non_divine_client');
-    expect(recorded).toHaveLength(0);
-    expect(kv.puts).toHaveLength(1);
-    expect(kv.puts[0].key).toBe(processedReportKey(REPORT_EVENT_ID));
-    expect(kv.puts[0].options).toEqual({ expirationTtl: 60 * 60 * 24 * 90 });
+    expect(result.status).toBe('recorded');
+    expect(recorded[0].source).toBe('relay-report-untrusted');
+    expect(kv.puts[0].options).toEqual({ expirationTtl: 60 * 60 * 24 * 180 });
     expect(JSON.parse(kv.store.get(processedReportKey(REPORT_EVENT_ID)))).toMatchObject({
-      status: 'skipped_non_divine_client',
+      status: 'recorded',
+      trustedClient: false,
     });
   });
 
@@ -391,7 +455,7 @@ describe('processReportEvent', () => {
       content: '',
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async () => {
         calls.fetchTargetEvent++;
         return TARGET;
@@ -425,7 +489,7 @@ describe('processReportEvent', () => {
       content: '',
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async () => {
         calls.fetchTargetEvent++;
         return TARGET;
@@ -457,7 +521,7 @@ describe('processReportEvent', () => {
       tags: [['e', TARGET_EVENT_ID, 'nudity'], ['client', 'diVine']],
     }, {
       kv,
-      requireDivineClient: true,
+      trustedClients: DEFAULT_TRUSTED_REPORT_CLIENTS,
       fetchTargetEvent: async () => null,
       recordReport: async (payload) => {
         recorded.push(payload);
@@ -642,7 +706,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: db,
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 50,
@@ -720,7 +784,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 4,
@@ -753,7 +817,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 10,
@@ -825,7 +889,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 2,
@@ -903,7 +967,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 3,
@@ -981,7 +1045,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 2,
@@ -1057,7 +1121,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 2,
@@ -1154,7 +1218,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         limit: 2,
@@ -1196,7 +1260,7 @@ describe('report polling', () => {
       const result = await pollRelayForReports({
         BLOSSOM_DB: {},
         MODERATION_KV: kv,
-        RELAY_REPORTS_REQUIRE_DIVINE_CLIENT: 'true',
+        TRUSTED_REPORT_CLIENTS: 'diVine,divine-web,divine-mobile',
       }, {
         since: 1778680000,
         until: 1778692781,

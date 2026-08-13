@@ -202,7 +202,7 @@ REPORT_POLLING_RELAY_URL = "wss://relay.divine.video" # Relay to poll for kind 1
 REPORT_POLLING_LOOKBACK_HOURS = "24"              # How far back to look for reports on first run
 REPORT_POLLING_LIMIT = "100"                      # Max reports to fetch per poll
 REPORT_POLLING_MAX_PAGES = "5"                    # Max bounded pages to drain per report poll
-RELAY_REPORTS_REQUIRE_DIVINE_CLIENT = "true"      # Only ingest reports tagged as sent by diVine
+TRUSTED_REPORT_CLIENTS = "diVine,divine-web,divine-mobile" # NIP-89 client tags whose reports may drive automatic outcomes; others are still reviewed
 
 # Funnelcake admin URL — destination for notifyRelay() NIP-98 add/remove
 # webhooks against /api/moderation/quarantine. Empty string = relay-side
