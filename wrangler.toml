@@ -156,6 +156,16 @@ AI_DETECTOR_GATE_WATERMARK_VISIBLE = "0.8"
 #
 # Any non-production deployment that sets NOSTR_PRIVATE_KEY must set this too.
 # DM_RELAY_URLS = "ws://127.0.0.1:4444"
+#
+# Must be a comma-separated STRING. `vars` accepts any JSON, so the TOML list
+# form DM_RELAY_URLS = ["ws://..."] deploys cleanly and arrives as an array;
+# that is refused at send time rather than silently falling back to production.
+#
+# It contains the DM send path and the kind-10050 inbox announcement. It does NOT
+# contain everything: RELAY_POLLING_RELAY_URL (where dm-reader polls), and
+# profile-resolver's kind-0 read, still reach relay.divine.video. The kind-0 read
+# publishes nothing and contacts no user, so it does not break DM containment,
+# but a non-production run is not fully offline.
 
 # Relay Polling Configuration
 RELAY_POLLING_ENABLED = "true"                    # Enable/disable relay polling

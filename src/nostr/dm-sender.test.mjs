@@ -417,15 +417,85 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
     expect(relays).toHaveLength(5);
   });
 
-  it('falls back to normal discovery when DM_RELAY_URLS is only separators', async () => {
-    // An all-blank value must not yield zero relays; that would be read
-    // downstream as success===0 rather than as a configuration error.
-    mockKV.get.mockResolvedValue(null);
-    const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: ' , , ' };
+  it('dedupes before capping, so a distinct relay is not crowded out', async () => {
+    // Without dedupe the cap consumes the duplicates and drops the one relay
+    // that was actually different, while the send path still reports five
+    // successes -- a single-relay delivery that reads as five-relay redundancy.
+    const env = {
+      MODERATION_KV: mockKV,
+      DM_RELAY_URLS: 'ws://a,ws://a,ws://a,ws://a,ws://a,ws://b',
+    };
 
     const relays = await discoverUserRelays('b'.repeat(64), env);
 
-    expect(relays).toContain('wss://relay.divine.video');
+    expect(relays).toEqual(['ws://a', 'ws://b']);
+  });
+
+  it('does not read the cache or open a discovery socket when the override is set', async () => {
+    // The other override tests assert the resulting list, which stays correct
+    // even if discovery still runs and its result is discarded. That would mean
+    // a "contained" run opening a socket to the production relay on every DM,
+    // invisibly. Assert the calls that must not happen, not just the answer.
+    mockKV.get.mockResolvedValue(null);
+    const sockets = [];
+    class SpyWS {
+      constructor(url) {
+        sockets.push(url);
+        this.readyState = 3;
+      }
+      addEventListener() {}
+      close() {}
+      send() {}
+    }
+    vi.stubGlobal('WebSocket', SpyWS);
+    try {
+      const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: 'ws://127.0.0.1:4444' };
+
+      await discoverUserRelays('b'.repeat(64), env);
+
+      expect(mockKV.get).not.toHaveBeenCalled();
+      expect(sockets).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  describe('set but unusable', () => {
+    // The whole point of this variable is that an operator who sets it has said
+    // "do not send outside this list". Quietly falling back to the production
+    // defaults honours the opposite of what they asked for, and does it silently:
+    // there is no log distinguishing a bad value from an unset one.
+    //
+    // So a value that is PRESENT and unusable is a configuration error, and it
+    // refuses rather than sends. Unset remains the production default and is
+    // unaffected. Returning an empty list instead is not an option -- it reads
+    // downstream as success===0, an ambiguous send that makes the sweep retain a
+    // warning claim and never resend it.
+    for (const [name, value] of [
+      ['a TOML array, which wrangler accepts in vars', ['ws://127.0.0.1:4444']],
+      ['a number', 4444],
+      ['an object', { url: 'ws://127.0.0.1:4444' }],
+      ['whitespace only', '   '],
+      ['separators only', ' , , '],
+      ['an empty string', ''],
+    ]) {
+      it(`refuses to send when DM_RELAY_URLS is ${name}`, async () => {
+        mockKV.get.mockResolvedValue(null);
+        const env = { MODERATION_KV: mockKV, DM_RELAY_URLS: value };
+
+        await expect(discoverUserRelays('b'.repeat(64), env)).rejects.toThrow(
+          /DM_RELAY_URLS/,
+        );
+      });
+    }
+
+    it('leaves the production default alone when DM_RELAY_URLS is absent', async () => {
+      mockKV.get.mockResolvedValue(null);
+
+      const relays = await discoverUserRelays('b'.repeat(64), { MODERATION_KV: mockKV });
+
+      expect(relays).toContain('wss://relay.divine.video');
+    });
   });
 });
 

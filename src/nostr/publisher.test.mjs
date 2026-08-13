@@ -443,6 +443,45 @@ describe('DM inbox relay list (kind 10050)', () => {
     expect(inboxRelays).toEqual(['wss://relay.divine.video']);
   });
 
+  it('does not announce to public relays when DM_RELAY_URLS contains the run', async () => {
+    // DM_RELAY_URLS says "this run must not reach outside these relays". This is
+    // the second path that publishes with the signing key, and its discovery
+    // fallback is three public relays plus the production one.
+    //
+    // Uncontained, a local run announces "moderation@'s DM inbox is
+    // ws://127.0.0.1:4444" to purplepag.es, relay.nostr.band and relay.damus.io,
+    // overwriting the real kind-10050 there. Strict NIP-17 clients then cannot
+    // deliver DMs to the moderation account until it is republished.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'ws://127.0.0.1:4444',
+      DM_RELAY_URLS: 'ws://127.0.0.1:4444',
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    const targets = connect.mock.calls.map((c) => c[0]);
+    expect(targets).toEqual(['ws://127.0.0.1:4444']);
+    expect(targets).not.toContain('wss://purplepag.es');
+    expect(targets).not.toContain('wss://relay.divine.video');
+  });
+
+  it('still announces to the public discovery relays in production', async () => {
+    // The pair to the above: unset DM_RELAY_URLS is production, where announcing
+    // widely is the entire point of a kind-10050.
+    const { connect } = createConnect();
+    const env = {
+      NOSTR_PRIVATE_KEY: 'a'.repeat(64),
+      RELAY_POLLING_RELAY_URL: 'wss://relay.divine.video',
+    };
+
+    await publishDmInboxRelayList(env, { connect });
+
+    const targets = connect.mock.calls.map((c) => c[0]);
+    expect(targets).toContain('wss://purplepag.es');
+  });
+
   it('returns {published:false} when no signing key is configured', async () => {
     const result = await publishDmInboxRelayList({});
     expect(result.published).toBe(false);

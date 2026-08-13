@@ -437,9 +437,21 @@ export async function publishDmInboxRelayList(env, { connect = Relay.connect } =
   const inboxRelays = [homeRelay];
 
   // Discovery targets: where we publish the event so clients can resolve it.
-  const discoveryRelays = env.DM_INBOX_DISCOVERY_RELAYS
-    ? env.DM_INBOX_DISCOVERY_RELAYS.split(',').map((r) => r.trim()).filter(Boolean)
-    : ['wss://purplepag.es', 'wss://relay.nostr.band', 'wss://relay.damus.io'];
+  //
+  // DM_RELAY_URLS contains a non-production run, and this is the second path that
+  // publishes with the signing key. Announcing widely is right in production and
+  // wrong here: a contained run would tell purplepag.es, relay.nostr.band and
+  // relay.damus.io that moderation@'s DM inbox is a localhost relay, overwriting
+  // the real kind-10050 on the relays clients actually consult. Strict NIP-17
+  // clients would then be unable to deliver DMs to the moderation account until
+  // it was republished. So when the run is contained, the announcement is too.
+  const contained = typeof env.DM_RELAY_URLS === 'string'
+    && env.DM_RELAY_URLS.split(',').map((r) => r.trim()).filter(Boolean).length > 0;
+  const discoveryRelays = contained
+    ? []
+    : env.DM_INBOX_DISCOVERY_RELAYS
+      ? env.DM_INBOX_DISCOVERY_RELAYS.split(',').map((r) => r.trim()).filter(Boolean)
+      : ['wss://purplepag.es', 'wss://relay.nostr.band', 'wss://relay.damus.io'];
   const targets = [...new Set([homeRelay, ...discoveryRelays])];
 
   const event = createDmInboxRelayListEvent(inboxRelays, env.NOSTR_PRIVATE_KEY);
