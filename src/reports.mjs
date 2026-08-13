@@ -37,14 +37,6 @@ export async function initReportsTable(db) {
   }
 }
 
-// The one report source whose reporter identity is not established well enough
-// to count toward an automatic moderation outcome. A `dm-report` reporter is
-// whatever key reached the moderation inbox over NIP-17: nothing signs for the
-// reported sha256, nothing proves the key belongs to a distinct person, and
-// minting fresh keys is free. Such a report is still recorded and still shown
-// to a human -- it just cannot be one of the two "distinct reporters" that
-// auto age-restriction counts, or a single actor could supply both halves of
-// the threshold the authenticated path relies on.
 /**
  * Whether this reporter already has a row for this sha256.
  *
