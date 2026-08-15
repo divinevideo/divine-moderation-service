@@ -178,7 +178,7 @@ During inbox sync (Phase 3), detect `conversation_report` messages:
 ### 3.1 New File: `src/nostr/dm-reader.mjs`
 
 Functions:
-- `syncInbox(env)` — connects to relay, queries kind 1059 events tagged with moderation pubkey, unwraps with `unwrapEvent`, stores in `dm_log`
+- `syncInbox(env)` — connects to relay, queries kind 1059 events tagged with moderation pubkey, unwraps with `unwrapVerifiedRumor` (enforces the NIP-17 seal↔rumor author binding), stores in `dm_log`
 - `getModeratorPubkey(env)` — derives pubkey from `MODERATOR_NSEC`
 
 **Inbox sync query:**

@@ -4,9 +4,9 @@
 // ABOUTME: NIP-17 DM inbox reader for moderation conversations
 // ABOUTME: Syncs gift-wrapped DMs from relay and stores in D1 dm_log
 
-import { getPublicKey, finalizeEvent } from 'nostr-tools/pure';
+import { getPublicKey, finalizeEvent, verifyEvent } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
-import { unwrapEvent } from 'nostr-tools/nip17';
+import * as nip44 from 'nostr-tools/nip44';
 import { makeAuthEvent } from 'nostr-tools/nip42';
 import { computeConversationId, findDmByNostrEventId, logDm } from './dm-store.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
@@ -50,6 +50,67 @@ export function resolveReportedAt(createdAt, nowMs = Date.now()) {
     && createdAt >= nowSeconds - INBOX_FIRST_RUN_LOOKBACK_SECONDS;
 
   return new Date(isUsable ? createdAt * 1000 : nowMs).toISOString();
+}
+
+/**
+ * Unwrap a NIP-59 gift wrap and enforce the NIP-17 seal<->rumor author binding.
+ *
+ * The three layers carry very different amounts of authority:
+ *   - the gift wrap (kind 1059) is signed by a throwaway key by construction,
+ *     so its signature says nothing about who sent the message;
+ *   - the seal (kind 13) is signed by the sender's real key;
+ *   - the rumor (kind 14) is unsigned by definition (NIP-59 s1), so its
+ *     `pubkey` field is a claim and nothing more.
+ *
+ * NIP-17 is normative about the consequence: "Clients MUST verify if pubkey of
+ * the `kind:13` is the same pubkey on the `kind:14`, otherwise any sender can
+ * impersonate others by simply changing the pubkey on `kind:14`."
+ *
+ * nostr-tools' `unwrapEvent` does neither the signature check nor the
+ * comparison -- it is two NIP-44 decrypts, and it discards the seal on return,
+ * so a caller cannot make good the difference afterwards. Hence unwrapping the
+ * layers here instead, so the seal stays in scope to be checked against.
+ *
+ * What actually closes the hole is the final comparison. Decrypting the seal's
+ * content (the rumor) already authenticates `seal.pubkey` on its own -- that
+ * conversation key is ECDH(moderatorPrivkey, seal.pubkey), so a seal claiming a
+ * pubkey whose private key the sender doesn't hold cannot produce readable
+ * ciphertext. The `verifyEvent` calls and the kind check are cheap
+ * defence-in-depth on top of that, and they also bind each layer's `id` to its
+ * own contents -- which matters for the gift wrap, whose `id` is the dm_log
+ * dedup key.
+ *
+ * @param {Object} giftWrap - kind 1059 event as received from the relay
+ * @param {Uint8Array} privateKey - the moderator's private key
+ * @returns {Object} the kind-14 rumor, with its author confirmed by the seal
+ * @throws if any layer is malformed, unsigned, or the authors disagree
+ */
+export function unwrapVerifiedRumor(giftWrap, privateKey) {
+  if (giftWrap?.kind !== 1059 || !verifyEvent(giftWrap)) {
+    throw new Error(`gift wrap ${giftWrap?.id} is not a valid kind:1059 event`);
+  }
+
+  const seal = JSON.parse(nip44.v2.decrypt(
+    giftWrap.content,
+    nip44.v2.utils.getConversationKey(privateKey, giftWrap.pubkey),
+  ));
+
+  if (seal?.kind !== 13 || !verifyEvent(seal)) {
+    throw new Error(`gift wrap ${giftWrap.id} does not contain a valid kind:13 seal`);
+  }
+
+  const rumor = JSON.parse(nip44.v2.decrypt(
+    seal.content,
+    nip44.v2.utils.getConversationKey(privateKey, seal.pubkey),
+  ));
+
+  if (rumor?.pubkey !== seal.pubkey) {
+    throw new Error(
+      `gift wrap ${giftWrap.id}: rumor claims author ${rumor?.pubkey} but the seal was signed by ${seal.pubkey}`
+    );
+  }
+
+  return rumor;
 }
 
 async function findModerationResultBySha(db, sha256) {
@@ -134,8 +195,12 @@ export async function syncInbox(env) {
 
   for (const giftWrap of events) {
     try {
-      // Unwrap the gift wrap -> seal -> rumor
-      const rumor = unwrapEvent(giftWrap, privateKey);
+      // Unwrap the gift wrap -> seal -> rumor, confirming as we go that the
+      // rumor's claimed author is the key that actually signed the seal.
+      // Everything below keys on rumor.pubkey -- the conversation a moderator
+      // replies into, the direction of the message, the reporter credited on a
+      // report -- so an unverified author here is an impersonation anywhere.
+      const rumor = unwrapVerifiedRumor(giftWrap, privateKey);
 
       if (!rumor || !rumor.content) {
         console.warn(`[DM-READER] Empty rumor from event ${giftWrap.id}`);
@@ -185,7 +250,8 @@ export async function syncInbox(env) {
  * directly testable against a plain rumor object -- no relay connection
  * or gift-wrap crypto round-trip required.
  *
- * @param {Object} rumor - decrypted kind-14 rumor (unwrapEvent's output)
+ * @param {Object} rumor - decrypted kind-14 rumor (unwrapVerifiedRumor's output,
+ *   so rumor.pubkey is the seal-confirmed author, not an unverified claim)
  * @param {string} giftWrapId - the outer kind-1059 event id (dm_log dedup key)
  * @param {string} moderatorPubkey
  * @param {Object} env - Environment bindings (BLOSSOM_DB)
