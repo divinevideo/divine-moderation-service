@@ -9,6 +9,7 @@ export { AWSRekognitionProvider } from './aws-rekognition/adapter.mjs';
 export { SightengineProvider } from './sightengine/adapter.mjs';
 export { BunnyCDNProvider } from './bunnycdn/adapter.mjs';
 export { HiveAIProvider } from './hiveai/adapter.mjs';
+export { RealityDefenderProvider } from './reality-defender/adapter.mjs';
 export {
   getProvider,
   getConfiguredProviders,

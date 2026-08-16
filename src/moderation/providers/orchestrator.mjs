@@ -8,15 +8,26 @@ import { AWSRekognitionProvider } from './aws-rekognition/adapter.mjs';
 import { SightengineProvider } from './sightengine/adapter.mjs';
 import { BunnyCDNProvider } from './bunnycdn/adapter.mjs';
 import { HiveAIProvider } from './hiveai/adapter.mjs';
+import { RealityDefenderProvider } from './reality-defender/adapter.mjs';
 
 /**
  * Provider registry
+ *
+ * Content Moderation Providers:
+ * - hiveai: Primary content moderation + AI detection
+ * - sightengine: Legacy fallback for content moderation
+ * - bunnycdn: CDN-integrated moderation
+ * - aws-rekognition: AWS-based content moderation
+ *
+ * AI Detection Providers:
+ * - reality-defender: Multi-provider AI detection (Reality Defender + Hive + Sensity)
  */
 const PROVIDERS = {
   'aws-rekognition': new AWSRekognitionProvider(),
   'sightengine': new SightengineProvider(),
   'bunnycdn': new BunnyCDNProvider(),
-  'hiveai': new HiveAIProvider()
+  'hiveai': new HiveAIProvider(),
+  'reality-defender': new RealityDefenderProvider()
 };
 
 /**

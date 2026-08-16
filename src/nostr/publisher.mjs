@@ -37,28 +37,39 @@ const CATEGORY_LABELS = {
  * @param {string} [report.cdnUrl] - URL to video
  * @param {Object} env - Environment with Nostr credentials
  * @param {Object} [mockRelay] - Mock relay for testing
+ * @returns {Promise<Object>} Publish result with success status and event details
  */
 export async function publishToFaro(report, env, mockRelay = null) {
   // Don't publish safe content
   if (report.type === 'safe') {
-    return;
+    return { published: false, reason: 'Safe content not published', skipped: true };
   }
 
   // Validate configuration
   if (!env.NOSTR_PRIVATE_KEY) {
     throw new Error('NOSTR_PRIVATE_KEY not configured');
   }
-  if (!env.FARO_RELAY_URL) {
-    throw new Error('FARO_RELAY_URL not configured');
+  const relayUrl = env.NOSTR_RELAY_URL || env.FARO_RELAY_URL;
+  if (!relayUrl) {
+    throw new Error('No relay URL configured (set NOSTR_RELAY_URL or FARO_RELAY_URL)');
   }
 
   // Create kind 1984 report event (NIP-56)
   const event = createReportEvent(report, env.NOSTR_PRIVATE_KEY);
 
+  console.log(`[PUBLISH] Publishing kind 1984 event ${event.id.substring(0, 16)}... for ${report.sha256.substring(0, 16)}...`);
+
   // Publish to relay
   if (mockRelay) {
     // Testing path
     await mockRelay.publish(event);
+    return {
+      published: true,
+      eventId: event.id,
+      pubkey: event.pubkey,
+      relay: 'mock',
+      verified: true
+    };
   } else {
     // Production path - add Cloudflare Access headers if configured
     const relayOptions = {};
@@ -69,13 +80,83 @@ export async function publishToFaro(report, env, mockRelay = null) {
       };
     }
 
-    const relay = await Relay.connect(env.FARO_RELAY_URL, relayOptions);
+    const relay = await Relay.connect(relayUrl, relayOptions);
     try {
+      // relay.publish() returns a promise that:
+      // - resolves when relay sends OK with success=true
+      // - rejects when relay sends OK with success=false or on timeout/error
       await relay.publish(event);
+
+      console.log(`[PUBLISH] ✅ Relay accepted event ${event.id.substring(0, 16)}... on ${relayUrl}`);
+
+      // Verify the event was actually stored by querying for it
+      let verified = false;
+      try {
+        verified = await verifyEventOnRelay(relay, event.id);
+        if (verified) {
+          console.log(`[PUBLISH] ✅ Verified event ${event.id.substring(0, 16)}... exists on relay`);
+        } else {
+          console.warn(`[PUBLISH] ⚠️ Event ${event.id.substring(0, 16)}... accepted but not found on query`);
+        }
+      } catch (verifyErr) {
+        console.warn(`[PUBLISH] ⚠️ Could not verify event: ${verifyErr.message}`);
+      }
+
+      return {
+        published: true,
+        eventId: event.id,
+        pubkey: event.pubkey,
+        relay: relayUrl,
+        verified,
+        sha256: report.sha256,
+        type: report.type
+      };
+    } catch (publishErr) {
+      console.error(`[PUBLISH] ❌ Relay rejected event ${event.id.substring(0, 16)}...: ${publishErr.message}`);
+      return {
+        published: false,
+        eventId: event.id,
+        pubkey: event.pubkey,
+        relay: relayUrl,
+        verified: false,
+        error: publishErr.message,
+        sha256: report.sha256,
+        type: report.type
+      };
     } finally {
       relay.close();
     }
   }
+}
+
+/**
+ * Verify an event exists on the relay by querying for it
+ * @param {Relay} relay - Connected relay instance
+ * @param {string} eventId - Event ID to look for
+ * @returns {Promise<boolean>} True if event was found
+ */
+async function verifyEventOnRelay(relay, eventId) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolve(false);
+    }, 3000); // 3 second timeout for verification
+
+    const sub = relay.subscribe(
+      [{ ids: [eventId], limit: 1 }],
+      {
+        onevent: () => {
+          clearTimeout(timeout);
+          sub.close();
+          resolve(true);
+        },
+        oneose: () => {
+          clearTimeout(timeout);
+          sub.close();
+          resolve(false);
+        }
+      }
+    );
+  });
 }
 
 /**
@@ -98,9 +179,13 @@ function createReportEvent(report, privateKeyHex) {
   // Build tags
   const tags = [
     ['L', 'MOD'],  // Namespace: Moderation
-    ['l', label, 'MOD'],  // Label within MOD namespace
-    ['p', sha256]  // Report target (using video hash as identifier)
+    ['l', label, 'MOD']  // Label within MOD namespace
   ];
+
+  // Identify target by content hash using standard 'x' tag
+  if (sha256) {
+    tags.push(['x', sha256]);
+  }
 
   if (cdnUrl) {
     tags.push(['r', cdnUrl]);  // Reference URL

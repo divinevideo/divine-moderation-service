@@ -40,11 +40,28 @@ max_batch_size = 10
 max_batch_timeout = 30
 max_retries = 3
 
+# Queue for external moderation actions (from realness.admin)
+[[queues.producers]]
+binding = "ACTION_QUEUE"
+queue = "moderation-actions-queue"
+
+[[queues.consumers]]
+queue = "moderation-actions-queue"
+max_batch_size = 25
+max_batch_timeout = 30
+max_retries = 3
+
+# Results queue (produced here, consumed by realness.admin)
+[[queues.producers]]
+binding = "ACTION_RESULTS_QUEUE"
+queue = "moderation-action-results-queue"
+
 # Environment variables
 [vars]
 MODERATION_ENABLED = "true"
 CDN_DOMAIN = "cdn.divine.video"  # CDN domain for video access
 PRIMARY_MODERATION_PROVIDER = "hiveai"  # Use Hive.AI for content moderation + AI detection
+NOSTR_RELAY_URL = "wss://relay.divine.video"  # Relay where bans/labels are enforced
 
 # Zero Trust JWT verification (for /api/v1/moderate endpoint)
 TEAM_DOMAIN = "https://divinevideo.cloudflareaccess.com"  # Cloudflare Access team domain
@@ -82,6 +99,11 @@ SELF_HARM_THRESHOLD_MEDIUM = "0.5"    # Human review
 AI_GENERATED_THRESHOLD_HIGH = "0.8"   # Age-restricted
 AI_GENERATED_THRESHOLD_MEDIUM = "0.6" # Human review
 
+# Reality Defender Multi-Provider AI Detection
+# Uses realness.divine.video which aggregates Reality Defender, Hive, and Sensity
+REALNESS_API_ENABLED = "true"         # Enable multi-provider AI detection
+AI_DETECTION_PROVIDER = "reality-defender"  # Provider for AI/deepfake detection
+
 # Secrets (set with: wrangler secret put <NAME>)
 # POLICY_AUD - Zero Trust application audience tag (from Access > Applications > moderation.admin.divine.video > Overview)
 # CF_ACCESS_CLIENT_ID - Cloudflare Access service token ID for relay.divine.video
@@ -95,3 +117,8 @@ AI_GENERATED_THRESHOLD_MEDIUM = "0.6" # Human review
 # HIVE_MODERATION_API_KEY - Hive.AI V2 API token for content moderation (nudity, violence, etc.)
 # HIVE_AI_DETECTION_API_KEY - Hive.AI V2 API token for AI-generated content and deepfake detection
 # ADMIN_PASSWORD_HASH - SHA-256 hash of admin dashboard password
+#
+# Note: Reality Defender integration uses realness.divine.video which manages its own API keys:
+# - REALITY_DEFENDER_API_KEY (configured in realness.divine.video)
+# - HIVE_API_KEY (configured in realness.divine.video)
+# - SENSITY_API_KEY (configured in realness.divine.video)

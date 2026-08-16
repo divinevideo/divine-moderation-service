@@ -31,7 +31,7 @@ describe('Nostr Event Publisher', () => {
         kind: 1984,
         content: expect.stringContaining('High nudity detected'),
         tags: expect.arrayContaining([
-          ['p', expect.any(String)],  // Reported content (video hash as pseudo-pubkey)
+          ['x', 'b'.repeat(64)], // Target by content hash
           ['L', 'MOD'],
           ['l', 'NS', 'MOD']
         ])
@@ -155,7 +155,7 @@ describe('Nostr Event Publisher', () => {
     ).rejects.toThrow('NOSTR_PRIVATE_KEY not configured');
   });
 
-  it('should throw error if FARO_RELAY_URL not configured', async () => {
+  it('should throw error if relay URL not configured', async () => {
     const env = {
       NOSTR_PRIVATE_KEY: 'a'.repeat(64)
     };
@@ -166,7 +166,7 @@ describe('Nostr Event Publisher', () => {
         sha256: 'h'.repeat(64),
         scores: { nudity: 0.6, violence: 0.4 }
       }, env)
-    ).rejects.toThrow('FARO_RELAY_URL not configured');
+    ).rejects.toThrow('No relay URL configured');
   });
 
   it('should use appropriate label for severity', async () => {

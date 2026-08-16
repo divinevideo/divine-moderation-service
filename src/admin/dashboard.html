@@ -1615,7 +1615,7 @@
       if (author) {
         metaLine += '<span style="color: #a78bfa;">👤 ' + escapeHtml(author) + '</span>';
       } else if (pubkey) {
-        metaLine += '<span style="color: #666;">👤 ' + pubkey + '</span>';
+        metaLine += '<span class="copyable-id" style="color: #666; cursor: pointer;" onclick="copyToClipboard(\'' + pubkey + '\'); event.stopPropagation();" title="Click to copy: ' + pubkey + '">👤 ' + pubkey.substring(0, 12) + '...</span>';
       }
       if (client) {
         metaLine += (metaLine ? ' · ' : '') + '<span style="color: #666;">' + escapeHtml(client) + '</span>';
@@ -1637,9 +1637,10 @@
           '</div>' +
         '</div>' +
         '<div class="video-info">' +
-          '<div style="font-size: 11px; color: #666; margin-bottom: 6px; font-family: monospace;">' +
-            '<span title="' + sha256 + '">' + sha256.substring(0, 16) + '...</span> ' +
-            '<button onclick="copyToClipboard(\'' + videoUrl + '\'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy video URL">📋 URL</button>' +
+          '<div style="font-size: 11px; color: #666; margin-bottom: 6px; font-family: monospace; display: flex; gap: 6px; align-items: center;">' +
+            '<span class="copyable-id" style="cursor: pointer;" onclick="copyToClipboard(\'' + sha256 + '\'); event.stopPropagation();" title="Click to copy: ' + sha256 + '">' + sha256.substring(0, 16) + '...</span>' +
+            '<button onclick="copyToClipboard(\'' + sha256 + '\'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy SHA256">📋</button>' +
+            '<button onclick="copyToClipboard(\'' + videoUrl + '\'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy video URL">🔗</button>' +
           '</div>' +
           (metaLine ? '<div style="font-size: 12px; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + metaLine + '</div>' : '') +
           (description ? '<div style="font-size: 13px; color: #ccc; margin-bottom: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">' + description + '</div>' : '') +
@@ -1960,6 +1961,33 @@
         parts.push(`<div class="nostr-meta">${metaItems.join('')}</div>`);
       }
 
+      // Add copyable identifiers section
+      const idItems = [];
+
+      if (metadata.pubkey) {
+        idItems.push(`
+          <span class="nostr-meta-item" style="cursor: pointer;" onclick="copyToClipboard('${metadata.pubkey}')" title="Click to copy: ${metadata.pubkey}">
+            <span class="nostr-meta-label">pubkey</span>
+            <span class="nostr-meta-value" style="font-family: monospace;">${metadata.pubkey.substring(0, 12)}...</span>
+            <button onclick="copyToClipboard('${metadata.pubkey}'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 1px 4px; border-radius: 3px; cursor: pointer; font-size: 9px; margin-left: 4px;">📋</button>
+          </span>
+        `);
+      }
+
+      if (metadata.eventId) {
+        idItems.push(`
+          <span class="nostr-meta-item" style="cursor: pointer;" onclick="copyToClipboard('${metadata.eventId}')" title="Click to copy: ${metadata.eventId}">
+            <span class="nostr-meta-label">event</span>
+            <span class="nostr-meta-value" style="font-family: monospace;">${metadata.eventId.substring(0, 12)}...</span>
+            <button onclick="copyToClipboard('${metadata.eventId}'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 1px 4px; border-radius: 3px; cursor: pointer; font-size: 9px; margin-left: 4px;">📋</button>
+          </span>
+        `);
+      }
+
+      if (idItems.length > 0) {
+        parts.push(`<div class="nostr-meta" style="margin-top: 6px;">${idItems.join('')}</div>`);
+      }
+
       return parts.join('');
     }
 
@@ -2097,7 +2125,11 @@
           </div>
           <div class="video-info">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-              <div class="video-hash" title="Click to copy full hash" onclick="copyToClipboard('${sha256}')" style="margin-bottom: 0;">${sha256.substring(0, 16)}...</div>
+              <div style="display: flex; align-items: center; gap: 6px;">
+                <div class="video-hash" title="Click to copy: ${sha256}" onclick="copyToClipboard('${sha256}')" style="margin-bottom: 0;">${sha256.substring(0, 16)}...</div>
+                <button onclick="copyToClipboard('${sha256}'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy SHA256">📋</button>
+                <button onclick="copyToClipboard('https://cdn.divine.video/${sha256}.mp4'); event.stopPropagation();" style="background: #333; color: #888; border: none; padding: 2px 6px; border-radius: 3px; cursor: pointer; font-size: 10px;" title="Copy video URL">🔗</button>
+              </div>
               ${providerBadgeHTML}
             </div>
 
@@ -2122,9 +2154,11 @@
               <div class="nostr-loading">Loading context...</div>
             </div>
 
-            <div class="divine-link">
+            <div class="divine-link" style="display: flex; justify-content: space-between; align-items: center;">
               <a id="divine-link-${sha256}" href="https://divine.video/video/${sha256}?source=discovery&index=0" target="_blank" rel="noopener noreferrer">
-                View on divine.video →
+                View on divine.video →</a>
+              <a href="/reports/${sha256}" target="_blank" style="color: #888; font-size: 12px; text-decoration: none;" title="View full report with copyable IDs">
+                📋 Report
               </a>
             </div>
 
@@ -2509,14 +2543,26 @@
 
     function copyToClipboard(text) {
       navigator.clipboard.writeText(text).then(() => {
-        console.log(`Copied SHA256 to clipboard: ${text}`);
+        console.log(`Copied to clipboard: ${text.substring(0, 24)}...`);
         // Show brief visual feedback
-        event.target.style.background = '#2563eb';
-        event.target.style.color = '#fff';
+        const target = event.target;
+        const originalText = target.textContent;
+        const originalBg = target.style.background;
+        const originalColor = target.style.color;
+
+        target.style.background = '#22c55e';
+        target.style.color = '#fff';
+        if (target.tagName === 'BUTTON') {
+          target.textContent = '✓';
+        }
+
         setTimeout(() => {
-          event.target.style.background = '';
-          event.target.style.color = '';
-        }, 200);
+          target.style.background = originalBg;
+          target.style.color = originalColor;
+          if (target.tagName === 'BUTTON') {
+            target.textContent = originalText;
+          }
+        }, 800);
       }).catch(err => {
         console.error('Failed to copy:', err);
       });
