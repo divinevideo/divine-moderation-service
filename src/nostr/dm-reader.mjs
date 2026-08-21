@@ -394,11 +394,9 @@ export function fetchGiftWraps(relayUrl, filter, env) {
     const reqMessage = JSON.stringify(['REQ', subscriptionId, filter]);
 
     const timeout = setTimeout(() => {
-      try {
-        if (ws) ws.close();
-      } catch {}
       // No EOSE means the read was cut short. Return what arrived but mark it
-      // incomplete so the caller leaves the checkpoint where it was.
+      // incomplete so the caller leaves the checkpoint where it was. finish()
+      // closes the socket.
       console.warn(`[DM-READER] WebSocket timeout, returning ${events.length} events collected so far (incomplete)`);
       finish({ events, complete: false });
     }, 15000); // 15 second timeout for potentially many events
@@ -407,6 +405,13 @@ export function fetchGiftWraps(relayUrl, filter, env) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      // Close the socket on every exit. The reject paths (auth refused, non-auth
+      // CLOSED, AUTH-sign / WS / setup error) previously returned without closing,
+      // leaking the connection until isolate teardown. close() is idempotent, so
+      // the EOSE and timeout paths are unaffected.
+      try {
+        if (ws) ws.close();
+      } catch {}
       if (resultOrError instanceof Error) {
         reject(resultOrError);
         return;
@@ -456,9 +461,9 @@ export function fetchGiftWraps(relayUrl, filter, env) {
         }
 
         if (data[0] === 'EOSE' && data[1] === subscriptionId) {
+          // Polite NIP-01 close of our subscription; finish() closes the socket.
           try {
             ws.send(JSON.stringify(['CLOSE', subscriptionId]));
-            ws.close();
           } catch {}
           finish({ events, complete: true });
           return;
