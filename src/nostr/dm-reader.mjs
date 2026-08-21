@@ -4,9 +4,10 @@
 // ABOUTME: NIP-17 DM inbox reader for moderation conversations
 // ABOUTME: Syncs gift-wrapped DMs from relay and stores in D1 dm_log
 
-import { getPublicKey } from 'nostr-tools/pure';
+import { getPublicKey, finalizeEvent } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import { unwrapEvent } from 'nostr-tools/nip17';
+import { makeAuthEvent } from 'nostr-tools/nip42';
 import { computeConversationId, findDmByNostrEventId, logDm } from './dm-store.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
@@ -124,8 +125,8 @@ export async function syncInbox(env) {
 
   console.log(`[DM-READER] Syncing inbox from ${relayUrl}, since=${new Date(since * 1000).toISOString()}`);
 
-  const events = await fetchGiftWraps(relayUrl, filter, env);
-  console.log(`[DM-READER] Fetched ${events.length} gift wrap events`);
+  const { events, complete } = await fetchGiftWraps(relayUrl, filter, env);
+  console.log(`[DM-READER] Fetched ${events.length} gift wrap events (complete=${complete})`);
 
   let synced = 0;
   let skipped = 0;
@@ -158,9 +159,19 @@ export async function syncInbox(env) {
     }
   }
 
-  // Update last sync timestamp
-  if (env.MODERATION_KV) {
+  // Advance the inbox checkpoint only when the relay actually completed the
+  // read -- it sent EOSE, after answering any NIP-42 AUTH challenge. A sync that
+  // timed out, was auth-refused, or errored leaves the checkpoint where it was
+  // so the next tick retries the same window. Advancing on an incomplete sync is
+  // how a silent regression becomes permanent: the moment the relay starts
+  // gating kind-1059 reads behind AUTH, an unauthed reader collects zero gift
+  // wraps yet still "succeeds", and moving the checkpoint past those DMs drops
+  // every report in the window for good -- the two-day overlap only masks it for
+  // two days.
+  if (complete && env.MODERATION_KV) {
     await env.MODERATION_KV.put('dm-inbox:last-sync', String(Math.floor(Date.now() / 1000)));
+  } else if (!complete) {
+    console.warn('[DM-READER] Sync incomplete (no EOSE); leaving inbox checkpoint unchanged so the next tick retries the same window');
   }
 
   console.log(`[DM-READER] Sync complete: ${synced} new, ${skipped} deduped, ${errors} errors`);
@@ -347,21 +358,73 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
  * Fetch gift wrap events from relay via WebSocket
  * Uses the same pattern as relay-client.mjs: connect -> REQ -> collect -> EOSE -> close
  *
+ * relay.divine.video gates kind-1059 (gift wrap) reads behind NIP-42 AUTH to the
+ * addressed recipient, so this speaks the AUTH handshake. On an ["AUTH", challenge]
+ * it signs a kind-22242 event with the moderator key and replies ["AUTH", event];
+ * for the ["CLOSED", subid, "auth-required: ..."] the relay sends for the pre-auth
+ * REQ it re-sends the REQ once the AUTH is confirmed, so the subscription is served
+ * post-auth. Any other CLOSED, or a rejected AUTH, rejects loudly rather than
+ * silently resolving an empty inbox -- a silent empty read that also advanced the
+ * checkpoint is exactly how reported DMs would be lost permanently.
+ *
  * @param {string} relayUrl - WebSocket relay URL
  * @param {Object} filter - Nostr filter object
- * @param {Object} env - Environment with CF Access credentials
- * @returns {Promise<Array>} Array of gift wrap events
+ * @param {Object} env - Environment with NOSTR_PRIVATE_KEY (for NIP-42 AUTH)
+ * @returns {Promise<{events: Array, complete: boolean}>} `complete` is true only
+ *   when the relay sent EOSE (after any needed auth). The caller must not advance
+ *   the inbox checkpoint on a `false`/rejected result, or unread gift wraps in the
+ *   window are skipped forever.
  */
-function fetchGiftWraps(relayUrl, filter, env) {
+export function fetchGiftWraps(relayUrl, filter, env) {
   return new Promise((resolve, reject) => {
-    let ws;
     const events = [];
+    let ws;
+    let settled = false;
+
+    // NIP-42 handshake state. The relay's auth-required CLOSED (which invalidates
+    // the pre-auth subscription) and the OK confirming our AUTH can arrive in
+    // either order, so the re-REQ waits for both and fires exactly once. A relay
+    // that requires no auth sends neither, so it never re-REQs.
+    let authEventId = null;
+    let authConfirmed = false;
+    let subClosedForAuth = false;
+    let reqResent = false;
+
+    const subscriptionId = 'dm-sync-' + Math.random().toString(36).substring(7);
+    const reqMessage = JSON.stringify(['REQ', subscriptionId, filter]);
+
     const timeout = setTimeout(() => {
-      if (ws) ws.close();
-      // Resolve with whatever we have rather than rejecting
-      console.warn(`[DM-READER] WebSocket timeout, returning ${events.length} events collected so far`);
-      resolve(events);
+      try {
+        if (ws) ws.close();
+      } catch {}
+      // No EOSE means the read was cut short. Return what arrived but mark it
+      // incomplete so the caller leaves the checkpoint where it was.
+      console.warn(`[DM-READER] WebSocket timeout, returning ${events.length} events collected so far (incomplete)`);
+      finish({ events, complete: false });
     }, 15000); // 15 second timeout for potentially many events
+
+    function finish(resultOrError) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (resultOrError instanceof Error) {
+        reject(resultOrError);
+        return;
+      }
+      resolve(resultOrError);
+    }
+
+    // Re-send the original REQ once the relay has both closed the pre-auth
+    // subscription for auth and confirmed our AUTH. Guarded so we re-REQ at most
+    // once (a second auth-required CLOSED after this means auth did not take, and
+    // is handled as a hard failure below).
+    function maybeResendReq() {
+      if (authConfirmed && subClosedForAuth && !reqResent) {
+        reqResent = true;
+        console.log(`[DM-READER] Re-sending REQ after NIP-42 auth to ${relayUrl}`);
+        ws.send(reqMessage);
+      }
+    }
 
     try {
       // Cloudflare Workers' WebSocket constructor only accepts a subprotocol
@@ -372,46 +435,98 @@ function fetchGiftWraps(relayUrl, filter, env) {
       // point at a CF-Access-protected relay, switch to the fetch({ Upgrade })
       // pattern and use the returned response.webSocket.
       ws = new WebSocket(relayUrl);
-      const subscriptionId = 'dm-sync-' + Math.random().toString(36).substring(7);
 
       ws.addEventListener('open', () => {
-        const reqMessage = JSON.stringify(['REQ', subscriptionId, filter]);
         console.log(`[DM-READER] Sent REQ to ${relayUrl} with filter: kinds=[1059], since=${filter.since}, limit=${filter.limit}`);
         ws.send(reqMessage);
       });
 
       ws.addEventListener('message', (msg) => {
+        let data;
         try {
-          const data = JSON.parse(msg.data);
-
-          if (data[0] === 'EVENT' && data[2]) {
-            events.push(data[2]);
-          }
-
-          if (data[0] === 'EOSE') {
-            clearTimeout(timeout);
-            ws.close();
-            resolve(events);
-          }
+          data = JSON.parse(msg.data);
         } catch (err) {
           console.error('[DM-READER] Failed to parse message:', err);
+          return;
+        }
+
+        if (data[0] === 'EVENT' && data[1] === subscriptionId && data[2]) {
+          events.push(data[2]);
+          return;
+        }
+
+        if (data[0] === 'EOSE' && data[1] === subscriptionId) {
+          try {
+            ws.send(JSON.stringify(['CLOSE', subscriptionId]));
+            ws.close();
+          } catch {}
+          finish({ events, complete: true });
+          return;
+        }
+
+        if (data[0] === 'AUTH' && typeof data[1] === 'string') {
+          // NIP-42 challenge: sign a kind-22242 event with the moderator key and
+          // answer. syncInbox guarantees env.NOSTR_PRIVATE_KEY is set.
+          try {
+            const authEvent = finalizeEvent(
+              makeAuthEvent(relayUrl, data[1]),
+              hexToBytes(env.NOSTR_PRIVATE_KEY)
+            );
+            authEventId = authEvent.id;
+            console.log(`[DM-READER] Answering NIP-42 AUTH challenge from ${relayUrl}`);
+            ws.send(JSON.stringify(['AUTH', authEvent]));
+          } catch (err) {
+            finish(new Error(`Failed to answer NIP-42 AUTH challenge: ${err.message}`));
+          }
+          return;
+        }
+
+        if (data[0] === 'OK' && data[1] === authEventId) {
+          // Relay's verdict on our AUTH event specifically.
+          if (data[2] === true) {
+            authConfirmed = true;
+            maybeResendReq();
+          } else {
+            const reason = typeof data[3] === 'string' && data[3] ? data[3] : 'no reason given';
+            finish(new Error(`Relay rejected NIP-42 AUTH: ${reason}`));
+          }
+          return;
+        }
+
+        if (data[0] === 'CLOSED' && data[1] === subscriptionId) {
+          const reason = typeof data[2] === 'string' && data[2] ? data[2] : 'unknown reason';
+          const isAuthGate = reason.startsWith('auth-required:') || reason.startsWith('restricted:');
+          if (isAuthGate && !reqResent) {
+            // Expected pre-auth close: the relay wants us to authenticate and
+            // re-subscribe. Note it and re-REQ once the AUTH is confirmed.
+            subClosedForAuth = true;
+            maybeResendReq();
+          } else {
+            // A non-auth CLOSED, or an auth gate that persisted after we already
+            // authenticated and re-subscribed -- both are real failures, not an
+            // empty inbox. Reject rather than resolve empty.
+            finish(new Error(`Relay closed subscription ${subscriptionId}: ${reason}`));
+          }
+          return;
+        }
+
+        if (data[0] === 'NOTICE') {
+          console.log(`[DM-READER] Relay notice: ${data[1]}`);
         }
       });
 
       ws.addEventListener('error', (err) => {
-        clearTimeout(timeout);
-        reject(new Error(`WebSocket error: ${err.message || 'connection failed'}`));
+        finish(new Error(`WebSocket error: ${err.message || 'connection failed'}`));
       });
 
       ws.addEventListener('close', () => {
-        clearTimeout(timeout);
-        // Resolve with whatever we collected if not already resolved
-        resolve(events);
+        // Reaching here without an EOSE means the read was incomplete. The
+        // once-guard drops this when EOSE/CLOSED/timeout already settled.
+        finish({ events, complete: false });
       });
 
     } catch (error) {
-      clearTimeout(timeout);
-      reject(error);
+      finish(error instanceof Error ? error : new Error('WebSocket setup failed'));
     }
   });
 }
