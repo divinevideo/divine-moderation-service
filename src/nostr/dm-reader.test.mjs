@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { bytesToHex } from '@noble/hashes/utils';
-import { getModeratorPubkey, processRumor, resolveReportedAt } from './dm-reader.mjs';
+import { fetchGiftWraps, getModeratorPubkey, processRumor, resolveReportedAt, syncInbox } from './dm-reader.mjs';
 import { initDmLogTable } from './dm-store.mjs';
 import { initReportsTable } from '../reports.mjs';
 
@@ -500,5 +500,343 @@ describe('DM Reader - resolveReportedAt', () => {
   it('tolerates a client clock that runs slightly fast', () => {
     const oneMinuteAhead = NOW_SECONDS + 60;
     expect(resolveReportedAt(oneMinuteAhead, NOW_MS)).toBe(new Date(oneMinuteAhead * 1000).toISOString());
+  });
+});
+
+// NIP-42 AUTH handshake + checkpoint guard for the gift-wrap reader.
+//
+// relay.divine.video is gating kind-1059 reads behind NIP-42 AUTH to the
+// addressed recipient. Before this change fetchGiftWraps handled only EVENT and
+// EOSE, so under the gate it ignored the AUTH challenge and the auth-required
+// CLOSED, timed out, and resolved an empty array -- and syncInbox then advanced
+// the inbox checkpoint anyway, so the reported DMs in that window were skipped
+// forever. These tests pin the handshake and the "only advance on EOSE" guard.
+//
+// The WebSocket is mocked the same way report-poller.test.mjs mocks its relay:
+// a class swapped onto globalThis.WebSocket that emits 'open' on a microtask and
+// drives replies synchronously from each send(). Replies nest (a reply triggers
+// the reader's next send, which triggers the next reply), so the effective order
+// the reader observes is AUTH -> OK -> CLOSED; the re-REQ trigger is written to
+// be order-independent (it fires once both the auth-required CLOSED and the OK
+// have arrived, whichever is last).
+describe('DM Reader - fetchGiftWraps NIP-42 AUTH', () => {
+  const RELAY = 'wss://relay.example';
+  const FILTER = { kinds: [1059], '#p': [testPubkey], since: 1, limit: 200 };
+
+  function makeGiftWrap(id) {
+    return {
+      id,
+      kind: 1059,
+      pubkey: 'a'.repeat(64),
+      created_at: 1_700_000_000,
+      tags: [['p', testPubkey]],
+      content: 'sealed',
+      sig: 'b'.repeat(128),
+    };
+  }
+
+  // Swap a scripted relay onto globalThis.WebSocket. onSend(parsed, ctx) is
+  // called for every client->relay frame; ctx.reply(arr) pushes a relay->client
+  // frame, ctx.closeConn() fires the socket 'close' event without an EOSE.
+  // closes.count records socket teardown, so a test can pin that an exit path
+  // actually closed the connection instead of leaking it.
+  function installRelayMock(onSend) {
+    const original = globalThis.WebSocket;
+    const sent = [];
+    const closes = { count: 0 };
+    globalThis.WebSocket = class {
+      constructor(url) {
+        this.url = url;
+        this._listeners = new Map();
+        queueMicrotask(() => this._emit('open', {}));
+      }
+      addEventListener(type, listener) { this._listeners.set(type, listener); }
+      send(message) {
+        const parsed = JSON.parse(message);
+        sent.push(parsed);
+        onSend(parsed, {
+          reply: (arr) => this._emit('message', { data: JSON.stringify(arr) }),
+          closeConn: () => this._emit('close', {}),
+          fail: (message) => this._emit('error', { message }),
+        });
+      }
+      close() { closes.count += 1; }
+      _emit(type, event) { this._listeners.get(type)?.(event); }
+    };
+    return { sent, closes, restore: () => { globalThis.WebSocket = original; } };
+  }
+
+  it('answers the AUTH challenge, re-subscribes after the auth-required close, and returns the gift wraps', async () => {
+    const giftWrap = makeGiftWrap('gw-gated');
+    let reqCount = 0;
+    const { sent, restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        const subId = msg[1];
+        reqCount += 1;
+        if (reqCount === 1) {
+          // Pre-auth REQ: the relay offers a challenge and closes the sub.
+          ctx.reply(['AUTH', 'challenge-abc']);
+          ctx.reply(['CLOSED', subId, 'auth-required: authentication required to read kind 1059']);
+        } else {
+          // Post-auth re-subscription is served.
+          ctx.reply(['EVENT', subId, giftWrap]);
+          ctx.reply(['EOSE', subId]);
+        }
+      } else if (msg[0] === 'AUTH') {
+        ctx.reply(['OK', msg[1].id, true, '']);
+      }
+    });
+
+    try {
+      const result = await fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex });
+
+      expect(result.complete).toBe(true);
+      expect(result.events).toEqual([giftWrap]);
+
+      // Signed a kind-22242 auth event with the moderator key, echoing the
+      // challenge and target relay.
+      const authSend = sent.find((m) => m[0] === 'AUTH');
+      expect(authSend).toBeTruthy();
+      expect(authSend[1].kind).toBe(22242);
+      expect(authSend[1].pubkey).toBe(testPubkey);
+      expect(authSend[1].sig).toMatch(/^[0-9a-f]{128}$/);
+      expect(authSend[1].tags).toContainEqual(['challenge', 'challenge-abc']);
+      expect(authSend[1].tags).toContainEqual(['relay', RELAY]);
+
+      // The REQ was sent twice: the original, then the post-auth re-subscription.
+      expect(sent.filter((m) => m[0] === 'REQ')).toHaveLength(2);
+    } finally {
+      restore();
+    }
+  });
+
+  it('answers a proactively offered AUTH challenge and returns the served gift wraps on EOSE', async () => {
+    const giftWrap = makeGiftWrap('gw-proactive');
+    const { sent, restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        const subId = msg[1];
+        // Relay offers auth but still serves the original sub (no CLOSED).
+        ctx.reply(['AUTH', 'challenge-proactive']);
+        ctx.reply(['EVENT', subId, giftWrap]);
+        ctx.reply(['EOSE', subId]);
+      }
+    });
+
+    try {
+      const result = await fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex });
+
+      expect(result.complete).toBe(true);
+      expect(result.events).toEqual([giftWrap]);
+      const authSend = sent.find((m) => m[0] === 'AUTH');
+      expect(authSend[1].kind).toBe(22242);
+      // No CLOSED means no re-subscription: the REQ is sent exactly once.
+      expect(sent.filter((m) => m[0] === 'REQ')).toHaveLength(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects loudly when the relay closes the subscription for a non-auth reason', async () => {
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.reply(['CLOSED', msg[1], 'blocked: you are banned']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('blocked: you are banned');
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects loudly on a "restricted:" close (NIP-42 terminal denial, not a retry)', async () => {
+    // 'restricted:' means we authenticated but this key is not allowed -- per
+    // NIP-42 retrying can't help, so it must reject, not loop on re-REQ.
+    let reqCount = 0;
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        reqCount += 1;
+        ctx.reply(['CLOSED', msg[1], 'restricted: not the addressed recipient']);
+      } else if (msg[0] === 'AUTH') {
+        ctx.reply(['OK', msg[1].id, true, '']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('restricted: not the addressed recipient');
+      expect(reqCount).toBe(1); // rejected on the first close, no re-REQ loop
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects a "restricted:" close that arrives after a successful AUTH', async () => {
+    // The shape relay.divine.video actually produces: it challenges on connect,
+    // we authenticate, and the read is still refused because the filter is not
+    // scoped to the authed key (funnelcake crates/relay/src/auth.rs only returns
+    // Restricted for an already-authenticated connection). NIP-42 reserves
+    // 'restricted:' for exactly this post-auth case, so there is nothing to
+    // retry -- re-REQing can only draw the same refusal.
+    let reqCount = 0;
+    let authAnswered = false;
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        reqCount += 1;
+        // Challenge first, so the AUTH round trip completes before the refusal.
+        ctx.reply(['AUTH', 'challenge-post-auth']);
+        ctx.reply(['CLOSED', msg[1], 'restricted: not authorized to read events for another pubkey']);
+      } else if (msg[0] === 'AUTH') {
+        authAnswered = true;
+        ctx.reply(['OK', msg[1].id, true, '']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('restricted: not authorized to read events for another pubkey');
+      expect(authAnswered).toBe(true); // we did authenticate, so this is the post-auth denial
+      expect(reqCount).toBe(1); // and it is terminal: no second REQ was sent
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects loudly when the relay refuses the AUTH (OK false)', async () => {
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        const subId = msg[1];
+        ctx.reply(['AUTH', 'challenge-refuse']);
+        ctx.reply(['CLOSED', subId, 'auth-required: nope']);
+      } else if (msg[0] === 'AUTH') {
+        ctx.reply(['OK', msg[1].id, false, 'pubkey not permitted']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('pubkey not permitted');
+    } finally {
+      restore();
+    }
+  });
+
+  it('closes the socket on a reject path, not only on EOSE', async () => {
+    // Every exit from fetchGiftWraps has to tear the connection down. The reject
+    // paths used to return without closing, leaking the socket until the isolate
+    // was torn down.
+    const { closes, restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.reply(['CLOSED', msg[1], 'error: relay is shutting down']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('relay is shutting down');
+      expect(closes.count).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+});
+
+// The checkpoint guard, exercised through syncInbox (which owns the KV write).
+// BLOSSOM_DB is left undefined so initReportsTable is skipped and no D1 is
+// touched; every scenario drives zero decrypted events, so the classify path
+// never runs -- the point under test is purely whether the checkpoint moves.
+describe('DM Reader - syncInbox checkpoint guard', () => {
+  function createKvMock(initial = new Map()) {
+    const store = new Map(initial);
+    const puts = [];
+    return {
+      store,
+      puts,
+      async get(key) { return store.has(key) ? store.get(key) : null; },
+      async put(key, value) { puts.push({ key, value }); store.set(key, value); },
+    };
+  }
+
+  function installRelayMock(onSend) {
+    const original = globalThis.WebSocket;
+    const sent = [];
+    globalThis.WebSocket = class {
+      constructor(url) {
+        this.url = url;
+        this._listeners = new Map();
+        queueMicrotask(() => this._emit('open', {}));
+      }
+      addEventListener(type, listener) { this._listeners.set(type, listener); }
+      send(message) {
+        const parsed = JSON.parse(message);
+        sent.push(parsed);
+        onSend(parsed, {
+          reply: (arr) => this._emit('message', { data: JSON.stringify(arr) }),
+          closeConn: () => this._emit('close', {}),
+        });
+      }
+      close() {}
+      _emit(type, event) { this._listeners.get(type)?.(event); }
+    };
+    return { sent, restore: () => { globalThis.WebSocket = original; } };
+  }
+
+  it('advances the checkpoint after a completed (EOSE) sync', async () => {
+    const kv = createKvMock();
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.reply(['EOSE', msg[1]]); // clean completion, zero events
+      }
+    });
+
+    try {
+      const result = await syncInbox({ NOSTR_PRIVATE_KEY: testHex, MODERATION_KV: kv });
+      expect(result).toEqual({ synced: 0, skipped: 0, errors: 0 });
+      expect(kv.puts.map((p) => p.key)).toContain('dm-inbox:last-sync');
+    } finally {
+      restore();
+    }
+  });
+
+  it('leaves the checkpoint unchanged when the sync never completes (no EOSE)', async () => {
+    const kv = createKvMock(new Map([['dm-inbox:last-sync', '1700000000']]));
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.closeConn(); // relay drops the connection without an EOSE
+      }
+    });
+
+    try {
+      const result = await syncInbox({ NOSTR_PRIVATE_KEY: testHex, MODERATION_KV: kv });
+      expect(result).toEqual({ synced: 0, skipped: 0, errors: 0 });
+      expect(kv.puts).toHaveLength(0);
+      expect(kv.store.get('dm-inbox:last-sync')).toBe('1700000000'); // untouched
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not advance the checkpoint when the relay refuses AUTH', async () => {
+    const kv = createKvMock(new Map([['dm-inbox:last-sync', '1700000000']]));
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        const subId = msg[1];
+        ctx.reply(['AUTH', 'c']);
+        ctx.reply(['CLOSED', subId, 'auth-required: nope']);
+      } else if (msg[0] === 'AUTH') {
+        ctx.reply(['OK', msg[1].id, false, 'not permitted']);
+      }
+    });
+
+    try {
+      await expect(syncInbox({ NOSTR_PRIVATE_KEY: testHex, MODERATION_KV: kv }))
+        .rejects.toThrow('not permitted');
+      expect(kv.puts).toHaveLength(0);
+      expect(kv.store.get('dm-inbox:last-sync')).toBe('1700000000'); // untouched
+    } finally {
+      restore();
+    }
   });
 });
