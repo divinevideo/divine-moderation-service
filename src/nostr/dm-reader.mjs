@@ -503,7 +503,12 @@ export function fetchGiftWraps(relayUrl, filter, env) {
 
         if (data[0] === 'CLOSED' && data[1] === subscriptionId) {
           const reason = typeof data[2] === 'string' && data[2] ? data[2] : 'unknown reason';
-          const isAuthGate = reason.startsWith('auth-required:') || reason.startsWith('restricted:');
+          // Only 'auth-required:' means "authenticate and retry" (NIP-42). The
+          // relay hands us its challenge on connect, so by the time it gates a
+          // read we can answer and re-REQ. 'restricted:' is NIP-42's terminal
+          // "authenticated but this key is not allowed" -- retrying can't help,
+          // so it falls through to the loud reject below.
+          const isAuthGate = reason.startsWith('auth-required:');
           if (isAuthGate && !reqResent) {
             // Expected pre-auth close: the relay wants us to authenticate and
             // re-subscribe. Note it and re-REQ once the AUTH is confirmed.

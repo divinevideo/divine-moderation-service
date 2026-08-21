@@ -648,6 +648,28 @@ describe('DM Reader - fetchGiftWraps NIP-42 AUTH', () => {
     }
   });
 
+  it('rejects loudly on a "restricted:" close (NIP-42 terminal denial, not a retry)', async () => {
+    // 'restricted:' means we authenticated but this key is not allowed -- per
+    // NIP-42 retrying can't help, so it must reject, not loop on re-REQ.
+    let reqCount = 0;
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        reqCount += 1;
+        ctx.reply(['CLOSED', msg[1], 'restricted: not the addressed recipient']);
+      } else if (msg[0] === 'AUTH') {
+        ctx.reply(['OK', msg[1].id, true, '']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('restricted: not the addressed recipient');
+      expect(reqCount).toBe(1); // rejected on the first close, no re-REQ loop
+    } finally {
+      restore();
+    }
+  });
+
   it('rejects loudly when the relay refuses the AUTH (OK false)', async () => {
     const { restore } = installRelayMock((msg, ctx) => {
       if (msg[0] === 'REQ') {
