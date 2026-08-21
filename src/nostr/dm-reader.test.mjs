@@ -538,9 +538,12 @@ describe('DM Reader - fetchGiftWraps NIP-42 AUTH', () => {
   // Swap a scripted relay onto globalThis.WebSocket. onSend(parsed, ctx) is
   // called for every client->relay frame; ctx.reply(arr) pushes a relay->client
   // frame, ctx.closeConn() fires the socket 'close' event without an EOSE.
+  // closes.count records socket teardown, so a test can pin that an exit path
+  // actually closed the connection instead of leaking it.
   function installRelayMock(onSend) {
     const original = globalThis.WebSocket;
     const sent = [];
+    const closes = { count: 0 };
     globalThis.WebSocket = class {
       constructor(url) {
         this.url = url;
@@ -557,10 +560,10 @@ describe('DM Reader - fetchGiftWraps NIP-42 AUTH', () => {
           fail: (message) => this._emit('error', { message }),
         });
       }
-      close() {}
+      close() { closes.count += 1; }
       _emit(type, event) { this._listeners.get(type)?.(event); }
     };
-    return { sent, restore: () => { globalThis.WebSocket = original; } };
+    return { sent, closes, restore: () => { globalThis.WebSocket = original; } };
   }
 
   it('answers the AUTH challenge, re-subscribes after the auth-required close, and returns the gift wraps', async () => {
@@ -684,6 +687,25 @@ describe('DM Reader - fetchGiftWraps NIP-42 AUTH', () => {
     try {
       await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
         .rejects.toThrow('pubkey not permitted');
+    } finally {
+      restore();
+    }
+  });
+
+  it('closes the socket on a reject path, not only on EOSE', async () => {
+    // Every exit from fetchGiftWraps has to tear the connection down. The reject
+    // paths used to return without closing, leaking the socket until the isolate
+    // was torn down.
+    const { closes, restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.reply(['CLOSED', msg[1], 'error: relay is shutting down']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('relay is shutting down');
+      expect(closes.count).toBe(1);
     } finally {
       restore();
     }
