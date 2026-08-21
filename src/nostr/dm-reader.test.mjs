@@ -673,6 +673,37 @@ describe('DM Reader - fetchGiftWraps NIP-42 AUTH', () => {
     }
   });
 
+  it('rejects a "restricted:" close that arrives after a successful AUTH', async () => {
+    // The shape relay.divine.video actually produces: it challenges on connect,
+    // we authenticate, and the read is still refused because the filter is not
+    // scoped to the authed key (funnelcake crates/relay/src/auth.rs only returns
+    // Restricted for an already-authenticated connection). NIP-42 reserves
+    // 'restricted:' for exactly this post-auth case, so there is nothing to
+    // retry -- re-REQing can only draw the same refusal.
+    let reqCount = 0;
+    let authAnswered = false;
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        reqCount += 1;
+        // Challenge first, so the AUTH round trip completes before the refusal.
+        ctx.reply(['AUTH', 'challenge-post-auth']);
+        ctx.reply(['CLOSED', msg[1], 'restricted: not authorized to read events for another pubkey']);
+      } else if (msg[0] === 'AUTH') {
+        authAnswered = true;
+        ctx.reply(['OK', msg[1].id, true, '']);
+      }
+    });
+
+    try {
+      await expect(fetchGiftWraps(RELAY, FILTER, { NOSTR_PRIVATE_KEY: testHex }))
+        .rejects.toThrow('restricted: not authorized to read events for another pubkey');
+      expect(authAnswered).toBe(true); // we did authenticate, so this is the post-auth denial
+      expect(reqCount).toBe(1); // and it is terminal: no second REQ was sent
+    } finally {
+      restore();
+    }
+  });
+
   it('rejects loudly when the relay refuses the AUTH (OK false)', async () => {
     const { restore } = installRelayMock((msg, ctx) => {
       if (msg[0] === 'REQ') {
