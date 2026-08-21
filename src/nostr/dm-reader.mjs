@@ -486,8 +486,11 @@ export function fetchGiftWraps(relayUrl, filter, env) {
           return;
         }
 
-        if (data[0] === 'OK' && data[1] === authEventId) {
-          // Relay's verdict on our AUTH event specifically.
+        if (data[0] === 'OK' && authEventId !== null && data[1] === authEventId) {
+          // Relay's verdict on our AUTH event specifically. The authEventId
+          // null-check keeps a malformed ["OK", null, ...] frame arriving before
+          // we have signed an AUTH from matching (null === null) and spuriously
+          // flipping the handshake state.
           if (data[2] === true) {
             authConfirmed = true;
             maybeResendReq();
