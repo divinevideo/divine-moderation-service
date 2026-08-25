@@ -56,3 +56,43 @@ describe('messages UI — progressive render + optimistic send', () => {
     expect(messagesHTML).toContain('renderThread([])');
   });
 });
+
+describe('messages UI — conversation list pagination', () => {
+  it('does not cap the list at a single hardcoded page', () => {
+    // The bug: the sidebar fetched exactly one page and never asked for more,
+    // so history only reached back as far as the 50 most-recent conversations.
+    expect(messagesHTML).not.toContain("'/admin/api/messages?limit=50'");
+  });
+
+  it('fetches conversations with an offset so it can page through history', () => {
+    expect(messagesHTML).toContain('conversationsOffset');
+    expect(messagesHTML).toContain('&offset=');
+  });
+
+  it('tracks whether more pages remain, keyed off a full page coming back', () => {
+    // hasMore stays true only while the server returns a complete page.
+    expect(messagesHTML).toContain('conversationsHasMore');
+    expect(messagesHTML).toContain('CONVERSATIONS_PAGE_SIZE');
+    expect(messagesHTML).toContain('page.length === CONVERSATIONS_PAGE_SIZE');
+  });
+
+  it('appends further pages instead of replacing the loaded list', () => {
+    expect(messagesHTML).toContain('conversations.concat(page)');
+  });
+
+  it('loads the next page when the conversation list is scrolled near the bottom', () => {
+    expect(messagesHTML).toContain('function loadMoreConversations');
+    expect(messagesHTML).toContain("getElementById('conversation-items').addEventListener('scroll'");
+  });
+
+  it('guards load-more against overlap and past the last page', () => {
+    expect(messagesHTML).toContain('conversationsLoading');
+    // No further fetch once no full page remains or a load is already in flight.
+    expect(messagesHTML).toContain('if (conversationsLoading || !conversationsHasMore)');
+  });
+
+  it('preserves scroll position across re-render so appends do not jump to top', () => {
+    expect(messagesHTML).toContain('const prevScroll = container.scrollTop;');
+    expect(messagesHTML).toContain('container.scrollTop = prevScroll;');
+  });
+});

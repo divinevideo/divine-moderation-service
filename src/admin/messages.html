@@ -519,6 +519,15 @@
     let conversations = [];
     let profileCache = {};
 
+    // Conversation-list pagination. The list is ordered by last activity, so
+    // paging with offset walks backward through history one page at a time.
+    // hasMore stays true only while the server hands back a full page; a short
+    // page means we've reached the oldest conversation.
+    const CONVERSATIONS_PAGE_SIZE = 50;
+    let conversationsOffset = 0;
+    let conversationsHasMore = true;
+    let conversationsLoading = false;
+
     // --- Helpers ---
 
     function truncatePubkey(hex) {
@@ -626,28 +635,57 @@
 
     // --- Fetch conversations ---
 
-    async function fetchConversations() {
+    async function fetchConversations({ append = false } = {}) {
       const container = document.getElementById('conversation-items');
       const loading = document.getElementById('conv-loading');
-      loading.style.display = 'flex';
+
+      // Fresh load (initial paint or a refresh) resets pagination back to the
+      // first page; append keeps walking backward from where we left off.
+      if (!append) {
+        conversationsOffset = 0;
+        conversationsHasMore = true;
+        // The first successful render replaces the list's innerHTML, which
+        // removes this spinner node for good — so on a later Refresh it's
+        // already gone. Guard rather than deref null.
+        if (loading) loading.style.display = 'flex';
+      }
+      conversationsLoading = true;
 
       try {
-        const res = await fetch('/admin/api/messages?limit=50');
+        const res = await fetch('/admin/api/messages?limit=' + CONVERSATIONS_PAGE_SIZE + '&offset=' + conversationsOffset);
         if (!res.ok) throw new Error('Failed to fetch conversations');
         const data = await res.json();
-        conversations = data.conversations || data || [];
+        const page = data.conversations || data || [];
+
+        conversations = append ? conversations.concat(page) : page;
+        conversationsOffset += page.length;
+        // A short page means the server has no more rows past this point.
+        conversationsHasMore = page.length === CONVERSATIONS_PAGE_SIZE;
 
         // Paint immediately — displayName() falls back to the truncated pubkey,
         // so rows show last message + timestamp without waiting on the
         // relay-bound profile lookup. Then fetch profiles in the background and
-        // re-render to patch in names/avatars when they arrive.
+        // re-render to patch in names/avatars when they arrive. Only the new
+        // page needs a profile lookup; earlier pages are already cached.
         renderConversations();
-        const pubkeys = conversations.map(c => c.participant_pubkey || c.pubkey).filter(Boolean);
+        const pubkeys = page.map(c => c.participant_pubkey || c.pubkey).filter(Boolean);
         fetchProfiles(pubkeys).then(() => renderConversations()).catch(() => {});
       } catch (err) {
-        container.innerHTML = '<div class="empty-state">Failed to load conversations</div>';
+        if (!append) {
+          container.innerHTML = '<div class="empty-state">Failed to load conversations</div>';
+        }
         console.error('fetchConversations error:', err);
+      } finally {
+        conversationsLoading = false;
       }
+    }
+
+    // Infinite scroll: pull the next page as the moderator nears the bottom of
+    // the list. Guarded so overlapping scroll events and the end of history
+    // don't fire redundant fetches.
+    async function loadMoreConversations() {
+      if (conversationsLoading || !conversationsHasMore) return;
+      await fetchConversations({ append: true });
     }
 
     function renderConversations() {
@@ -656,6 +694,11 @@
 
     function renderConversationList(list) {
       const container = document.getElementById('conversation-items');
+      // Rebuilding innerHTML resets scrollTop to 0, which would yank the list
+      // back to the top every time an appended page (or a background profile
+      // patch) re-renders. Capture and restore so the viewport stays put; the
+      // earlier rows render identically, so the saved offset stays valid.
+      const prevScroll = container.scrollTop;
 
       if (!list.length) {
         container.innerHTML = '<div class="empty-state">No conversations yet</div>';
@@ -685,6 +728,8 @@
           </div>
         `;
       }).join('');
+
+      container.scrollTop = prevScroll;
     }
 
     function escapeHtml(str) {
@@ -996,6 +1041,15 @@
     document.getElementById('compose-input').addEventListener('input', function() {
       this.style.height = 'auto';
       this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+    });
+
+    // --- Infinite scroll for the conversation list ---
+    document.getElementById('conversation-items').addEventListener('scroll', function() {
+      // Trigger a little before the exact bottom so the next page is ready by
+      // the time the moderator scrolls into it.
+      if (this.scrollTop + this.clientHeight >= this.scrollHeight - 200) {
+        loadMoreConversations();
+      }
     });
 
     // --- Init ---
