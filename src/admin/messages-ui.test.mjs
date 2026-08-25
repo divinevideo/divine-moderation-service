@@ -96,3 +96,37 @@ describe('messages UI — conversation list pagination', () => {
     expect(messagesHTML).toContain('container.scrollTop = prevScroll;');
   });
 });
+
+describe('messages UI — identifier search (full-history reach)', () => {
+  it('runs an identifier lookup when the search box is submitted with Enter', () => {
+    expect(messagesHTML).toContain("getElementById('search-input').addEventListener('keydown'");
+    expect(messagesHTML).toContain("event.key === 'Enter'");
+    expect(messagesHTML).toContain('searchByIdentifier(');
+  });
+
+  it('resolves the typed identifier to a pubkey via the recipient endpoint', () => {
+    expect(messagesHTML).toContain('function searchByIdentifier');
+    // Reuses the existing hex/npub/nip-05 -> pubkey resolver.
+    expect(messagesHTML).toContain('/admin/api/recipient/resolve?input=');
+  });
+
+  it('opens the resolved conversation directly, reaching beyond loaded pages', () => {
+    // selectConversation loads the thread by deterministic conversation_id, so
+    // a hit opens whether or not the conversation is in the loaded list.
+    expect(messagesHTML).toContain('selectConversation(data.pubkey)');
+  });
+
+  it('advertises identifier input in the search placeholder', () => {
+    expect(messagesHTML).toContain('placeholder="Search name, pubkey, npub, or nip-05');
+  });
+
+  it('tells the moderator that free-text name search only covers loaded conversations', () => {
+    expect(messagesHTML).toContain('covers loaded conversations');
+  });
+
+  it('clears the search box and restores the list after opening a hit', () => {
+    // Otherwise the live oninput filter leaves the list emptied to the raw
+    // identifier (which matches nothing loaded) while the thread is open.
+    expect(messagesHTML).toContain("document.getElementById('search-input').value = '';");
+  });
+});

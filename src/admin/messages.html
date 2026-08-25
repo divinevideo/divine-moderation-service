@@ -116,6 +116,17 @@
       border-color: #2563eb;
     }
 
+    .search-status {
+      font-size: 11px;
+      color: #888;
+      text-transform: none;
+      letter-spacing: normal;
+      line-height: 1.4;
+    }
+    .search-status:empty {
+      display: none;
+    }
+
     .conv-avatar {
       width: 24px;
       height: 24px;
@@ -463,8 +474,9 @@
     <div class="conversation-list">
       <div class="conversation-list-header">
         <span>Conversations</span>
-        <input type="text" id="search-input" placeholder="Search by name or pubkey..."
+        <input type="text" id="search-input" placeholder="Search name, pubkey, npub, or nip-05 (Enter to look up)"
           oninput="filterConversations(this.value)">
+        <div id="search-status" class="search-status"></div>
       </div>
       <div class="conversation-items" id="conversation-items">
         <div class="loading-state" id="conv-loading">
@@ -627,6 +639,63 @@
       });
 
       renderConversationList(filtered);
+    }
+
+    // Only these shapes resolve to a single pubkey. Guarding here keeps a plain
+    // name from being sent to the resolver, which would otherwise treat a bare
+    // word as a handle (e.g. "alice" -> alice@divine.video) and open an
+    // unintended conversation. Plain names stay a pure client-side filter.
+    // This is an intentional divergence from the New Message compose flow
+    // (resolveRecipient), which posts raw input and so resolves a bare handle:
+    // here the same box also drives live name filtering, so a bare word is a
+    // filter, not a lookup. Identifier forms (@handle, host.tld, user@domain,
+    // npub, hex) still resolve identically in both places.
+    function looksLikeIdentifier(q) {
+      return /^[0-9a-f]{64}$/i.test(q)   // bare hex pubkey
+        || /^npub1[0-9a-z]+$/i.test(q)   // npub
+        || q.includes('@')               // @handle or user@domain
+        || /\.[a-z]{2,}$/i.test(q);      // bare handle, e.g. mjb.divine.video
+    }
+
+    // Identifier lookup (Enter): resolve a typed hex pubkey / npub / nip-05 to a
+    // pubkey and open that conversation directly. Because selectConversation
+    // loads the thread by its deterministic conversation_id, this reaches the
+    // full history — not just the pages currently loaded in the list. Free-text
+    // (names) doesn't resolve; that path stays the live client-side filter,
+    // which only covers loaded conversations.
+    async function searchByIdentifier(rawQuery) {
+      const query = (rawQuery || '').trim();
+      if (!query) return;
+      const status = document.getElementById('search-status');
+      const setStatus = (msg) => { if (status) status.textContent = msg || ''; };
+
+      if (!looksLikeIdentifier(query)) {
+        // Plain text — the live filter over loaded conversations is the result.
+        setStatus('Name search covers loaded conversations only. For older history, search by pubkey, npub, or nip-05.');
+        return;
+      }
+
+      setStatus('Searching…');
+      try {
+        const res = await fetch('/admin/api/recipient/resolve?input=' + encodeURIComponent(query));
+        if (!res.ok) {
+          setStatus('No match for that pubkey, npub, or nip-05.');
+          return;
+        }
+        const data = await res.json();
+        setStatus('');
+        // Warm the profile so the thread header shows a name/avatar immediately.
+        await fetchProfiles([data.pubkey]).catch(() => {});
+        await selectConversation(data.pubkey);
+        // Restore the list: the live oninput filter emptied it to whatever
+        // matched the raw identifier (usually nothing loaded), so clear the box
+        // and re-render the full loaded list now that the thread is open.
+        document.getElementById('search-input').value = '';
+        renderConversations();
+      } catch (err) {
+        setStatus('Search failed. Try again.');
+        console.error('searchByIdentifier error:', err);
+      }
     }
 
     function currentConversationSearch() {
@@ -1041,6 +1110,14 @@
     document.getElementById('compose-input').addEventListener('input', function() {
       this.style.height = 'auto';
       this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+    });
+
+    // --- Identifier search: Enter resolves the query to a conversation ---
+    document.getElementById('search-input').addEventListener('keydown', function(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        searchByIdentifier(this.value);
+      }
     });
 
     // --- Infinite scroll for the conversation list ---
