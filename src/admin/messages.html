@@ -653,7 +653,7 @@
     // word as a handle (e.g. "alice" -> alice@divine.video) and open an
     // unintended conversation. Plain names stay a pure client-side filter.
     // This is an intentional divergence from the New Message compose flow
-    // (resolveRecipient), which posts raw input and so resolves a bare handle:
+    // (resolveRecipient), which sends raw input and so resolves a bare handle:
     // here the same box also drives live name filtering, so a bare word is a
     // filter, not a lookup. Identifier forms (@handle, host.tld, user@domain,
     // npub, hex) still resolve identically in both places.
@@ -699,7 +699,6 @@
           setStatus('No match for that pubkey, npub, or nip-05.');
           return;
         }
-        setStatus('');
         // Clear the box BEFORE opening: selectConversation re-renders the list,
         // and with the identifier cleared that render shows the full loaded list
         // instead of the empty view the live oninput filter left behind (the raw
@@ -713,6 +712,7 @@
         // Warm the profile so the thread header shows a name/avatar immediately.
         await fetchProfiles([data.pubkey]).catch(() => {});
         if (gen !== conversationSearchGen) return;
+        setStatus('');
         await selectConversation(data.pubkey, { searchGen: gen });
       } catch (err) {
         if (gen !== conversationSearchGen) return;
@@ -892,6 +892,8 @@
         if (opts.searchGen !== conversationSearchGen) return;
       } else {
         conversationSearchGen++;
+        const searchStatus = document.getElementById('search-status');
+        if (searchStatus) searchStatus.textContent = '';
       }
       selectedPubkey = pubkey;
 

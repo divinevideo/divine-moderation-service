@@ -194,6 +194,16 @@ describe('messages UI — identifier search (full-history reach)', () => {
     );
   });
 
+  it('keeps search progress visible until profile warm-up finishes', () => {
+    const fn = messagesHTML.slice(
+      messagesHTML.indexOf('async function searchByIdentifier'),
+      messagesHTML.indexOf('function currentConversationSearch'),
+    );
+    expect(fn).toMatch(
+      /await fetchProfiles\(\[data\.pubkey\]\)[\s\S]*?setStatus\(''\);[\s\S]*?selectConversation/,
+    );
+  });
+
   it('clears a lingering search status while the moderator keeps typing', () => {
     expect(messagesHTML).toContain('function onSearchInput');
     expect(messagesHTML).toContain('oninput="onSearchInput(this.value)"');
