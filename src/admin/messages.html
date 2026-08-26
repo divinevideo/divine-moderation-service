@@ -543,6 +543,9 @@
     // when a Refresh landed discards its stale result instead of both mutating
     // conversationsOffset and silently skipping a page.
     let conversationsGen = 0;
+    // Invalidates an in-flight identifier lookup when the moderator searches
+    // again, keeps typing, or opens a different conversation.
+    let conversationSearchGen = 0;
 
     // --- Helpers ---
 
@@ -670,6 +673,7 @@
     async function searchByIdentifier(rawQuery) {
       const query = (rawQuery || '').trim();
       if (!query) return;
+      const gen = ++conversationSearchGen;
       const status = document.getElementById('search-status');
       const setStatus = (msg) => { if (status) status.textContent = msg || ''; };
 
@@ -682,11 +686,13 @@
       setStatus('Searching…');
       try {
         const res = await fetch('/admin/api/recipient/resolve?input=' + encodeURIComponent(query));
+        if (gen !== conversationSearchGen) return;
         if (!res.ok) {
           setStatus('No match for that pubkey, npub, or nip-05.');
           return;
         }
         const data = await res.json();
+        if (gen !== conversationSearchGen) return;
         // Defensive: the resolver contract returns a hex pubkey on every 200,
         // but never open /messages/undefined if that ever changes.
         if (!data.pubkey) {
@@ -706,8 +712,10 @@
         document.getElementById('search-input').value = '';
         // Warm the profile so the thread header shows a name/avatar immediately.
         await fetchProfiles([data.pubkey]).catch(() => {});
-        await selectConversation(data.pubkey);
+        if (gen !== conversationSearchGen) return;
+        await selectConversation(data.pubkey, { searchGen: gen });
       } catch (err) {
+        if (gen !== conversationSearchGen) return;
         setStatus('Search failed. Try again.');
         console.error('searchByIdentifier error:', err);
       }
@@ -721,6 +729,7 @@
     // identifier-search status (e.g. the "name search covers loaded only" note)
     // so it doesn't hang under the box while the moderator keeps typing.
     function onSearchInput(value) {
+      conversationSearchGen++;
       const status = document.getElementById('search-status');
       if (status) status.textContent = '';
       filterConversations(value);
@@ -879,6 +888,11 @@
     // --- Select conversation & load thread ---
 
     async function selectConversation(pubkey, opts = {}) {
+      if (opts.searchGen !== undefined) {
+        if (opts.searchGen !== conversationSearchGen) return;
+      } else {
+        conversationSearchGen++;
+      }
       selectedPubkey = pubkey;
 
       // Optimistically clear the unread dot for this row, then tell the

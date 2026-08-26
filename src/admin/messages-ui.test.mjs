@@ -169,7 +169,7 @@ describe('messages UI — identifier search (full-history reach)', () => {
       messagesHTML.indexOf('function currentConversationSearch'),
     );
     expect(fn).toContain("fetch('/admin/api/recipient/resolve?input=' + encodeURIComponent(query))");
-    expect(fn).toContain('selectConversation(data.pubkey)');
+    expect(fn).toContain('selectConversation(data.pubkey, { searchGen: gen })');
   });
 
   it('advertises identifier input in the search placeholder', () => {
@@ -190,13 +190,29 @@ describe('messages UI — identifier search (full-history reach)', () => {
     // Clearing must precede selectConversation (which re-renders the list); doing
     // it after would render the empty filtered view first, then repopulate.
     expect(messagesHTML).toMatch(
-      /getElementById\('search-input'\)\.value = '';[\s\S]*?selectConversation\(data\.pubkey\)/,
+      /getElementById\('search-input'\)\.value = '';[\s\S]*?selectConversation\(data\.pubkey, \{ searchGen: gen \}\)/,
     );
   });
 
   it('clears a lingering search status while the moderator keeps typing', () => {
     expect(messagesHTML).toContain('function onSearchInput');
     expect(messagesHTML).toContain('oninput="onSearchInput(this.value)"');
+  });
+
+  it('discards stale identifier results after a newer search or navigation', () => {
+    const searchFn = messagesHTML.slice(
+      messagesHTML.indexOf('async function searchByIdentifier'),
+      messagesHTML.indexOf('function currentConversationSearch'),
+    );
+    const selectFn = messagesHTML.slice(
+      messagesHTML.indexOf('async function selectConversation'),
+      messagesHTML.indexOf('async function loadThread'),
+    );
+    expect(searchFn).toContain('const gen = ++conversationSearchGen;');
+    expect(searchFn).toContain('if (gen !== conversationSearchGen) return;');
+    expect(searchFn).toContain('selectConversation(data.pubkey, { searchGen: gen })');
+    expect(messagesHTML).toMatch(/function onSearchInput\(value\) \{\s*conversationSearchGen\+\+;/);
+    expect(selectFn).toContain('conversationSearchGen++');
   });
 });
 
