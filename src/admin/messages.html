@@ -116,6 +116,17 @@
       border-color: #2563eb;
     }
 
+    .search-status {
+      font-size: 11px;
+      color: #888;
+      text-transform: none;
+      letter-spacing: normal;
+      line-height: 1.4;
+    }
+    .search-status:empty {
+      display: none;
+    }
+
     .conv-avatar {
       width: 24px;
       height: 24px;
@@ -463,8 +474,9 @@
     <div class="conversation-list">
       <div class="conversation-list-header">
         <span>Conversations</span>
-        <input type="text" id="search-input" placeholder="Search by name or pubkey..."
-          oninput="filterConversations(this.value)">
+        <input type="text" id="search-input" placeholder="Search name, pubkey, npub, or nip-05 (Enter to look up)"
+          oninput="onSearchInput(this.value)">
+        <div id="search-status" class="search-status"></div>
       </div>
       <div class="conversation-items" id="conversation-items">
         <div class="loading-state" id="conv-loading">
@@ -518,6 +530,22 @@
     let selectedPubkey = null;
     let conversations = [];
     let profileCache = {};
+
+    // Conversation-list pagination. The list is ordered by last activity, so
+    // paging with offset walks backward through history one page at a time.
+    // hasMore stays true only while the server hands back a full page; a short
+    // page means we've reached the oldest conversation.
+    const CONVERSATIONS_PAGE_SIZE = 50;
+    let conversationsOffset = 0;
+    let conversationsHasMore = true;
+    let conversationsLoading = false;
+    // Bumped on every fresh (non-append) load so an append that was in flight
+    // when a Refresh landed discards its stale result instead of both mutating
+    // conversationsOffset and silently skipping a page.
+    let conversationsGen = 0;
+    // Invalidates an in-flight identifier lookup when the moderator searches
+    // again, keeps typing, or opens a different conversation.
+    let conversationSearchGen = 0;
 
     // --- Helpers ---
 
@@ -620,34 +648,183 @@
       renderConversationList(filtered);
     }
 
+    // Only these shapes resolve to a single pubkey. Guarding here keeps a plain
+    // name from being sent to the resolver, which would otherwise treat a bare
+    // word as a handle (e.g. "alice" -> alice@divine.video) and open an
+    // unintended conversation. Plain names stay a pure client-side filter.
+    // This is an intentional divergence from the New Message compose flow
+    // (resolveRecipient), which sends raw input and so resolves a bare handle:
+    // here the same box also drives live name filtering, so a bare word is a
+    // filter, not a lookup. Identifier forms (@handle, host.tld, user@domain,
+    // npub, hex) still resolve identically in both places.
+    function looksLikeIdentifier(q) {
+      return /^[0-9a-f]{64}$/i.test(q)   // bare hex pubkey
+        || /^npub1[0-9a-z]+$/i.test(q)   // npub
+        || q.includes('@')               // @handle or user@domain
+        || /\.[a-z]{2,}$/i.test(q);      // bare handle, e.g. mjb.divine.video
+    }
+
+    // Identifier lookup (Enter): resolve a typed hex pubkey / npub / nip-05 to a
+    // pubkey and open that conversation directly. Because selectConversation
+    // loads the thread by its deterministic conversation_id, this reaches the
+    // full history — not just the pages currently loaded in the list. Free-text
+    // (names) doesn't resolve; that path stays the live client-side filter,
+    // which only covers loaded conversations.
+    async function searchByIdentifier(rawQuery) {
+      const query = (rawQuery || '').trim();
+      if (!query) return;
+      const gen = ++conversationSearchGen;
+      const status = document.getElementById('search-status');
+      const setStatus = (msg) => { if (status) status.textContent = msg || ''; };
+
+      if (!looksLikeIdentifier(query)) {
+        // Plain text — the live filter over loaded conversations is the result.
+        setStatus('Name search covers loaded conversations only. For older history, search by pubkey, npub, or nip-05.');
+        return;
+      }
+
+      setStatus('Searching…');
+      try {
+        const res = await fetch('/admin/api/recipient/resolve?input=' + encodeURIComponent(query));
+        if (gen !== conversationSearchGen) return;
+        if (!res.ok) {
+          setStatus('No match for that pubkey, npub, or nip-05.');
+          return;
+        }
+        const data = await res.json();
+        if (gen !== conversationSearchGen) return;
+        // Defensive: the resolver contract returns a hex pubkey on every 200,
+        // but never open /messages/undefined if that ever changes.
+        if (!data.pubkey) {
+          setStatus('No match for that pubkey, npub, or nip-05.');
+          return;
+        }
+        // Clear the box BEFORE opening: selectConversation re-renders the list,
+        // and with the identifier cleared that render shows the full loaded list
+        // instead of the empty view the live oninput filter left behind (the raw
+        // identifier matches nothing loaded). Clearing after would flash empty.
+        // Note (intended): if the resolved conversation is deeper than the loaded
+        // pages it opens in the thread panel without a matching/highlighted list
+        // row. That's accepted — the thread header identifies it; a Refresh (which
+        // collapses back to page 1) can likewise leave a selected deep row
+        // unhighlighted until it's paged back in.
+        document.getElementById('search-input').value = '';
+        // Warm the profile so the thread header shows a name/avatar immediately.
+        await fetchProfiles([data.pubkey]).catch(() => {});
+        if (gen !== conversationSearchGen) return;
+        setStatus('');
+        await selectConversation(data.pubkey, { searchGen: gen });
+      } catch (err) {
+        if (gen !== conversationSearchGen) return;
+        setStatus('Search failed. Try again.');
+        console.error('searchByIdentifier error:', err);
+      }
+    }
+
     function currentConversationSearch() {
       return document.getElementById('search-input')?.value || '';
     }
 
+    // Live-typing handler: filter the loaded list and clear any lingering
+    // identifier-search status (e.g. the "name search covers loaded only" note)
+    // so it doesn't hang under the box while the moderator keeps typing.
+    function onSearchInput(value) {
+      conversationSearchGen++;
+      const status = document.getElementById('search-status');
+      if (status) status.textContent = '';
+      filterConversations(value);
+    }
+
     // --- Fetch conversations ---
 
-    async function fetchConversations() {
+    async function fetchConversations({ append = false } = {}) {
       const container = document.getElementById('conversation-items');
       const loading = document.getElementById('conv-loading');
-      loading.style.display = 'flex';
+
+      // Fresh load (initial paint or a refresh) resets pagination back to the
+      // first page; append keeps walking backward from where we left off.
+      if (!append) {
+        conversationsOffset = 0;
+        conversationsHasMore = true;
+        // The first successful render replaces the list's innerHTML, which
+        // removes this spinner node for good — so on a later Refresh it's
+        // already gone. Guard rather than deref null.
+        if (loading) loading.style.display = 'flex';
+      }
+      // A fresh load supersedes anything in flight; an append rides the current
+      // generation and bails after its await if a fresh load bumped it. The
+      // offset in the URL below is read synchronously (no await before it), so
+      // each invocation fetches the page it intended.
+      const gen = append ? conversationsGen : ++conversationsGen;
+      conversationsLoading = true;
 
       try {
-        const res = await fetch('/admin/api/messages?limit=50');
+        const res = await fetch('/admin/api/messages?limit=' + CONVERSATIONS_PAGE_SIZE + '&offset=' + conversationsOffset);
         if (!res.ok) throw new Error('Failed to fetch conversations');
         const data = await res.json();
-        conversations = data.conversations || data || [];
+        if (gen !== conversationsGen) return; // superseded by a fresh load — discard
+        const page = data.conversations || data || [];
+
+        // Dedupe on append: offset paging over an activity-ordered list can
+        // re-surface a row that moved up between page fetches.
+        conversations = append ? dedupeConversations(conversations.concat(page)) : page;
+        conversationsOffset += page.length;
+        // A short page means the server has no more rows past this point.
+        conversationsHasMore = page.length === CONVERSATIONS_PAGE_SIZE;
 
         // Paint immediately — displayName() falls back to the truncated pubkey,
         // so rows show last message + timestamp without waiting on the
         // relay-bound profile lookup. Then fetch profiles in the background and
-        // re-render to patch in names/avatars when they arrive.
+        // re-render to patch in names/avatars when they arrive. Only the new
+        // page needs a profile lookup; earlier pages are already cached.
         renderConversations();
-        const pubkeys = conversations.map(c => c.participant_pubkey || c.pubkey).filter(Boolean);
+        const pubkeys = page.map(c => c.participant_pubkey || c.pubkey).filter(Boolean);
         fetchProfiles(pubkeys).then(() => renderConversations()).catch(() => {});
       } catch (err) {
-        container.innerHTML = '<div class="empty-state">Failed to load conversations</div>';
+        if (!append && gen === conversationsGen) {
+          container.innerHTML = '<div class="empty-state">Failed to load conversations</div>';
+        }
         console.error('fetchConversations error:', err);
+      } finally {
+        // Only the current generation owns the loading flag; a superseded append
+        // must not clear it out from under the fresh load that replaced it.
+        if (gen === conversationsGen) conversationsLoading = false;
       }
+    }
+
+    // Drop duplicate conversations by id (falling back to participant pubkey) so
+    // one conversation never renders as two rows after a boundary-straddling append.
+    function dedupeConversations(list) {
+      const seen = new Set();
+      return list.filter((c) => {
+        const key = c.conversation_id || c.participant_pubkey || c.pubkey;
+        // Drop only actual duplicates; a keyless row passes through (matching the
+        // fresh-load path, which never dedupes) rather than being silently eaten.
+        if (key && seen.has(key)) return false;
+        if (key) seen.add(key);
+        return true;
+      });
+    }
+
+    // Infinite scroll: pull the next page as the moderator nears the bottom of
+    // the list. Guarded so overlapping scroll events and the end of history
+    // don't fire redundant fetches.
+    async function loadMoreConversations() {
+      if (conversationsLoading || !conversationsHasMore) return;
+      await fetchConversations({ append: true });
+      maybeAutoFillConversations();
+    }
+
+    // A page that doesn't fill the list's viewport leaves no scrollbar to drive
+    // the infinite-scroll listener, so older history would be unreachable (tall
+    // window / few rows). Pull the next page until the viewport fills or history
+    // runs out. Bounded: it stops as soon as conversationsHasMore goes false.
+    function maybeAutoFillConversations() {
+      const c = document.getElementById('conversation-items');
+      if (!c || conversationsLoading || !conversationsHasMore) return;
+      // A filtered list is expected to be short; don't force-page through it.
+      if (currentConversationSearch().trim()) return;
+      if (c.scrollHeight <= c.clientHeight) loadMoreConversations();
     }
 
     function renderConversations() {
@@ -656,6 +833,14 @@
 
     function renderConversationList(list) {
       const container = document.getElementById('conversation-items');
+      // Rebuilding innerHTML resets scrollTop to 0, which would yank the list
+      // back to the top every time an appended page (or a background profile
+      // patch) re-renders. Capture and restore so the viewport stays put; the
+      // earlier rows render identically, so the saved offset stays valid.
+      // Only when unfiltered: a filtered (shorter) list would clamp the restored
+      // offset, so restoring onto it just fights the filter.
+      const prevScroll = container.scrollTop;
+      const preserveScroll = !currentConversationSearch().trim();
 
       if (!list.length) {
         container.innerHTML = '<div class="empty-state">No conversations yet</div>';
@@ -685,18 +870,31 @@
           </div>
         `;
       }).join('');
+
+      if (preserveScroll) container.scrollTop = prevScroll;
     }
 
     function escapeHtml(str) {
       if (!str) return '';
       const div = document.createElement('div');
       div.textContent = str;
-      return div.innerHTML;
+      // textContent serialization escapes < > & but NOT quotes. Several call
+      // sites interpolate the result into double-quoted attributes (e.g. an
+      // <img src="..."> built from an attacker-controlled profile.picture), so
+      // escape quotes too or such a value could break out of the attribute.
+      return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     // --- Select conversation & load thread ---
 
     async function selectConversation(pubkey, opts = {}) {
+      if (opts.searchGen !== undefined) {
+        if (opts.searchGen !== conversationSearchGen) return;
+      } else {
+        conversationSearchGen++;
+        const searchStatus = document.getElementById('search-status');
+        if (searchStatus) searchStatus.textContent = '';
+      }
       selectedPubkey = pubkey;
 
       // Optimistically clear the unread dot for this row, then tell the
@@ -907,6 +1105,7 @@
         // sync endpoint may not exist yet; ignore
       }
       await fetchConversations();
+      maybeAutoFillConversations();
       if (selectedPubkey) {
         await loadThread(selectedPubkey);
       }
@@ -998,12 +1197,30 @@
       this.style.height = Math.min(this.scrollHeight, 120) + 'px';
     });
 
+    // --- Identifier search: Enter resolves the query to a conversation ---
+    document.getElementById('search-input').addEventListener('keydown', function(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        searchByIdentifier(this.value);
+      }
+    });
+
+    // --- Infinite scroll for the conversation list ---
+    document.getElementById('conversation-items').addEventListener('scroll', function() {
+      // Trigger a little before the exact bottom so the next page is ready by
+      // the time the moderator scrolls into it.
+      if (this.scrollTop + this.clientHeight >= this.scrollHeight - 200) {
+        loadMoreConversations();
+      }
+    });
+
     // --- Init ---
     (async function init() {
       const urlParams = new URLSearchParams(window.location.search);
       const preselectedPubkey = urlParams.get('pubkey');
 
       await fetchConversations();
+      maybeAutoFillConversations();
       loadTemplates();
 
       if (preselectedPubkey) {
