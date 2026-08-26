@@ -223,6 +223,9 @@ describe('messages UI — identifier search (full-history reach)', () => {
     expect(searchFn).toContain('selectConversation(data.pubkey, { searchGen: gen })');
     expect(messagesHTML).toMatch(/function onSearchInput\(value\) \{\s*conversationSearchGen\+\+;/);
     expect(selectFn).toContain('conversationSearchGen++');
+    expect(selectFn).toMatch(
+      /conversationSearchGen\+\+;\s*const searchStatus = document\.getElementById\('search-status'\);\s*if \(searchStatus\) searchStatus\.textContent = '';/,
+    );
   });
 });
 
