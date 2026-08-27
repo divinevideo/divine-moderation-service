@@ -111,10 +111,11 @@ describe('messages UI — conversation list pagination', () => {
     expect(messagesHTML).toContain('scrollHeight - 200');
   });
 
-  it('guards load-more against overlap and past the last page', () => {
+  it('guards load-more against overlap, past the last page, and a pending error', () => {
     expect(messagesHTML).toContain('conversationsLoading');
-    // No further fetch once no full page remains or a load is already in flight.
-    expect(messagesHTML).toContain('if (conversationsLoading || !conversationsHasMore)');
+    // No further fetch once no full page remains, a load is already in flight, or
+    // a page failed (so scroll/auto-fill can't silently re-attempt it).
+    expect(messagesHTML).toContain('if (conversationsLoading || !conversationsHasMore || conversationsError)');
   });
 
   it('auto-fills the next page when a short page leaves no scrollbar', () => {
@@ -260,5 +261,49 @@ describe('messages UI — pure logic (behavioral, eval-extracted from shipped so
     ];
     const out = dedupeConversations(rows);
     expect(out.map((r) => r.latest_message)).toEqual(['first-a', 'first-b', 'by-pubkey', 'keyless']);
+  });
+});
+
+describe('messages UI — failed load-more recovery (#207)', () => {
+  it('surfaces a failed append instead of stopping silently like end-of-history', () => {
+    // The append branch of the catch must flag the error and re-render, not
+    // leave a short list that reads as "no older conversations".
+    expect(messagesHTML).toContain('else if (append && gen === conversationsGen)');
+    expect(messagesHTML).toContain('conversationsError = true;');
+  });
+
+  it('renders a clickable, announced retry row only when not filtering', () => {
+    // The retry row is gated on a pending error and an inactive filter, and is
+    // announced to assistive tech.
+    expect(messagesHTML).toContain('if (!conversationsError || currentConversationSearch().trim()) return;');
+    expect(messagesHTML).toContain('class="load-more-error" role="status"');
+    expect(messagesHTML).toContain("Couldn't load more");
+    expect(messagesHTML).toContain('onclick="retryLoadMore()"');
+  });
+
+  it('keeps the retry row reachable even if the unfiltered list is empty', () => {
+    // Defends the #207 invariant: an append error must never hide behind the
+    // empty-list branch, so both render paths append the retry row.
+    const matches = messagesHTML.match(/appendLoadMoreError\(container\)/g) || [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('retry clears the error, re-renders for feedback, and re-requests the same page', () => {
+    // offset is not advanced on failure, so loadMoreConversations re-requests it.
+    expect(messagesHTML).toContain('function retryLoadMore');
+    expect(messagesHTML).toMatch(
+      /function retryLoadMore[\s\S]*?conversationsError = false;[\s\S]*?renderConversations\(\);[\s\S]*?loadMoreConversations\(\)/,
+    );
+  });
+
+  it('reveals the retry row by scrolling to the bottom on failure', () => {
+    expect(messagesHTML).toContain('if (container) container.scrollTop = container.scrollHeight;');
+  });
+
+  it('clears the error flag on a fresh load AND on a successful page (each pinned)', () => {
+    // Not a tautology: pin each clear to its own branch so deleting either one
+    // fails this test even though the literal appears elsewhere.
+    expect(messagesHTML).toMatch(/conversationsHasMore = true;\s*\n\s*conversationsError = false;/);
+    expect(messagesHTML).toMatch(/conversationsOffset \+= page\.length;\s*\n\s*conversationsError = false;/);
   });
 });

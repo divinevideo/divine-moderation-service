@@ -229,6 +229,29 @@
       text-align: center;
     }
 
+    .load-more-error {
+      padding: 14px 16px;
+      text-align: center;
+      color: #f0a0a0;
+      font-size: 12px;
+      border-top: 1px solid #1a1a1a;
+    }
+
+    .load-more-error button {
+      margin-left: 8px;
+      background: #333;
+      color: #e0e0e0;
+      border: none;
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .load-more-error button:hover {
+      background: #444;
+    }
+
     .spinner {
       width: 24px;
       height: 24px;
@@ -543,6 +566,9 @@
     // when a Refresh landed discards its stale result instead of both mutating
     // conversationsOffset and silently skipping a page.
     let conversationsGen = 0;
+    // A load-more (append) page failed. Surfaced as an inline retry row at the
+    // list bottom so a failed page isn't mistaken for the end of history (#207).
+    let conversationsError = false;
     // Invalidates an in-flight identifier lookup when the moderator searches
     // again, keeps typing, or opens a different conversation.
     let conversationSearchGen = 0;
@@ -746,6 +772,7 @@
       if (!append) {
         conversationsOffset = 0;
         conversationsHasMore = true;
+        conversationsError = false; // a fresh load starts clean
         // The first successful render replaces the list's innerHTML, which
         // removes this spinner node for good — so on a later Refresh it's
         // already gone. Guard rather than deref null.
@@ -769,6 +796,7 @@
         // re-surface a row that moved up between page fetches.
         conversations = append ? dedupeConversations(conversations.concat(page)) : page;
         conversationsOffset += page.length;
+        conversationsError = false; // a page came back — clear any prior retry row
         // A short page means the server has no more rows past this point.
         conversationsHasMore = page.length === CONVERSATIONS_PAGE_SIZE;
 
@@ -783,6 +811,16 @@
       } catch (err) {
         if (!append && gen === conversationsGen) {
           container.innerHTML = '<div class="empty-state">Failed to load conversations</div>';
+        } else if (append && gen === conversationsGen) {
+          // A failed page must not read as "end of history" (#207): flag it so
+          // renderConversationList paints an inline retry row. Then scroll to the
+          // bottom to reveal it — deliberately overriding the append path's
+          // preserve-scroll, since the whole point is to surface the failure. The
+          // resulting scroll event can't auto-retry: loadMoreConversations bails
+          // while conversationsError is set.
+          conversationsError = true;
+          renderConversations();
+          if (container) container.scrollTop = container.scrollHeight;
         }
         console.error('fetchConversations error:', err);
       } finally {
@@ -810,7 +848,9 @@
     // the list. Guarded so overlapping scroll events and the end of history
     // don't fire redundant fetches.
     async function loadMoreConversations() {
-      if (conversationsLoading || !conversationsHasMore) return;
+      // conversationsError blocks scroll/auto-fill from silently re-attempting a
+      // page that just failed; only retryLoadMore (which clears the flag) proceeds.
+      if (conversationsLoading || !conversationsHasMore || conversationsError) return;
       await fetchConversations({ append: true });
       maybeAutoFillConversations();
     }
@@ -844,6 +884,10 @@
 
       if (!list.length) {
         container.innerHTML = '<div class="empty-state">No conversations yet</div>';
+        // Unreachable today (a pending append error implies a non-empty
+        // unfiltered list), but keep the retry row reachable if that invariant
+        // ever changes — otherwise a failure could silently look like the end.
+        appendLoadMoreError(container);
         return;
       }
 
@@ -871,7 +915,33 @@
         `;
       }).join('');
 
+      appendLoadMoreError(container);
+
       if (preserveScroll) container.scrollTop = prevScroll;
+    }
+
+    // A failed load-more shows a clickable retry row at the bottom, where the
+    // failure happened. Only when unfiltered — a filtered short list is expected
+    // and its bottom isn't the end of history. The flag persists (invisibly)
+    // across a filtered interval and the row re-appears once the filter clears.
+    // role="status" lets a screen reader announce the failure.
+    function appendLoadMoreError(container) {
+      if (!conversationsError || currentConversationSearch().trim()) return;
+      container.insertAdjacentHTML('beforeend',
+        '<div class="load-more-error" role="status">'
+        + "<span>Couldn't load more conversations.</span> "
+        + '<button type="button" onclick="retryLoadMore()">Retry</button>'
+        + '</div>');
+    }
+
+    // Retry the page that failed. The offset was not advanced on failure, so
+    // loadMoreConversations re-requests the same page. Guarded so a double-click
+    // (or a retry while one is already running) doesn't stack fetches.
+    function retryLoadMore() {
+      if (conversationsLoading) return;
+      conversationsError = false;
+      renderConversations(); // clear the row so the click visibly registers while the retry is in flight
+      loadMoreConversations();
     }
 
     function escapeHtml(str) {
