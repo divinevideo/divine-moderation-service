@@ -23,6 +23,7 @@ import {
   renderComposeTemplate,
   publishToRelays,
   requestDirectMessagePush,
+  scheduleDirectMessagePush,
 } from './dm-sender.mjs';
 import { isContained, parseRelayOverride } from './relay-override.mjs';
 import { createMockKV } from '../test/helpers.mjs';
@@ -697,6 +698,70 @@ describe('DM Sender - Push Hook', () => {
       requested: false,
       reason: 'Push service returned 503',
     });
+  });
+
+  it('fails open when the push request throws', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network unavailable'));
+
+    await expect(requestDirectMessagePush(
+      {
+        PUSH_SERVICE_URL: 'https://push.internal',
+        PUSH_SERVICE_TOKEN: 'shared-token',
+      },
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    )).resolves.toEqual({
+      requested: false,
+      reason: 'network unavailable',
+    });
+  });
+
+  it('warns when only half of the push configuration is present', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    await requestDirectMessagePush(
+      { PUSH_SERVICE_URL: 'https://push.internal' },
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    );
+
+    expect(warn).toHaveBeenCalledWith(
+      '[DM] Push service configuration is incomplete; both URL and token are required',
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('anchors a successful DM push in waitUntil', async () => {
+    const pushCalls = [];
+    const requestPush = async (...args) => {
+      pushCalls.push(args);
+      return { requested: true };
+    };
+    let waitUntilCalls = 0;
+    const ctx = {
+      waitUntil(_promise) { waitUntilCalls++; },
+    };
+    const env = {};
+
+    await scheduleDirectMessagePush(
+      env,
+      ctx,
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+      requestPush,
+    );
+
+    expect(pushCalls).toEqual([[
+      env,
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    ]]);
+    expect(waitUntilCalls).toBe(1);
   });
 
   it('does not call the network when the hook is unconfigured', async () => {

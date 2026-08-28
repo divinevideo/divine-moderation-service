@@ -618,6 +618,9 @@ const PUSH_REQUEST_TIMEOUT_MS = 10_000;
  */
 export async function requestDirectMessagePush(env, recipientPubkey, eventId, messageType) {
   if (!env.PUSH_SERVICE_URL || !env.PUSH_SERVICE_TOKEN) {
+    if (env.PUSH_SERVICE_URL || env.PUSH_SERVICE_TOKEN) {
+      console.warn('[DM] Push service configuration is incomplete; both URL and token are required');
+    }
     return { requested: false, reason: 'Push service not configured' };
   }
 
@@ -649,8 +652,15 @@ export async function requestDirectMessagePush(env, recipientPubkey, eventId, me
   }
 }
 
-async function scheduleDirectMessagePush(env, ctx, recipientPubkey, eventId, messageType) {
-  const pushPromise = requestDirectMessagePush(
+export async function scheduleDirectMessagePush(
+  env,
+  ctx,
+  recipientPubkey,
+  eventId,
+  messageType,
+  requestPush = requestDirectMessagePush,
+) {
+  const pushPromise = requestPush(
     env,
     recipientPubkey,
     eventId,
@@ -875,7 +885,7 @@ export async function sendReportOutcomeDM(reporterPubkey, sha256, action, env, c
  * @param {string} logPrefix - Log prefix for context (e.g., "[ADMIN]", "[MODERATION]")
  * @returns {Promise<{ notified: number, failed: number }>}
  */
-export async function notifyReporters(sha256, action, env, logPrefix = '[DM]') {
+export async function notifyReporters(sha256, action, env, logPrefix = '[DM]', ctx = null) {
   if (!env.NOSTR_PRIVATE_KEY) {
     return { notified: 0, failed: 0 };
   }
@@ -918,7 +928,7 @@ export async function notifyReporters(sha256, action, env, logPrefix = '[DM]') {
   let failed = 0;
   for (const reporter of reporters) {
     try {
-      const result = await sendReportOutcomeDM(reporter.pubkey, sha256, action, env, null, {
+      const result = await sendReportOutcomeDM(reporter.pubkey, sha256, action, env, ctx, {
         title: contentMeta.title,
         publishedAt: contentMeta.publishedAt,
         reportedAt: reporter.reportedAt,

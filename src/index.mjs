@@ -555,7 +555,7 @@ function transcriptReprocessNotificationKey(sha256, oldAction, newAction) {
   return `transcript-reprocess-notified:${sha256}:${fromAction}:${toAction}`;
 }
 
-async function processPendingTranscriptReprocess(env) {
+async function processPendingTranscriptReprocess(env, ctx = null) {
   if (!env.BLOSSOM_DB || !env.MODERATION_KV) {
     return;
   }
@@ -753,7 +753,7 @@ async function processPendingTranscriptReprocess(env) {
           },
           topicProfile: topicProfile || null,
           text_scores: textScores
-        }, env);
+        }, env, ctx);
         await env.MODERATION_KV.put(notificationKey, checkedAt, { expirationTtl: 60 * 60 * 24 * 7 });
       } else {
         console.log(`[CRON] Transcript reprocess resolved ${sha256} without action change (${newAction})`);
@@ -2521,7 +2521,7 @@ export default {
           ).bind(sha256).first();
           if (uploaderRow?.uploaded_by) {
             const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
-            await sendModerationDM(uploaderRow.uploaded_by, sha256, action, reason || 'Manual moderator action', env, null, { categories: uploaderRow?.categories, title: uploaderRow?.title, publishedAt: uploaderRow?.published_at });
+            await sendModerationDM(uploaderRow.uploaded_by, sha256, action, reason || 'Manual moderator action', env, ctx, { categories: uploaderRow?.categories, title: uploaderRow?.title, publishedAt: uploaderRow?.published_at });
             dmSent = true;
             console.log(`[ADMIN] DM sent to creator ${uploaderRow.uploaded_by.substring(0, 16)}...`);
           }
@@ -2532,7 +2532,12 @@ export default {
 
       // Notify reporters who filed reports on this content (non-blocking)
       const { notifyReporters } = await import('./nostr/dm-sender.mjs');
-      notifyReporters(sha256, action, env, '[ADMIN]').catch(() => {});
+      const reporterPromise = notifyReporters(sha256, action, env, '[ADMIN]', ctx).catch(() => {});
+      if (ctx?.waitUntil) {
+        ctx.waitUntil(reporterPromise);
+      } else {
+        await reporterPromise;
+      }
       // Notify ATProto labeler of manual override
       notifyAtprotoLabeler({ sha256, action, scores: updated.scores || {}, reviewed_by: 'admin' }, env).catch(err => {
         console.error('[ADMIN] ATProto labeler notification failed:', err.message);
@@ -4300,7 +4305,7 @@ async function runMigration() {
           action,
           reason || null,
           env,
-          null
+          ctx
         );
 
         const authSource = authSourceFromVerification(verification);
@@ -4843,7 +4848,7 @@ async function runMigration() {
    * Queue consumer for video moderation
    * Triggered when messages are sent to the video-moderation-queue
    */
-  async queue(batch, env) {
+  async queue(batch, env, ctx) {
     console.log(`[MODERATION] Processing batch of ${batch.messages.length} videos`);
 
     // Reactive moderation kill-switch. When enabled, drain (ack) every message
@@ -5038,7 +5043,7 @@ async function runMigration() {
 
         // Handle based on severity
         console.log(`[MODERATION] Step 8: Handling result (action=${result.action})`);
-        await handleModerationResult(result, env);
+        await handleModerationResult(result, env, ctx);
         console.log(`[MODERATION] Step 9: Result handled`);
 
         // Acknowledge successful processing
@@ -5257,7 +5262,7 @@ async function runMigration() {
       }
 
       try {
-        await processPendingTranscriptReprocess(env);
+        await processPendingTranscriptReprocess(env, ctx);
       } catch (error) {
         console.error('[CRON] Transcript reprocess step failed:', error);
       }
@@ -5403,7 +5408,7 @@ async function runMigration() {
                         const metaRow = await env.BLOSSOM_DB.prepare(
                           'SELECT title, published_at FROM moderation_results WHERE sha256 = ?'
                         ).bind(sha256).first();
-                        await sendModerationDM(uploadedBy, sha256, 'PERMANENT_BAN', moderation.reason, env, null, { title: metaRow?.title, publishedAt: metaRow?.published_at });
+                        await sendModerationDM(uploadedBy, sha256, 'PERMANENT_BAN', moderation.reason, env, ctx, { title: metaRow?.title, publishedAt: metaRow?.published_at });
                         console.log(`[CRON] DM sent to creator for auto-escalated ${sha256}`);
                       } catch (dmErr) {
                         console.error(`[CRON] DM failed for ${sha256}:`, dmErr.message);
@@ -5412,7 +5417,12 @@ async function runMigration() {
 
                     // Notify reporters
                     const { notifyReporters: notifyCronReporters } = await import('./nostr/dm-sender.mjs');
-                    notifyCronReporters(sha256, 'PERMANENT_BAN', env, '[CRON]').catch(() => {});
+                    const reporterPromise = notifyCronReporters(sha256, 'PERMANENT_BAN', env, '[CRON]', ctx).catch(() => {});
+                    if (ctx?.waitUntil) {
+                      ctx.waitUntil(reporterPromise);
+                    } else {
+                      await reporterPromise;
+                    }
 
                     // Mark escalation complete so cron doesn't retry
                     const rdCached = await env.MODERATION_KV.get(`rd:${sha256}`);
@@ -5500,7 +5510,7 @@ async function runMigration() {
  * Handle moderation result - publish notifications
  * Action is already stored in D1, this just handles notifications
  */
-async function handleModerationResult(result, env) {
+async function handleModerationResult(result, env, ctx = null) {
   const { sha256, action, scores, reason, flaggedFrames, severity, cdnUrl, uploadedBy } = result;
   const downstreamContext = buildDownstreamPublishContext(result);
 
@@ -5564,7 +5574,7 @@ async function handleModerationResult(result, env) {
   if (['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE'].includes(action) && uploadedBy && env.NOSTR_PRIVATE_KEY) {
     try {
       const { sendModerationDM } = await import('./nostr/dm-sender.mjs');
-      await sendModerationDM(uploadedBy, sha256, action, reason, env, null, { categories: result.categories, title: result.nostrContext?.title, publishedAt: result.nostrContext?.publishedAt });
+      await sendModerationDM(uploadedBy, sha256, action, reason, env, ctx, { categories: result.categories, title: result.nostrContext?.title, publishedAt: result.nostrContext?.publishedAt });
       console.log(`[MODERATION] ${sha256} - DM notification sent to creator ${uploadedBy.substring(0, 16)}...`);
     } catch (dmErr) {
       console.error(`[MODERATION] ${sha256} - DM notification failed:`, dmErr.message);
@@ -5574,7 +5584,12 @@ async function handleModerationResult(result, env) {
   // Notify reporters who filed reports on this content (non-blocking)
   if (env.NOSTR_PRIVATE_KEY) {
     const { notifyReporters: notifyReportersOfOutcome } = await import('./nostr/dm-sender.mjs');
-    notifyReportersOfOutcome(sha256, action, env, '[MODERATION]').catch(() => {});
+    const reporterPromise = notifyReportersOfOutcome(sha256, action, env, '[MODERATION]', ctx).catch(() => {});
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(reporterPromise);
+    } else {
+      await reporterPromise;
+    }
   }
 
   if (contentRelayPublished) {
