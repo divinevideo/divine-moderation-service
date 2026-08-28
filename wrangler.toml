@@ -156,6 +156,9 @@ AI_DETECTOR_GATE_WATERMARK_VISIBLE = "0.8"
 #
 # Any non-production deployment that sets NOSTR_PRIVATE_KEY must set this too.
 # DM_RELAY_URLS = "ws://127.0.0.1:4444"
+# Base URL for classified direct-message push requests. Leave unset until the
+# authenticated push-service route is reachable from this Worker.
+# PUSH_SERVICE_URL = "https://push.example.com"
 #
 # Must be a comma-separated STRING. `vars` accepts any JSON, so the TOML list
 # form DM_RELAY_URLS = ["ws://..."] deploys cleanly and arrives as an array;
@@ -241,6 +244,7 @@ crons = ["* * * * *", "*/5 * * * *"]
 
 # Secrets (set with: wrangler secret put <NAME>)
 # SERVICE_API_TOKEN - bearer token for authenticated requests to moderation-api.divine.video
+# PUSH_SERVICE_TOKEN - shared bearer token for classified direct-message push requests
 # POLICY_AUD - Zero Trust application audience tag (from Access > Applications > moderation.admin.divine.video > Overview)
 # CF_ACCESS_CLIENT_ID - Cloudflare Access service token ID for relay.divine.video
 # CF_ACCESS_CLIENT_SECRET - Cloudflare Access service token secret for relay.divine.video

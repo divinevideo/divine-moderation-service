@@ -80,12 +80,14 @@ Bindings, routes, feature flags, and non-secret vars live in `wrangler.toml`. Hi
 | `CREATOR_DELETE_PIPELINE_ENABLED` | Enable the kind `5` creator-delete cron. |
 | `AI_DETECTOR_BASE_URL` / `AI_DETECTOR_MODE_*` | `divine-ai-detector` endpoint and per-signal cutover mode. |
 | `INQUISITOR_BASE_URL` | `divine-inquisitor` C2PA / ProofMode service. |
+| `PUSH_SERVICE_URL` | Base URL for classified direct-message push requests. Unset disables the hook. |
 | `FUNNELCAKE_ADMIN_URL` / `FUNNELCAKE_LOOKUP_URL` | Relay admin (writes) and video-lookup (reads) hosts. |
 | `*_THRESHOLD_HIGH` / `*_THRESHOLD_MEDIUM` | Legacy classifier thresholds, retained for provider/classifier tests. |
 
 Secrets are set with `wrangler secret put <NAME>`. The ones the service reads (see the header of `wrangler.toml` for the full list):
 
 - `SERVICE_API_TOKEN` — bearer token for authenticated `moderation-api.divine.video` requests.
+- `PUSH_SERVICE_TOKEN` — shared bearer token for authenticated direct-message push requests.
 - `POLICY_AUD` — Zero Trust application audience tag for the admin app.
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` — Cloudflare Access service token for the relay.
 - `NOSTR_PRIVATE_KEY` — signs NIP-56 report events.
