@@ -60,9 +60,10 @@ export async function findReportByReporter(db, sha256, reporterPubkey) {
 // Sources whose reporters may never drive an automatic outcome, and so are
 // excluded from escalationReporterCount. A report DM is the least verified
 // path; an untrusted-client relay report carries an unauthenticated, optional
-// NIP-89 `client` tag that anyone can forge, so neither may supply part of the
-// AGE_RESTRICTED threshold. Both are still recorded for human review.
-export const NON_ESCALATING_SOURCES = Object.freeze(['dm-report', 'relay-report-untrusted']);
+// NIP-89 `client` tag that anyone can forge; and a `self-report` is someone
+// reporting their own content (#211) — none may supply part of the
+// AGE_RESTRICTED threshold. All are still recorded for human review.
+export const NON_ESCALATING_SOURCES = Object.freeze(['dm-report', 'relay-report-untrusted', 'self-report']);
 
 const nonEscalatingPlaceholders = NON_ESCALATING_SOURCES.map(() => '?').join(', ');
 
