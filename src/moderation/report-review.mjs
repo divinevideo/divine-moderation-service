@@ -50,11 +50,13 @@ export async function recordReportForReview(db, {
       effectiveUploader &&
       reporterPubkey.toLowerCase() === effectiveUploader.toLowerCase(),
   );
-  // KNOWN GAP (#211): on the HTTP path the uploader is only resolvable once the
+  // SCAN-RACE (#212): on the HTTP path the uploader is only resolvable once the
   // scan queue has written moderation_results.uploaded_by. A self-report on a
-  // freshly-uploaded, not-yet-scanned sha256 falls through unflagged here and is
-  // not retroactively corrected once the scan lands. The relay-poll path is
-  // unaffected (it passes the target event's signature-verified pubkey).
+  // freshly-uploaded, not-yet-scanned sha256 falls through unflagged here — it is
+  // corrected retroactively by reconcileSelfReportsForUploader, which the scan
+  // queue consumer runs (on both the full-scan and dedup-skip paths) once the
+  // verified uploader is known. The relay-poll path never hits this: it passes
+  // the target event's signature-verified pubkey.
   const originalSource = source;
   // Verified only when the match used the caller-supplied uploader (the
   // relay-poll's signature-verified pubkey), not the self-asserted DB fallback —

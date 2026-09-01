@@ -4898,6 +4898,19 @@ async function runMigration() {
         if (existingResult && !forceAIDetection && !providerOverridden) {
           console.log(`[MODERATION] ⚠️ SKIPPED ${sha256} - already moderated`);
           console.log(`[MODERATION] Previous result: action=${existingResult.action}, moderated_at=${existingResult.moderated_at}`);
+          // Scan-time self-report reconcile (#212), skip-path case. The report
+          // ingestion path writes a moderation_results row of its own, so a
+          // self-report filed before the scan trips the dedup above and the scan
+          // never reaches the post-moderation reconcile below. But this queue
+          // message still carries the verified uploader, so reconcile here too —
+          // otherwise the report the reconcile exists to catch stays escalating
+          // forever, which is the exact window #212 closes. Wrapped so a reconcile
+          // failure never blocks acking a duplicate.
+          try {
+            await reconcileSelfReportsForUploader(env.BLOSSOM_DB, sha256, uploadedBy);
+          } catch (reconcileErr) {
+            console.error(`[MODERATION] self-report reconcile (skip path) failed for ${sha256}:`, reconcileErr?.message || reconcileErr);
+          }
           message.ack();
           continue;
         }

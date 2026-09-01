@@ -88,14 +88,22 @@ const supersedablePlaceholders = SUPERSEDABLE_SOURCES.map(() => '?').join(', ');
  * escalation that already fired (which needs a co-reporter in the sub-scan window
  * and gets human review anyway).
  *
+ * The scan queue consumer calls this on BOTH the full-scan path and the
+ * "already moderated" dedup-skip path. The skip path matters: the report
+ * ingestion that lost the race also wrote a moderation_results row, so the later
+ * scan for the same sha256 trips dedup and skips — without the skip-path call the
+ * reconcile would never fire in the exact race it exists to close.
+ *
  * PROVENANCE (accepted risk): [uploadedBy] is only as trustworthy as its
  * producer. Today's callers pass the value the scan pipeline derived for the
- * content, and self-report is non-escalating — flagging can only *suppress*
- * escalation, never cause it — so a wrong uploader at worst under-flags. It can
- * never manufacture a self-report against a third party's content, since the
- * match is uploader-against-reporter on the same sha256. If a future caller ever
- * fed an attacker-controlled uploader here, revisit: the safe direction is still
- * that self-report only ever removes a reporter from the escalation count.
+ * content (the queue message's verified uploader), and self-report is
+ * non-escalating — flagging can only ever *suppress* escalation, never cause it.
+ * The bounded downside: if a producer ever supplied a wrong uploader that
+ * happened to equal some real reporter's pubkey, that reporter's report on this
+ * sha256 would be de-escalated (not merely "under-flagged"). It still cannot
+ * manufacture a self-report against a third party's *content* — the match is
+ * uploader-against-reporter on the same sha256 — and it cannot raise an outcome.
+ * If a future caller ever fed an attacker-controlled uploader here, revisit.
  *
  * KNOWN GAP (#212): this updates user_reports.source only. A moderation_results
  * row written by an earlier ingest still carries raw_response.selfReport=false;
