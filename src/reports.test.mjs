@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType, isNsfwReportType } from './reports.mjs';
+import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType, isNsfwReportType, reconcileSelfReportsForUploader } from './reports.mjs';
 
 const SHA256 = ('a'.repeat(63) + '1').slice(0, 64);
 const REPORTER1 = ('b'.repeat(63) + '1').slice(0, 64);
@@ -28,6 +28,43 @@ describe('reports', () => {
   beforeEach(async () => {
     await initReportsTable(db);
     await db.prepare('DELETE FROM user_reports').run();
+  });
+
+  describe('reconcileSelfReportsForUploader (#212)', () => {
+    async function sourceOf(reporter) {
+      const row = await db
+        .prepare('SELECT source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?')
+        .bind(SHA256, reporter)
+        .first();
+      return row?.source ?? null;
+    }
+
+    it('flags a report the ingest guard missed once the uploader is known', async () => {
+      // A pre-scan HTTP self-report landed un-flagged as user-report.
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await reconcileSelfReportsForUploader(db, SHA256, REPORTER1);
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+    });
+
+    it('leaves other reporters on the same content untouched', async () => {
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER2, report_type: 'spam', source: 'user-report' });
+      await reconcileSelfReportsForUploader(db, SHA256, REPORTER1); // REPORTER1 is the uploader
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+      expect(await sourceOf(REPORTER2)).toBe('user-report');
+    });
+
+    it('matches the uploader case-insensitively', async () => {
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await reconcileSelfReportsForUploader(db, SHA256, REPORTER1.toUpperCase());
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+    });
+
+    it('is a no-op when the uploader is unknown', async () => {
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await reconcileSelfReportsForUploader(db, SHA256, null);
+      expect(await sourceOf(REPORTER1)).toBe('user-report');
+    });
   });
 
   describe('isAiReportType', () => {

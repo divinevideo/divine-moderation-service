@@ -68,6 +68,30 @@ export const NON_ESCALATING_SOURCES = Object.freeze(['dm-report', 'relay-report-
 const nonEscalatingPlaceholders = NON_ESCALATING_SOURCES.map(() => '?').join(', ');
 
 /**
+ * Scan-time self-report reconcile (#212). Once the scan pipeline knows the
+ * verified uploader for [sha256], flag any report already filed by that uploader
+ * as a self-report — the HTTP path may have recorded it before uploaded_by
+ * existed, so the ingest-time guard in recordReportForReview could not see the
+ * match. This excludes it from all future escalation counts; it does not undo an
+ * escalation that already fired (which needs a co-reporter in the sub-scan window
+ * and gets human review anyway).
+ *
+ * @param {D1Database} db
+ * @param {string} sha256
+ * @param {string|null|undefined} uploadedBy - the verified content uploader
+ */
+export async function reconcileSelfReportsForUploader(db, sha256, uploadedBy) {
+  if (!sha256 || !uploadedBy) return;
+  await db.prepare(`
+    UPDATE user_reports
+    SET source = 'self-report'
+    WHERE sha256 = ?
+      AND LOWER(reporter_pubkey) = LOWER(?)
+      AND (source IS NULL OR source != 'self-report')
+  `).bind(sha256, uploadedBy).run();
+}
+
+/**
  * Insert a report and return two reporter counts, so callers can apply
  * per-report-type policy (e.g. NSFW needs 2 unique reporters before auto
  * AGE_RESTRICTED to defend against single-token griefing).

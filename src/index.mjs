@@ -20,7 +20,7 @@ import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
 import messagesHTML from './admin/messages.html';
-import { initReportsTable } from './reports.mjs';
+import { initReportsTable, reconcileSelfReportsForUploader } from './reports.mjs';
 import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforcement, applyUploaderEnforcementToResult } from './uploader-enforcement.mjs';
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { extractTopics, topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
@@ -4980,6 +4980,17 @@ async function runMigration() {
           null
         ).run();
         console.log(`[MODERATION] Step 7: D1 write successful`);
+
+        // Scan-time self-report reconcile (#212): the verified uploader is now
+        // known, so flag any report already filed by that uploader on this
+        // sha256 — the HTTP path may have recorded it before uploaded_by existed
+        // and the ingest guard in recordReportForReview couldn't see the match.
+        // Wrapped so a reconcile failure never sinks the scan.
+        try {
+          await reconcileSelfReportsForUploader(env.BLOSSOM_DB, sha256, result.uploadedBy);
+        } catch (reconcileErr) {
+          console.error(`[MODERATION] self-report reconcile failed for ${sha256}:`, reconcileErr?.message || reconcileErr);
+        }
 
         try {
           await recordAIDetectionEvent(env.BLOSSOM_DB, buildAIPolicyDecisionEvent({
