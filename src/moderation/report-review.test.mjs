@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { recordReportForReview } from './report-review.mjs';
-import { NON_ESCALATING_SOURCES } from '../reports.mjs';
+import { NON_ESCALATING_SOURCES, SUPERSEDABLE_SOURCES } from '../reports.mjs';
 
 const SHA = 'a'.repeat(64);
 const REPORTER = 'b'.repeat(64);
@@ -21,6 +21,8 @@ function createDbMock({
   aiDetectionEvents = [],
   failModerationWrite = false,
   failAiTelemetryWrite = false,
+  // undefined → the SELECT uploaded_by lookup finds no row (uploader unknown).
+  storedUploadedBy,
 } = {}) {
   return {
     prepare(sql) {
@@ -59,6 +61,9 @@ function createDbMock({
           if (/COUNT\(DISTINCT reporter_pubkey\)/i.test(sql)) {
             return { cnt: reporterCount, escalation_cnt: escalationReporterCount };
           }
+          if (/SELECT uploaded_by FROM moderation_results/i.test(sql)) {
+            return storedUploadedBy === undefined ? null : { uploaded_by: storedUploadedBy };
+          }
           return null;
         },
       };
@@ -92,8 +97,10 @@ describe('recordReportForReview', () => {
     });
     expect(userReportWrites).toHaveLength(1);
     // The row itself, then the conflict guard: upgrade the stored source only
-    // when it is one of the non-escalating sources and the incoming one is not.
-    // The guard binds that list twice — once per IN clause.
+    // when the existing row is a SUPERSEDABLE source (a weak path a stronger
+    // report may overtake) and the incoming one is escalation-eligible. The two
+    // IN clauses bind different lists — supersedable (excludes self-report, #212)
+    // for the existing row, the full non-escalating set for the incoming one.
     expect(userReportWrites[0].bindings).toEqual([
       SHA,
       REPORTER,
@@ -101,7 +108,7 @@ describe('recordReportForReview', () => {
       'reported from relay',
       '2026-05-13T17:19:42.000Z',
       'relay-report',
-      ...NON_ESCALATING_SOURCES,
+      ...SUPERSEDABLE_SOURCES,
       ...NON_ESCALATING_SOURCES,
     ]);
     expect(userReportWrites[0].sql).toMatch(/ON CONFLICT\(sha256, reporter_pubkey\) DO UPDATE SET source = excluded\.source/i);
@@ -242,5 +249,104 @@ describe('recordReportForReview', () => {
       aiTelemetryError: 'ai telemetry write failed',
     });
     expect(aiDetectionEvents).toHaveLength(0);
+  });
+});
+
+describe('recordReportForReview self-report guard (#211)', () => {
+  it('flags a self-report (reporter == uploader) and never auto-acts', async () => {
+    const userReportWrites = [];
+    const moderationWrites = [];
+    // NSFW + escalation >= 2 would normally AGE_RESTRICT; the flag must prevent
+    // that AND mark the row a non-escalating self-report.
+    const db = createDbMock({
+      userReportWrites,
+      moderationWrites,
+      reporterCount: 2,
+      escalationReporterCount: 2,
+    });
+
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'nudity',
+      source: 'user-report',
+      uploadedBy: REPORTER, // reporter reports their own upload
+    });
+
+    expect(NON_ESCALATING_SOURCES).toContain('self-report');
+    expect(userReportWrites[0].bindings[5]).toBe('self-report'); // source column
+    expect(result.action).toBe('REVIEW'); // not AGE_RESTRICTED
+    expect(result.isSelfReport).toBe(true);
+  });
+
+  it('matches the uploader case-insensitively', async () => {
+    const userReportWrites = [];
+    const db = createDbMock({ userReportWrites });
+    await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'spam',
+      source: 'relay-report',
+      uploadedBy: REPORTER.toUpperCase(),
+    });
+    expect(userReportWrites[0].bindings[5]).toBe('self-report'); // source column
+  });
+
+  it('does not flag when reporter and uploader differ', async () => {
+    const userReportWrites = [];
+    const db = createDbMock({ userReportWrites });
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'spam',
+      source: 'relay-report',
+      uploadedBy: 'c'.repeat(64),
+    });
+    expect(userReportWrites[0].bindings[5]).toBe('relay-report'); // source unchanged
+    expect(result.isSelfReport).toBe(false);
+  });
+
+  it('does not flag when the uploader is unknown (no param, no stored row)', async () => {
+    const userReportWrites = [];
+    // createDbMock's first() returns null for the SELECT uploaded_by lookup,
+    // so the uploader is unknown and the guard must skip rather than guess.
+    const db = createDbMock({ userReportWrites });
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'spam',
+      source: 'user-report',
+    });
+    expect(userReportWrites[0].bindings[5]).toBe('user-report'); // source unchanged
+    expect(result.isSelfReport).toBe(false);
+  });
+
+  it('flags via the uploaded_by lookup when no uploadedBy param is passed', async () => {
+    const userReportWrites = [];
+    // No uploadedBy param → the guard must resolve the uploader from the stored
+    // moderation row (the HTTP/DM path's only signal). Also regression-guards
+    // the exact field name a lookup bug would get wrong.
+    const db = createDbMock({ userReportWrites, storedUploadedBy: REPORTER });
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'spam',
+      source: 'user-report',
+    });
+    expect(userReportWrites[0].bindings[5]).toBe('self-report');
+    expect(result.isSelfReport).toBe(true);
+  });
+
+  it('does not flag when the looked-up uploader differs from the reporter', async () => {
+    const userReportWrites = [];
+    const db = createDbMock({ userReportWrites, storedUploadedBy: 'c'.repeat(64) });
+    const result = await recordReportForReview(db, {
+      sha256: SHA,
+      reporterPubkey: REPORTER,
+      reportType: 'spam',
+      source: 'user-report',
+    });
+    expect(userReportWrites[0].bindings[5]).toBe('user-report');
+    expect(result.isSelfReport).toBe(false);
   });
 });

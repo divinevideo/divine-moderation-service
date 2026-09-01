@@ -60,11 +60,70 @@ export async function findReportByReporter(db, sha256, reporterPubkey) {
 // Sources whose reporters may never drive an automatic outcome, and so are
 // excluded from escalationReporterCount. A report DM is the least verified
 // path; an untrusted-client relay report carries an unauthenticated, optional
-// NIP-89 `client` tag that anyone can forge, so neither may supply part of the
-// AGE_RESTRICTED threshold. Both are still recorded for human review.
-export const NON_ESCALATING_SOURCES = Object.freeze(['dm-report', 'relay-report-untrusted']);
+// NIP-89 `client` tag that anyone can forge; and a `self-report` is someone
+// reporting their own content (#211) — none may supply part of the
+// AGE_RESTRICTED threshold. All are still recorded for human review.
+export const NON_ESCALATING_SOURCES = Object.freeze(['dm-report', 'relay-report-untrusted', 'self-report']);
 
 const nonEscalatingPlaceholders = NON_ESCALATING_SOURCES.map(() => '?').join(', ');
+
+// The subset of non-escalating sources a stronger, escalation-eligible report
+// may supersede on conflict: a reporter first seen via a weak path (a DM, an
+// untrusted-client relay report) should count toward escalation once they also
+// report through an authenticated/trusted path. 'self-report' is deliberately
+// excluded (#212): it describes the reporter's identity relative to the content
+// (permanent), not verification strength — a later report from the same person
+// on their own content is still a self-report and must never be upgraded back to
+// an escalating source.
+export const SUPERSEDABLE_SOURCES = Object.freeze(['dm-report', 'relay-report-untrusted']);
+
+const supersedablePlaceholders = SUPERSEDABLE_SOURCES.map(() => '?').join(', ');
+
+/**
+ * Scan-time self-report reconcile (#212). Once the scan pipeline knows the
+ * verified uploader for [sha256], flag any report already filed by that uploader
+ * as a self-report — the HTTP path may have recorded it before uploaded_by
+ * existed, so the ingest-time guard in recordReportForReview could not see the
+ * match. This excludes it from all future escalation counts; it does not undo an
+ * escalation that already fired (which needs a co-reporter in the sub-scan window
+ * and gets human review anyway).
+ *
+ * The scan queue consumer calls this on BOTH the full-scan path and the
+ * "already moderated" dedup-skip path. The skip path matters: the report
+ * ingestion that lost the race also wrote a moderation_results row, so the later
+ * scan for the same sha256 trips dedup and skips — without the skip-path call the
+ * reconcile would never fire in the exact race it exists to close.
+ *
+ * PROVENANCE (accepted risk): [uploadedBy] is only as trustworthy as its
+ * producer. Today's callers pass the value the scan pipeline derived for the
+ * content (the queue message's verified uploader), and self-report is
+ * non-escalating — flagging can only ever *suppress* escalation, never cause it.
+ * The bounded downside: if a producer ever supplied a wrong uploader that
+ * happened to equal some real reporter's pubkey, that reporter's report on this
+ * sha256 would be de-escalated (not merely "under-flagged"). It still cannot
+ * manufacture a self-report against a third party's *content* — the match is
+ * uploader-against-reporter on the same sha256 — and it cannot raise an outcome.
+ * If a future caller ever fed an attacker-controlled uploader here, revisit.
+ *
+ * KNOWN GAP (#212): this updates user_reports.source only. A moderation_results
+ * row written by an earlier ingest still carries raw_response.selfReport=false;
+ * nothing reads that field yet, but a consumer that did would see it disagree
+ * with the reconciled source until the next write. Left as follow-up.
+ *
+ * @param {D1Database} db
+ * @param {string} sha256
+ * @param {string|null|undefined} uploadedBy - the verified content uploader
+ */
+export async function reconcileSelfReportsForUploader(db, sha256, uploadedBy) {
+  if (!sha256 || !uploadedBy) return;
+  await db.prepare(`
+    UPDATE user_reports
+    SET source = 'self-report'
+    WHERE sha256 = ?
+      AND LOWER(reporter_pubkey) = LOWER(?)
+      AND (source IS NULL OR source != 'self-report')
+  `).bind(sha256, uploadedBy).run();
+}
 
 /**
  * Insert a report and return two reporter counts, so callers can apply
@@ -108,11 +167,19 @@ export async function addReport(db, { sha256, reporter_pubkey, report_type, reas
   // reporter the HTTP or trusted relay path already established. Everything
   // else about the row stays first-write-wins -- `report_type`, `reason` and
   // `created_at` keep the report of record as it was first filed.
+  //
+  // Only a SUPERSEDABLE source may be upgraded (#212): the existing row must be
+  // 'dm-report' or 'relay-report-untrusted'. 'self-report' is deliberately not
+  // in that set, so a later user-report from the same key on the same content --
+  // e.g. a self-reporter's client retrying while the ingest-time uploader lookup
+  // was momentarily unavailable -- can never flip a reconciled self-report back
+  // to an escalating source. The excluded-source guard still uses the full
+  // non-escalating set, so an incoming self-report never upgrades anything either.
   await db.prepare(`
     INSERT OR IGNORE INTO user_reports (sha256, reporter_pubkey, report_type, reason, created_at, source)
     VALUES (?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)
     ON CONFLICT(sha256, reporter_pubkey) DO UPDATE SET source = excluded.source
-      WHERE user_reports.source IN (${nonEscalatingPlaceholders})
+      WHERE user_reports.source IN (${supersedablePlaceholders})
         AND excluded.source IS NOT NULL
         AND excluded.source NOT IN (${nonEscalatingPlaceholders})
   `).bind(
@@ -122,7 +189,7 @@ export async function addReport(db, { sha256, reporter_pubkey, report_type, reas
     reason ?? null,
     created_at ?? null,
     source ?? null,
-    ...NON_ESCALATING_SOURCES,
+    ...SUPERSEDABLE_SOURCES,
     ...NON_ESCALATING_SOURCES,
   ).run();
 

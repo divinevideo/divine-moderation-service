@@ -7,6 +7,23 @@
 import { addReport, isAiReportType, isNsfwReportType } from '../reports.mjs';
 import { buildAIReportEvent, recordAIDetectionEvent } from './ai-detection-events.mjs';
 
+/**
+ * The uploader of the reported content — the party a report names. Only a
+ * previously-scanned sha256 has a moderation row, so an unknown one returns
+ * null and the self-report guard skips rather than guesses.
+ */
+async function lookupUploadedBy(db, sha256) {
+  try {
+    const row = await db
+      .prepare('SELECT uploaded_by FROM moderation_results WHERE sha256 = ?')
+      .bind(sha256)
+      .first();
+    return row?.uploaded_by ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function recordReportForReview(db, {
   sha256,
   reporterPubkey,
@@ -19,6 +36,38 @@ export async function recordReportForReview(db, {
   uploadedBy = null,
   allowAutoAgeRestrict = source === 'user-report',
 } = {}) {
+  // Self-report guard (#211): a user reporting their own content. The reported
+  // party is the content's uploader; prefer the caller-supplied value (the relay
+  // poller passes the target event's signature-verified pubkey), else look it up
+  // from any existing moderation row. On a match, flag it as a self-report —
+  // still recorded for audit, but source 'self-report' is non-escalating so it
+  // can never drive an automatic outcome. Flag, not drop: the HTTP path's
+  // reporter pubkey is self-asserted, so a spoofed self-match must not be able
+  // to silently suppress a real report.
+  const effectiveUploader = uploadedBy ?? (await lookupUploadedBy(db, sha256));
+  const isSelfReport = Boolean(
+    reporterPubkey &&
+      effectiveUploader &&
+      reporterPubkey.toLowerCase() === effectiveUploader.toLowerCase(),
+  );
+  // SCAN-RACE (#212): on the HTTP path the uploader is only resolvable once the
+  // scan queue has written moderation_results.uploaded_by. A self-report on a
+  // freshly-uploaded, not-yet-scanned sha256 falls through unflagged here — it is
+  // corrected retroactively by reconcileSelfReportsForUploader, which the scan
+  // queue consumer runs (on both the full-scan and dedup-skip paths) once the
+  // verified uploader is known. The relay-poll path never hits this: it passes
+  // the target event's signature-verified pubkey.
+  const originalSource = source;
+  // Verified only when the match used the caller-supplied uploader (the
+  // relay-poll's signature-verified pubkey), not the self-asserted DB fallback —
+  // the distinction the "flag, not drop" decision rests on, surfaced to the
+  // moderator rather than lost.
+  const uploaderMatchVerified = isSelfReport && uploadedBy != null;
+  if (isSelfReport) {
+    source = 'self-report';
+    allowAutoAgeRestrict = false;
+  }
+
   const result = await addReport(db, {
     sha256,
     reporter_pubkey: reporterPubkey,
@@ -77,6 +126,9 @@ export async function recordReportForReview(db, {
       JSON.stringify(categories),
       JSON.stringify({
         source,
+        originalSource,
+        selfReport: isSelfReport,
+        uploaderMatchVerified,
         reportType,
         reportedBy: reporterPubkey,
         distinctReporterCount: result.distinctReporterCount,
@@ -117,6 +169,7 @@ export async function recordReportForReview(db, {
     success: true,
     ...result,
     action,
+    isSelfReport,
     moderationResultRecorded,
     moderationResultError,
     aiTelemetryRecorded,

@@ -20,7 +20,7 @@ import { hexToBytes, bytesToHex } from '@noble/hashes/utils';
 import dashboardHTML from './admin/dashboard.html';
 import swipeReviewHTML from './admin/swipe-review.html';
 import messagesHTML from './admin/messages.html';
-import { initReportsTable } from './reports.mjs';
+import { initReportsTable, reconcileSelfReportsForUploader } from './reports.mjs';
 import { initUploaderEnforcementTable, getUploaderEnforcement, setUploaderEnforcement, applyUploaderEnforcementToResult } from './uploader-enforcement.mjs';
 import { formatForStorage, formatForGorse, formatForFunnelcake } from './classification/pipeline.mjs';
 import { extractTopics, topicsToLabels, topicsToWeightedFeatures } from './classification/topic-extractor.mjs';
@@ -4898,6 +4898,19 @@ async function runMigration() {
         if (existingResult && !forceAIDetection && !providerOverridden) {
           console.log(`[MODERATION] ⚠️ SKIPPED ${sha256} - already moderated`);
           console.log(`[MODERATION] Previous result: action=${existingResult.action}, moderated_at=${existingResult.moderated_at}`);
+          // Scan-time self-report reconcile (#212), skip-path case. The report
+          // ingestion path writes a moderation_results row of its own, so a
+          // self-report filed before the scan trips the dedup above and the scan
+          // never reaches the post-moderation reconcile below. But this queue
+          // message still carries the verified uploader, so reconcile here too —
+          // otherwise the report the reconcile exists to catch stays escalating
+          // forever, which is the exact window #212 closes. Wrapped so a reconcile
+          // failure never blocks acking a duplicate.
+          try {
+            await reconcileSelfReportsForUploader(env.BLOSSOM_DB, sha256, uploadedBy);
+          } catch (reconcileErr) {
+            console.error(`[MODERATION] self-report reconcile (skip path) failed for ${sha256}:`, reconcileErr?.message || reconcileErr);
+          }
           message.ack();
           continue;
         }
@@ -4980,6 +4993,17 @@ async function runMigration() {
           null
         ).run();
         console.log(`[MODERATION] Step 7: D1 write successful`);
+
+        // Scan-time self-report reconcile (#212): the verified uploader is now
+        // known, so flag any report already filed by that uploader on this
+        // sha256 — the HTTP path may have recorded it before uploaded_by existed
+        // and the ingest guard in recordReportForReview couldn't see the match.
+        // Wrapped so a reconcile failure never sinks the scan.
+        try {
+          await reconcileSelfReportsForUploader(env.BLOSSOM_DB, sha256, result.uploadedBy);
+        } catch (reconcileErr) {
+          console.error(`[MODERATION] self-report reconcile failed for ${sha256}:`, reconcileErr?.message || reconcileErr);
+        }
 
         try {
           await recordAIDetectionEvent(env.BLOSSOM_DB, buildAIPolicyDecisionEvent({

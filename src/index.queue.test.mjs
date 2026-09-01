@@ -33,6 +33,36 @@ function createDbMock({ writes = [] } = {}) {
   };
 }
 
+// A DB mock whose dedup lookup returns an existing moderation row, so the queue
+// consumer takes the "already moderated" skip branch. Captures .run() writes so a
+// test can assert what still ran on that path.
+function createSkipDbMock({ writes = [], existingRow } = {}) {
+  return {
+    prepare(sql) {
+      let bindings = [];
+      return {
+        bind(...args) {
+          bindings = args;
+          return this;
+        },
+        async first() {
+          if (sql.includes('SELECT sha256, action, moderated_at FROM moderation_results')) {
+            return existingRow;
+          }
+          return null;
+        },
+        async run() {
+          writes.push({ sql, bindings });
+          return { success: true, bindings };
+        }
+      };
+    },
+    async batch() {
+      return [];
+    }
+  };
+}
+
 function createEnv(overrides = {}) {
   return {
     BLOSSOM_DB: createDbMock(),
@@ -165,5 +195,57 @@ describe('queue consumer', () => {
     expect(moderationWrite).toBeDefined();
     expect(moderationWrite.sql).toContain('videoseal');
     expect(moderationWrite.bindings).toContain(JSON.stringify(videoseal));
+  });
+
+  it('reconciles self-reports on the dedup-skip path when a report already wrote a moderation row (#212)', async () => {
+    // The #212 race: a user reports their own freshly-uploaded video before the
+    // scan runs. The report path writes a moderation_results row, so when the
+    // delayed scan message arrives it trips the "already moderated" dedup skip.
+    // The scan message still carries the verified uploader, so the reconcile must
+    // run on the skip path too — otherwise the self-report the reconcile exists
+    // to catch stays escalating forever.
+    const writes = [];
+    const SHA = 'a'.repeat(64);
+    const UPLOADER = 'e'.repeat(64);
+
+    vi.doMock('./moderation/pipeline.mjs', async (importOriginal) => {
+      const actual = await importOriginal();
+      return {
+        ...actual,
+        moderateVideo: moderateVideoMock
+      };
+    });
+
+    const { default: worker } = await import('./index.mjs');
+    const ack = vi.fn();
+
+    await worker.queue({
+      messages: [{
+        body: {
+          sha256: SHA,
+          uploadedBy: UPLOADER,
+          uploadedAt: Date.now(),
+          metadata: { source: 'blossom' }
+        },
+        attempts: 0,
+        ack,
+        retry: vi.fn()
+      }]
+    }, createEnv({
+      BLOSSOM_DB: createSkipDbMock({
+        writes,
+        existingRow: { sha256: SHA, action: 'REVIEW', moderated_at: '2026-08-31T00:00:00.000Z' }
+      })
+    }));
+
+    // The scan skipped — a moderation row already existed, and this is not a rescan.
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(moderateVideoMock).not.toHaveBeenCalled();
+
+    // ...but the self-report reconcile still ran, keyed on the message's verified uploader.
+    const reconcileWrite = writes.find(({ sql }) =>
+      sql.includes('UPDATE user_reports') && sql.includes("SET source = 'self-report'"));
+    expect(reconcileWrite).toBeDefined();
+    expect(reconcileWrite.bindings).toEqual([SHA, UPLOADER]);
   });
 });
