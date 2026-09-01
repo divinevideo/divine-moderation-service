@@ -9,6 +9,7 @@ import { env } from 'cloudflare:test';
 import { initReportsTable, addReport, getReportCount, getReporterPubkeys, isAiReportType, isNsfwReportType, reconcileSelfReportsForUploader } from './reports.mjs';
 
 const SHA256 = ('a'.repeat(63) + '1').slice(0, 64);
+const SHA256_OTHER = ('c'.repeat(63) + '2').slice(0, 64);
 const REPORTER1 = ('b'.repeat(63) + '1').slice(0, 64);
 const REPORTER2 = ('b'.repeat(63) + '2').slice(0, 64);
 const REPORTER3 = ('b'.repeat(63) + '3').slice(0, 64);
@@ -64,6 +65,43 @@ describe('reports', () => {
       await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
       await reconcileSelfReportsForUploader(db, SHA256, null);
       expect(await sourceOf(REPORTER1)).toBe('user-report');
+    });
+
+    it('does not let a later user-report downgrade a reconciled self-report (#212)', async () => {
+      // The scan reconcile flags the uploader's own report as self-report. If the
+      // self-reporter's client then retries the HTTP report, addReport's ON-CONFLICT
+      // must NOT upgrade the row back to an escalating source -- a self-report is
+      // identity-based and permanent, not a weak source a stronger path supersedes.
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await reconcileSelfReportsForUploader(db, SHA256, REPORTER1);
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+
+      // Client retry: same reporter, same content, user-report source again.
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+    });
+
+    it('flags a row written before the source column existed (NULL source)', async () => {
+      // insertReport omits source, so the row is NULL -- the pre-`source` shape the
+      // reconcile's `source IS NULL` clause exists to catch.
+      await insertReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam' });
+      await reconcileSelfReportsForUploader(db, SHA256, REPORTER1);
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+    });
+
+    it('scopes the reconcile to the given sha256, not the reporter globally', async () => {
+      // The uploader has a report on the target content AND a legitimate report on a
+      // DIFFERENT video. Reconciling the first must never touch the second, or an
+      // uploader who reports someone else's content gets silently de-escalated.
+      await addReport(db, { sha256: SHA256, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await addReport(db, { sha256: SHA256_OTHER, reporter_pubkey: REPORTER1, report_type: 'spam', source: 'user-report' });
+      await reconcileSelfReportsForUploader(db, SHA256, REPORTER1);
+      expect(await sourceOf(REPORTER1)).toBe('self-report');
+      const otherRow = await db
+        .prepare('SELECT source FROM user_reports WHERE sha256 = ? AND reporter_pubkey = ?')
+        .bind(SHA256_OTHER, REPORTER1)
+        .first();
+      expect(otherRow?.source).toBe('user-report');
     });
   });
 

@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { recordReportForReview } from './report-review.mjs';
-import { NON_ESCALATING_SOURCES } from '../reports.mjs';
+import { NON_ESCALATING_SOURCES, SUPERSEDABLE_SOURCES } from '../reports.mjs';
 
 const SHA = 'a'.repeat(64);
 const REPORTER = 'b'.repeat(64);
@@ -97,8 +97,10 @@ describe('recordReportForReview', () => {
     });
     expect(userReportWrites).toHaveLength(1);
     // The row itself, then the conflict guard: upgrade the stored source only
-    // when it is one of the non-escalating sources and the incoming one is not.
-    // The guard binds that list twice — once per IN clause.
+    // when the existing row is a SUPERSEDABLE source (a weak path a stronger
+    // report may overtake) and the incoming one is escalation-eligible. The two
+    // IN clauses bind different lists — supersedable (excludes self-report, #212)
+    // for the existing row, the full non-escalating set for the incoming one.
     expect(userReportWrites[0].bindings).toEqual([
       SHA,
       REPORTER,
@@ -106,7 +108,7 @@ describe('recordReportForReview', () => {
       'reported from relay',
       '2026-05-13T17:19:42.000Z',
       'relay-report',
-      ...NON_ESCALATING_SOURCES,
+      ...SUPERSEDABLE_SOURCES,
       ...NON_ESCALATING_SOURCES,
     ]);
     expect(userReportWrites[0].sql).toMatch(/ON CONFLICT\(sha256, reporter_pubkey\) DO UPDATE SET source = excluded\.source/i);
