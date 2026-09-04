@@ -22,6 +22,8 @@ import {
   COMPOSE_TEMPLATES,
   renderComposeTemplate,
   publishToRelays,
+  requestDirectMessagePush,
+  scheduleDirectMessagePush,
 } from './dm-sender.mjs';
 import { isContained, parseRelayOverride } from './relay-override.mjs';
 import { createMockKV } from '../test/helpers.mjs';
@@ -642,6 +644,139 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       expect(isContained({})).toBe(false);
       expect(parseRelayOverride({})).toEqual([]);
     });
+  });
+});
+
+describe('DM Sender - Push Hook', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('posts the classified gift-wrap id and recipient', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(null, { status: 204 }),
+    );
+    const env = {
+      PUSH_SERVICE_URL: 'https://push.internal/',
+      PUSH_SERVICE_TOKEN: 'shared-token',
+    };
+
+    const result = await requestDirectMessagePush(
+      env,
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    );
+
+    expect(result).toEqual({ requested: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://push.internal/internal/v1/direct-message');
+    expect(init.method).toBe('POST');
+    expect(init.headers.Authorization).toBe('Bearer shared-token');
+    expect(JSON.parse(init.body)).toEqual({
+      eventId: 'c'.repeat(64),
+      recipientPubkey: 'b'.repeat(64),
+      messageType: 'moderation_notice',
+    });
+  });
+
+  it('fails open when the push service rejects the request', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(null, { status: 503 }),
+    );
+
+    await expect(requestDirectMessagePush(
+      {
+        PUSH_SERVICE_URL: 'https://push.internal',
+        PUSH_SERVICE_TOKEN: 'shared-token',
+      },
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'report_outcome',
+    )).resolves.toEqual({
+      requested: false,
+      reason: 'Push service returned 503',
+    });
+  });
+
+  it('fails open when the push request throws', async () => {
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network unavailable'));
+
+    await expect(requestDirectMessagePush(
+      {
+        PUSH_SERVICE_URL: 'https://push.internal',
+        PUSH_SERVICE_TOKEN: 'shared-token',
+      },
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    )).resolves.toEqual({
+      requested: false,
+      reason: 'network unavailable',
+    });
+  });
+
+  it('warns when only half of the push configuration is present', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    await requestDirectMessagePush(
+      { PUSH_SERVICE_URL: 'https://push.internal' },
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    );
+
+    expect(warn).toHaveBeenCalledWith(
+      '[DM] Push service configuration is incomplete; both URL and token are required',
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('anchors a successful DM push in waitUntil', async () => {
+    const pushCalls = [];
+    const requestPush = async (...args) => {
+      pushCalls.push(args);
+      return { requested: true };
+    };
+    let waitUntilCalls = 0;
+    const ctx = {
+      waitUntil(_promise) { waitUntilCalls++; },
+    };
+    const env = {};
+
+    await scheduleDirectMessagePush(
+      env,
+      ctx,
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+      requestPush,
+    );
+
+    expect(pushCalls).toEqual([[
+      env,
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    ]]);
+    expect(waitUntilCalls).toBe(1);
+  });
+
+  it('does not call the network when the hook is unconfigured', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+
+    await expect(requestDirectMessagePush(
+      {},
+      'b'.repeat(64),
+      'c'.repeat(64),
+      'moderation_notice',
+    )).resolves.toEqual({
+      requested: false,
+      reason: 'Push service not configured',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
