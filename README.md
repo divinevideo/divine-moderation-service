@@ -88,8 +88,8 @@ Secrets are set with `wrangler secret put <NAME>`. The ones the service reads (s
 - `SERVICE_API_TOKEN` — bearer token for authenticated `moderation-api.divine.video` requests.
 - `POLICY_AUD` — Zero Trust application audience tag for the admin app.
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` — Cloudflare Access service token for the relay.
-- `NOSTR_PRIVATE_KEY` — signs NIP-56 report events.
-- `MODERATOR_NSEC` / `NOSTR_RELAY_URL` — signs and publishes NIP-32 human-moderator label events.
+- `NOSTR_PRIVATE_KEY` — the service's only Nostr signing key: NIP-56 report events, NIP-32 moderator labels, and NIP-17 enforcement DMs all use it, and its derived pubkey is what `dm_log` records. `MODERATOR_NSEC` used to sign the label and DM halves; #31 unified them onto this key and nothing has read that variable since, so do not set it.
+- `NOSTR_RELAY_URL` — relay that label events are published to.
 - `ADMIN_PASSWORD_HASH` — SHA-256 of the admin dashboard password (`generate-admin-hash.mjs`).
 - `ATPROTO_LABELER_WEBHOOK_URL` / `ATPROTO_LABELER_TOKEN` — the divine-labeler webhook and its bearer token.
 - `REALITY_DEFENDER_API_KEY` — secondary AI verification.
