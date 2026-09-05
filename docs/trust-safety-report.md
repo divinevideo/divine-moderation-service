@@ -212,7 +212,47 @@ This creates an auditable record of human moderation decisions on the Nostr prot
 | **KV** `quarantine:{sha256}` | Quarantine flag with reason and moderator info | 90 days |
 | **D1** `moderation_results` | Action, provider, scores JSON, categories, raw response, timestamps, reviewer info | Permanent |
 | **D1** `user_reports` | User-submitted reports with auto-escalation | Permanent |
+| **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body | **Indefinite — undecided.** See below |
+| **D1** `dm_conversation_read_state` | Moderator read marker, one row per conversation | Indefinite; no cleanup, and no foreign key to `dm_log` |
 | **Blossom** `media.divine.video` | Source video files | Permanent |
+
+### `dm_log` is retained by omission, not by decision
+
+Every other row above has a lifetime somebody chose. `dm_log` has never had
+one: no `DELETE`, no TTL, no scheduled sweep, no lifecycle rule — and until
+this row was added, no entry in this table either.
+
+Three things make that worth deciding rather than leaving:
+
+- **`content` is the message, not a reference to it.** The same string that is
+  gift-wrapped is stored, so a row is a byte-identical server-side plaintext
+  copy of an end-to-end-encrypted message.
+- **It outlives the user's own copy.** NIP-59 tells relays to delete
+  `kind:1059` events addressed to anyone who requests a NIP-62 vanish, and
+  funnelcake does. Nothing propagates that erasure here, so after a user
+  deletes their account Divine still holds the notice explaining why they were
+  actioned, keyed to their pubkey, and they hold nothing.
+- **This is not what the table was for.** `docs/moderation-dm-plan.md` specifies
+  `dm_log` as an *operational index for the admin dashboard* with the *relay as
+  source of truth for message content*. Both halves have quietly stopped being
+  true.
+
+Sizing, so the decision is not made in the dark: a `moderation_notice` body
+runs 169–602 bytes, and on disk with the three indexes a row costs roughly
+1.0–1.25 KB. Volume is not the reason to decide this.
+
+Retaining enforcement records through an erasure request is a normal and
+defensible posture. It simply has to be chosen. The decision is tracked at
+`divinevideo/divine-mobile#7850`; the client-side half of the picture is in that
+repo's `mobile/docs/DM_RETENTION.md`.
+
+One mechanical note for whoever implements a decision: a moderation key
+rotation forks `conversation_id`, which is `SHA-256(sorted(pubkey pair))`, so
+rows written under a retired key form a disjoint set that
+`getConversationByPubkey` — which derives the id from the *current* key —
+already cannot reach. They are separable without touching live threads.
+`dm_conversation_read_state` has no foreign key, so any pruning must delete the
+matching read-state rows in the same transaction.
 
 ---
 
