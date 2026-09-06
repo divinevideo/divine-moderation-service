@@ -5,6 +5,7 @@
 // ABOUTME: Validates cf-access-jwt-assertion tokens using jose library
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { verifyZeroTrustJWT, createZeroTrustVerifier, getZeroTrustVerifier } from './zerotrust.mjs';
 
 describe('Zero Trust JWT Verification', () => {
@@ -107,6 +108,32 @@ describe('Zero Trust JWT Verification', () => {
       expect(() => createZeroTrustVerifier({})).toThrow('TEAM_DOMAIN not configured');
       expect(() => createZeroTrustVerifier({ TEAM_DOMAIN: 'https://test.com' }))
         .toThrow('POLICY_AUD not configured');
+    });
+
+    it('reuses fetched signing keys across repeated verifications', async () => {
+      const { publicKey, privateKey } = await generateKeyPair('RS256');
+      const publicJwk = await exportJWK(publicKey);
+      publicJwk.kid = 'test-key';
+      publicJwk.alg = 'RS256';
+      const token = await new SignJWT({ email: 'test@divine.video' })
+        .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
+        .setIssuer(mockEnv.TEAM_DOMAIN)
+        .setAudience(mockEnv.POLICY_AUD)
+        .setExpirationTime('5m')
+        .sign(privateKey);
+      const fetchMock = vi.fn(async () => new Response(JSON.stringify({ keys: [publicJwk] }), {
+        headers: { 'Content-Type': 'application/json' }
+      }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      try {
+        const verifier = createZeroTrustVerifier(mockEnv);
+        await expect(verifier.verify(token)).resolves.toMatchObject({ valid: true });
+        await expect(verifier.verify(token)).resolves.toMatchObject({ valid: true });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
   });
 

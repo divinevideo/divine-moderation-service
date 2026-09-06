@@ -28,7 +28,7 @@ export function getConfiguredBearerTokens(env) {
     .filter((value, index, all) => typeof value === 'string' && value.length > 0 && all.indexOf(value) === index);
 }
 
-export async function authenticateApiRequest(request, env, verifier = null) {
+export async function authenticateApiRequest(request, env) {
   if (env.ALLOW_DEV_ACCESS === 'true' && isLocalRequest(request)) {
     return { valid: true, email: 'dev@localhost', isServiceToken: false };
   }
@@ -43,7 +43,7 @@ export async function authenticateApiRequest(request, env, verifier = null) {
   const jwtToken = request.headers.get('cf-access-jwt-assertion');
   if (jwtToken) {
     try {
-      return await (verifier || getZeroTrustVerifier(env)).verify(jwtToken);
+      return await getZeroTrustVerifier(env).verify(jwtToken);
     } catch (error) {
       return { valid: false, error: error.message };
     }
