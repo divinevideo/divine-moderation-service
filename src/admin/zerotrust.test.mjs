@@ -5,7 +5,7 @@
 // ABOUTME: Validates cf-access-jwt-assertion tokens using jose library
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { verifyZeroTrustJWT, createZeroTrustVerifier } from './zerotrust.mjs';
+import { verifyZeroTrustJWT, createZeroTrustVerifier, getZeroTrustVerifier } from './zerotrust.mjs';
 
 describe('Zero Trust JWT Verification', () => {
   const mockEnv = {
@@ -107,6 +107,19 @@ describe('Zero Trust JWT Verification', () => {
       expect(() => createZeroTrustVerifier({})).toThrow('TEAM_DOMAIN not configured');
       expect(() => createZeroTrustVerifier({ TEAM_DOMAIN: 'https://test.com' }))
         .toThrow('POLICY_AUD not configured');
+    });
+  });
+
+  describe('getZeroTrustVerifier', () => {
+    it('reuses the verifier for the same issuer and audience', () => {
+      expect(getZeroTrustVerifier(mockEnv)).toBe(getZeroTrustVerifier({ ...mockEnv }));
+    });
+
+    it('keeps policies with different audiences isolated', () => {
+      expect(getZeroTrustVerifier(mockEnv)).not.toBe(getZeroTrustVerifier({
+        ...mockEnv,
+        POLICY_AUD: 'different-audience'
+      }));
     });
   });
 });

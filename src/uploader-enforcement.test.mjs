@@ -3,7 +3,19 @@
 //
 // ABOUTME: Verifies uploader enforcement state and admin endpoints for relay/user actions
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('./admin/zerotrust.mjs', () => ({
+  getZeroTrustVerifier: () => ({
+    verify: async (token) => token === 'test-access-token'
+      ? {
+          valid: true,
+          email: 'verified-mod@divine.video',
+          payload: { email: 'verified-mod@divine.video' }
+        }
+      : { valid: false, error: 'Missing JWT token' }
+  })
+}));
 import worker from './index.mjs';
 import { applyUploaderEnforcementToResult, getUploaderEnforcement, setUploaderEnforcement } from './uploader-enforcement.mjs';
 
@@ -170,7 +182,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({
             approvalRequired: true,
@@ -231,7 +243,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
         }),
@@ -282,7 +294,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
         }),
@@ -330,7 +342,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ relayBanned: false, reason: 'Cleared by trust and safety' })
         }),
@@ -365,7 +377,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
         }),
@@ -403,7 +415,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
         }),
@@ -457,7 +469,7 @@ describe('admin uploader enforcement routes', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       env
     );
@@ -491,7 +503,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ reason: 'Delete bad event' })
         }),
@@ -573,7 +585,7 @@ describe('admin uploader enforcement routes', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({
             reason: 'Delete all versions',
@@ -628,7 +640,7 @@ describe('age-review refusals on un-ban', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
         },
         body: JSON.stringify({ relayBanned: false, reason: 'Relay ban removed by moderator' })
       }),

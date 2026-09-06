@@ -9,8 +9,8 @@ import { moderateVideo, classifyVideoOnly } from './moderation/pipeline.mjs';
 import { applyForceProvider, shouldQueueHiveRecheck } from './moderation/report-trigger.mjs';
 import { publishToFaro, publishToContentRelay, publishLabelEvent, buildLabelEvent, publishPreparedLabelEvent, publishDmInboxRelayList } from './nostr/publisher.mjs';
 import { requireAuth, getAuthenticatedUser } from './admin/auth.mjs';
-import { verifyZeroTrustJWT } from './admin/zerotrust.mjs';
 import { getConfiguredBearerTokens, authenticateApiRequest, apiUnauthorizedResponse, authSourceFromVerification, verifyLegacyBearerAuth } from './auth-api.mjs';
+import { isLocalHostname } from './request-host.mjs';
 import { fetchNostrEventBySha256, fetchNostrVideoEventsByDTag, parseVideoEventMetadata, fetchKind5EventsSince, fetchNostrEventById, fetchLabelEventsSince, fetchLabelEventsForVideo } from './nostr/relay-client.mjs';
 import { pollRelayForVideos, getLastPollTimestamp, setLastPollTimestamp, getPollingStatus } from './nostr/relay-poller.mjs';
 import { getLastReportPollTimestamp, getReportLastRun, getReportPollingStatus, pollRelayForReports, setLastReportPollTimestamp } from './nostr/report-poller.mjs';
@@ -117,7 +117,6 @@ function serveHTML(html, etag, request) {
     headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache', 'ETag': etag }
   });
 }
-const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 /**
  * Generate NIP-32 style label tags based on scores and human verifications
@@ -181,10 +180,6 @@ function deriveCategoriesFromClassification(classification) {
   }
 
   return [...categories];
-}
-
-function isLocalHostname(hostname) {
-  return LOCAL_HOSTNAMES.has(hostname) || hostname.endsWith('.localhost');
 }
 
 function isApiSurfacePath(pathname) {

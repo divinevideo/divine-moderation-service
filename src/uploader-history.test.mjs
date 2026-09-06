@@ -4,7 +4,19 @@
 // ABOUTME: Tests GET /admin/api/uploader/:pubkey aggregate endpoint used by
 // ABOUTME: the admin dashboard to show per-uploader history and stats.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('./admin/zerotrust.mjs', () => ({
+  getZeroTrustVerifier: () => ({
+    verify: async (token) => token === 'test-access-token'
+      ? {
+          valid: true,
+          email: 'verified-mod@divine.video',
+          payload: { email: 'verified-mod@divine.video' }
+        }
+      : { valid: false, error: 'Missing JWT token' }
+  })
+}));
 import worker from './index.mjs';
 
 const PUBKEY = 'a'.repeat(64);
@@ -126,7 +138,10 @@ function createEnv(overrides = {}) {
   };
 }
 
-const AUTH_HEADER = { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' };
+const AUTH_HEADER = {
+  'Cf-Access-Authenticated-User-Email': 'mod@divine.video',
+  'cf-access-jwt-assertion': 'test-access-token'
+};
 
 describe('GET /admin/api/uploader/:pubkey', () => {
   it('returns per-uploader aggregates from moderation_results, dm_log, and enforcement', async () => {

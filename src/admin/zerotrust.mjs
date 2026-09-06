@@ -6,6 +6,8 @@
 
 import { jwtVerify, createRemoteJWKSet } from 'jose';
 
+const verifierCache = new Map();
+
 /**
  * Verify a Cloudflare Zero Trust JWT token
  * @param {string|null} token - The JWT from cf-access-jwt-assertion header
@@ -98,5 +100,20 @@ export function createZeroTrustVerifier(env, options = {}) {
     }
   };
 
+  return verifier;
+}
+
+/**
+ * Reuse the remote JWKS resolver across requests for the same Access policy.
+ * createRemoteJWKSet caches keys on the resolver instance, so recreating the
+ * verifier for every request would discard that cache.
+ */
+export function getZeroTrustVerifier(env) {
+  const cacheKey = `${env.TEAM_DOMAIN || ''}\u0000${env.POLICY_AUD || ''}`;
+  let verifier = verifierCache.get(cacheKey);
+  if (!verifier) {
+    verifier = createZeroTrustVerifier(env);
+    verifierCache.set(cacheKey, verifier);
+  }
   return verifier;
 }

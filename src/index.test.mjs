@@ -7,6 +7,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 
+vi.mock('./admin/zerotrust.mjs', () => ({
+  getZeroTrustVerifier: (env) => ({
+    verify: async (token) => token === 'test-access-token' || env.ALLOW_DEV_ACCESS === 'true'
+      ? {
+          valid: true,
+          email: 'verified-mod@divine.video',
+          payload: { email: 'verified-mod@divine.video' }
+        }
+      : { valid: false, error: 'Missing JWT token' }
+  })
+}));
+
 const publisherMocks = vi.hoisted(() => ({
   publishDmInboxRelayList: vi.fn()
 }));
@@ -658,7 +670,7 @@ describe('HTTP hostname routing', () => {
 
     const response = await worker.fetch(
       new Request('https://moderation.admin.divine.video/admin/api/ai-detection/stats?window=24h', {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' },
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' },
       }),
       env
     );
@@ -897,7 +909,7 @@ describe('Admin video lookup', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       env
     );
@@ -948,7 +960,7 @@ describe('Admin video lookup', () => {
 
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         env
       );
@@ -1003,7 +1015,7 @@ describe('Admin video lookup', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       env
     );
@@ -1061,7 +1073,7 @@ describe('Admin video lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({
           BLOSSOM_DB: createDbMock({
@@ -1166,7 +1178,7 @@ describe('Admin video lookup', () => {
     try {
       const first = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         makeEnv()
       );
@@ -1177,7 +1189,7 @@ describe('Admin video lookup', () => {
 
       const second = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         makeEnv()
       );
@@ -1234,7 +1246,7 @@ describe('Admin video lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({
           MODERATION_KV: {
@@ -1322,7 +1334,7 @@ describe('Admin video lookup', () => {
 
       const response = await worker.fetch(
         new Request('https://moderation.admin.divine.video/admin/api/videos', {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({
           BLOSSOM_DB: createDbMock({
@@ -1380,7 +1392,7 @@ describe('Admin video lookup', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       env
     );
@@ -1431,7 +1443,7 @@ describe('Admin video lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1489,7 +1501,7 @@ describe('Admin video lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${stableId}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({
           BLOSSOM_DB: createDbMock({
@@ -1529,7 +1541,7 @@ describe('Admin video lookup', () => {
     const identifier = 'x'.repeat(256);
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/video/${identifier}`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       createEnv()
     );
@@ -1547,7 +1559,7 @@ describe('Admin video lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/video/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1573,7 +1585,7 @@ describe('Admin nostr context lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/nostr-context/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({
           BLOSSOM_DB: createDbMock({
@@ -1670,7 +1682,7 @@ describe('Admin nostr context lookup', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/nostr-context/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1731,7 +1743,7 @@ This is a test`;
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/transcript/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1771,7 +1783,7 @@ This is a test`;
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/transcript/${SHA256}`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1813,7 +1825,7 @@ Hello world`;
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/transcript/${SHA256}.vtt`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1848,7 +1860,7 @@ Hello world`;
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/transcript/${SHA256}.vtt`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1888,7 +1900,7 @@ describe('admin video proxy format fallback', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/video/${SHA256}.mp4`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -1925,7 +1937,7 @@ describe('admin video proxy format fallback', () => {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/video/${SHA256}.mp4`, {
           headers: {
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token',
             'Range': 'bytes=0-1023'
           }
         }),
@@ -1967,7 +1979,7 @@ describe('admin video proxy format fallback', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/video/${SHA256}.mp4`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -2005,7 +2017,7 @@ describe('admin video proxy format fallback', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/video/${SHA256}.mp4`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({ BLOSSOM_WEBHOOK_SECRET: 'test-secret' })
       );
@@ -2038,7 +2050,7 @@ describe('admin video proxy format fallback', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/video/${SHA256}.mp4`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv({
           BLOSSOM_DB: createDbMock({
@@ -2088,7 +2100,7 @@ describe('admin video proxy format fallback', () => {
     try {
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/video/${SHA256}.mp4`, {
-          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+          headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
         }),
         createEnv()
       );
@@ -5962,7 +5974,7 @@ describe('POST /api/v1/notify', () => {
     const env = createEnv({ ALLOW_DEV_ACCESS: 'false' });
 
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'PERMANENT_BAN' })
@@ -5977,7 +5989,7 @@ describe('POST /api/v1/notify', () => {
     const env = createEnv({ ALLOW_DEV_ACCESS: 'true' });
 
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: 'not-a-valid-hex-pubkey', action: 'PERMANENT_BAN' })
@@ -5994,7 +6006,7 @@ describe('POST /api/v1/notify', () => {
     const env = createEnv({ ALLOW_DEV_ACCESS: 'true' });
 
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'INVALID_ACTION' })
@@ -6015,7 +6027,7 @@ describe('POST /api/v1/notify', () => {
     });
 
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'PERMANENT_BAN' })
@@ -6037,7 +6049,7 @@ describe('POST /api/v1/notify', () => {
     });
 
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'ACCOUNT_BANNED' })
@@ -6058,7 +6070,7 @@ describe('POST /api/v1/notify', () => {
     });
 
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'ACCOUNT_RESTORED' })
@@ -6081,7 +6093,7 @@ describe('POST /api/v1/notify', () => {
     // Mock fetch/WebSocket to prevent real connections. The DM sender
     // catches all errors internally and returns { sent: false, reason }.
     const response = await worker.fetch(
-      new Request('https://moderation-api.divine.video/api/v1/notify', {
+      new Request('http://localhost/api/v1/notify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'PERMANENT_BAN', reason: 'test' })
@@ -6543,7 +6555,7 @@ describe('admin age restricted reconcile preview endpoint', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({})
         }),
@@ -6592,7 +6604,7 @@ describe('admin age restricted reconcile preview endpoint', () => {
         new Request(`https://moderation.admin.divine.video/admin/api/reconcile/age-restricted/preview?limit=2&cursor=${shas[0]}`, {
           method: 'GET',
           headers: {
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           }
         }),
         env
@@ -6632,7 +6644,7 @@ describe('admin age restricted reconcile preview endpoint', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ limit: 1000 })
         }),
@@ -6671,7 +6683,7 @@ describe('admin age restricted reconcile preview endpoint', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ limit: 10, cursor: shas[0] })
         }),
@@ -6717,7 +6729,7 @@ describe('admin age restricted reconcile preview endpoint', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ limit: 10 })
         }),
@@ -6742,7 +6754,7 @@ describe('admin age restricted reconcile preview endpoint', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
         },
         body: JSON.stringify({ limit: 'fifty' })
       }),
@@ -6847,7 +6859,7 @@ describe('preview logs age restricted mismatch counts', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ limit: 50, cursor: null })
         }),
@@ -6976,7 +6988,7 @@ describe('admin age restricted reconcile apply endpoint', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
         },
         body: JSON.stringify({ shas: [] })
       }),
@@ -6992,7 +7004,7 @@ describe('admin age restricted reconcile apply endpoint', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
         },
         body: JSON.stringify({})
       }),
@@ -7009,7 +7021,7 @@ describe('admin age restricted reconcile apply endpoint', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
         },
         body: JSON.stringify({ shas: tooMany })
       }),
@@ -7025,7 +7037,7 @@ describe('admin age restricted reconcile apply endpoint', () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
         },
         body: JSON.stringify({ shas: ['not-a-sha', SHA_A] })
       }),
@@ -7045,7 +7057,7 @@ describe('admin age restricted reconcile apply endpoint', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_A] })
         }),
@@ -7143,7 +7155,7 @@ describe('age restricted apply revalidates blossom state', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_AR] })
         }),
@@ -7171,7 +7183,7 @@ describe('age restricted apply revalidates blossom state', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_DEL] })
         }),
@@ -7199,7 +7211,7 @@ describe('age restricted apply revalidates blossom state', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_REST] })
         }),
@@ -7228,7 +7240,7 @@ describe('age restricted apply revalidates blossom state', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_READ_FAIL] })
         }),
@@ -7261,7 +7273,7 @@ describe('age restricted apply revalidates blossom state', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_MISSING] })
         }),
@@ -7289,7 +7301,7 @@ describe('age restricted apply revalidates blossom state', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_UNEXPECTED] })
         }),
@@ -7359,7 +7371,7 @@ describe('age restricted apply returns exact failed shas', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA_REST, SHA_NOTIFY_FAIL, SHA_READ_FAIL] })
         }),
@@ -7433,7 +7445,7 @@ describe('age restricted reconcile writes AGE_RESTRICTED', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ shas: [SHA] })
         }),
@@ -7523,7 +7535,7 @@ describe('age restricted preview reports real blossom drift', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Cf-Access-Authenticated-User-Email': 'mod@divine.video'
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
           },
           body: JSON.stringify({ limit: 10 })
         }),
@@ -7861,7 +7873,7 @@ describe('GET /admin/api/community-strikes (#180)', () => {
 
     const response = await worker.fetch(
       new Request('https://moderation.admin.divine.video/admin/api/community-strikes?limit=10', {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       createEnv()
     );
@@ -7892,7 +7904,7 @@ describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
   it('rejects a non-hex creator pubkey', async () => {
     const response = await worker.fetch(
       new Request('https://moderation.admin.divine.video/admin/api/community-strikes/not-a-pubkey', {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       createEnv()
     );
@@ -7913,7 +7925,7 @@ describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=1&pageSize=10`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       createEnv()
     );
@@ -7948,7 +7960,7 @@ describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=3&pageSize=10`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       createEnv()
     );
@@ -7965,7 +7977,7 @@ describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
 
     const response = await worker.fetch(
       new Request(`https://moderation.admin.divine.video/admin/api/community-strikes/${CREATOR}?page=3&pageSize=5000`, {
-        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video' }
+        headers: { 'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token' }
       }),
       createEnv()
     );
