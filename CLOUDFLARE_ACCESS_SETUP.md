@@ -79,15 +79,14 @@ Only `moderation.admin.divine.video` is protected. Your other services remain pu
 - `moderation-api.divine.video` - Public and service-facing moderation API
 - `cdn.divine.video` - Public video CDN
 
-## Optional: Remove Old Auth System
+## Worker Verification
 
-After confirming Cloudflare Access works, you can optionally remove the custom auth system from `src/admin/auth.mjs` and `src/index.mjs`, since Cloudflare Access handles it at the edge.
+Cloudflare Access remains the edge authorization layer, and the Worker independently verifies its signed JWT as defence in depth. Keep `TEAM_DOMAIN` and the `POLICY_AUD` secret configured for the admin Access application. Do not replace Worker verification with a check for the asserted email header.
 
 **Available headers in your Worker:**
 ```javascript
-// After Cloudflare Access authenticates:
-const email = request.headers.get('cf-access-authenticated-user-email');
-// Example: "user@divine.video"
+// After Cloudflare Access authenticates, verify this token before trusting claims:
+const token = request.headers.get('cf-access-jwt-assertion');
 ```
 
 ## Troubleshooting

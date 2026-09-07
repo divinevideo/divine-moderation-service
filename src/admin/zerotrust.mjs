@@ -6,13 +6,15 @@
 
 import { jwtVerify, createRemoteJWKSet } from 'jose';
 
+const verifierCache = new Map();
+
 /**
  * Verify a Cloudflare Zero Trust JWT token
  * @param {string|null} token - The JWT from cf-access-jwt-assertion header
  * @param {Object} env - Environment with TEAM_DOMAIN and POLICY_AUD
  * @returns {Promise<Object>} Result with valid, email, payload, or error
  */
-export async function verifyZeroTrustJWT(token, env) {
+export async function verifyZeroTrustJWT(token, env, jwks = null) {
   // Validate environment configuration
   if (!env.TEAM_DOMAIN) {
     return { valid: false, error: 'TEAM_DOMAIN not configured' };
@@ -28,9 +30,9 @@ export async function verifyZeroTrustJWT(token, env) {
   }
 
   try {
-    // Create JWKS from Cloudflare's certs endpoint
-    const jwksUrl = new URL(`${env.TEAM_DOMAIN}/cdn-cgi/access/certs`);
-    const JWKS = createRemoteJWKSet(jwksUrl);
+    // Reuse a caller-provided resolver when there is one; otherwise build a
+    // one-off resolver for this single verification.
+    const JWKS = jwks || createRemoteJWKSet(new URL(`${env.TEAM_DOMAIN}/cdn-cgi/access/certs`));
 
     // Verify the JWT
     const { payload } = await jwtVerify(token, JWKS, {
@@ -70,6 +72,7 @@ export function createZeroTrustVerifier(env, options = {}) {
   }
 
   const jwksUrl = `${env.TEAM_DOMAIN}/cdn-cgi/access/certs`;
+  let jwks = null;
 
   // Create the verifier object
   const verifier = {
@@ -93,10 +96,29 @@ export function createZeroTrustVerifier(env, options = {}) {
         };
       }
 
-      // Production mode - use full verification
-      return verifyZeroTrustJWT(token, env);
+      // Production mode - reuse the resolver so jose keeps Cloudflare's
+      // signing keys and refetch cooldown cached across requests.
+      if (!jwks) {
+        jwks = createRemoteJWKSet(new URL(jwksUrl));
+      }
+      return verifyZeroTrustJWT(token, env, jwks);
     }
   };
 
+  return verifier;
+}
+
+/**
+ * Reuse the remote JWKS resolver across requests for the same Access policy.
+ * createRemoteJWKSet caches keys on the resolver instance, so recreating the
+ * verifier for every request would discard that cache.
+ */
+export function getZeroTrustVerifier(env) {
+  const cacheKey = `${env.TEAM_DOMAIN || ''}\u0000${env.POLICY_AUD || ''}`;
+  let verifier = verifierCache.get(cacheKey);
+  if (!verifier) {
+    verifier = createZeroTrustVerifier(env);
+    verifierCache.set(cacheKey, verifier);
+  }
   return verifier;
 }

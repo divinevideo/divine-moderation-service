@@ -64,10 +64,19 @@ describe('getConfiguredBearerTokens', () => {
 
 describe('authenticateApiRequest', () => {
   it('allows dev access when ALLOW_DEV_ACCESS is true', async () => {
-    const request = makeRequest();
+    const request = new Request('http://localhost/api/test');
     const env = { ALLOW_DEV_ACCESS: 'true' };
     const result = await authenticateApiRequest(request, env);
     expect(result).toEqual({ valid: true, email: 'dev@localhost', isServiceToken: false });
+  });
+
+  it('does not allow dev access on a deployed hostname', async () => {
+    const request = makeRequest();
+    const env = { ALLOW_DEV_ACCESS: 'true', SERVICE_API_TOKEN: 'configured-token' };
+
+    const result = await authenticateApiRequest(request, env);
+
+    expect(result.valid).toBe(false);
   });
 
   it('validates correct bearer token with isServiceToken true', async () => {
