@@ -244,8 +244,12 @@ crons = ["* * * * *", "*/5 * * * *"]
 # POLICY_AUD - Zero Trust application audience tag (from Access > Applications > moderation.admin.divine.video > Overview)
 # CF_ACCESS_CLIENT_ID - Cloudflare Access service token ID for relay.divine.video
 # CF_ACCESS_CLIENT_SECRET - Cloudflare Access service token secret for relay.divine.video
-# NOSTR_PRIVATE_KEY - for signing NIP-56 report events to faro.nos.social
-# MODERATOR_NSEC - Nostr private key (hex) for signing NIP-32 label events from human moderators
+# NOSTR_PRIVATE_KEY - the service's single Nostr signing key. Signs NIP-56 report
+# events, NIP-32 moderator labels, and NIP-17 enforcement DMs, and its derived
+# pubkey is what dm_log records in sender_pubkey / recipient_pubkey. Do NOT set
+# MODERATOR_NSEC: DM and label signing were unified onto this key in #31 and
+# nothing has read that variable since. Provisioning it does nothing, and its
+# presence in a runbook implies a retired key is still live somewhere.
 # NOSTR_RELAY_URL - Nostr relay for publishing label events (e.g., wss://relay.divine.video)
 # FARO_RELAY_URL - Nostr relay for faro moderation events
 # SIGHTENGINE_API_USER - (optional, for fallback)
