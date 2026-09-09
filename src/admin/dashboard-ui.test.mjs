@@ -70,5 +70,11 @@ describe('admin pages preserve the deep-link when a 401 forces re-auth', () => {
       // No bare redirect that would drop the filter should remain.
       expect(html).not.toContain("'/admin/login';");
     });
+
+    it(`${name} Logout performs a real Cloudflare Access logout`, () => {
+      // Logout must clear the CF Access session via /admin/logout, not bounce
+      // through the re-auth helper (which leaves the session fully intact).
+      expect(html).toMatch(/function logout\(\)\s*\{[\s\S]*?\/admin\/logout[\s\S]*?\}/);
+    });
   }
 });

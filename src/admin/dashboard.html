@@ -4851,8 +4851,9 @@
     }
 
     function logout() {
-      document.cookie = 'admin_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-      redirectToLogin();
+      // Clear the Cloudflare Access session at the edge; /admin/login only
+      // re-auths, so it can never actually sign the user out.
+      window.location.href = '/admin/logout';
     }
 
     function copyToClipboard(text) {
