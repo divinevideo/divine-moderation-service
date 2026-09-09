@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import dashboardHTML from './dashboard.html';
+import swipeReviewHTML from './swipe-review.html';
 
 describe('dashboard provenance UI hooks', () => {
   it('contains creator info modal and provenance helpers', () => {
@@ -56,4 +57,24 @@ describe('dashboard provenance UI hooks', () => {
   // running them, in dashboard-enforcement.test.mjs. Asserting on their source
   // text here as well would only add a second test that a reformat can break
   // and a behaviour change cannot.
+});
+
+describe('admin pages preserve the deep-link when a 401 forces re-auth', () => {
+  for (const [name, html] of [['dashboard', dashboardHTML], ['swipe-review', swipeReviewHTML]]) {
+    it(`${name} routes 401s through a returnTo-preserving login helper`, () => {
+      // The helper carries the current view (path + query) into login so
+      // re-auth lands back on it instead of the bare dashboard.
+      expect(html).toContain('function redirectToLogin()');
+      expect(html).toContain("encodeURIComponent(location.pathname + location.search)");
+      expect(html).toContain("'/admin/login?returnTo=' + returnTo");
+      // No bare redirect that would drop the filter should remain.
+      expect(html).not.toContain("'/admin/login';");
+    });
+
+    it(`${name} Logout performs a real Cloudflare Access logout`, () => {
+      // Logout must clear the CF Access session via /admin/logout, not bounce
+      // through the re-auth helper (which leaves the session fully intact).
+      expect(html).toMatch(/function logout\(\)\s*\{[\s\S]*?\/admin\/logout[\s\S]*?\}/);
+    });
+  }
 });

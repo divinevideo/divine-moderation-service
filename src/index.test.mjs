@@ -8019,3 +8019,126 @@ describe('GET /admin/api/community-strikes/:creatorPubkey (#180)', () => {
     );
   });
 });
+
+describe('Admin auth-failure recovery (returnTo + re-auth)', () => {
+  const ADMIN = 'https://moderation.admin.divine.video';
+
+  it('redirects an unauthenticated page navigation to login, preserving the deep-link in returnTo', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?action=REVIEW`),
+      createEnv()
+    );
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location'));
+    expect(location.pathname).toBe('/admin/login');
+    // The original path AND query survive so re-auth lands back on the filtered view.
+    expect(location.searchParams.get('returnTo')).toBe('/admin/dashboard?action=REVIEW&_reauth=1');
+  });
+
+  it('applies the same recovery to the swipe-review page', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/review`),
+      createEnv()
+    );
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location'));
+    expect(location.pathname).toBe('/admin/login');
+    expect(location.searchParams.get('returnTo')).toBe('/admin/review?_reauth=1');
+  });
+
+  it('shows a re-auth interstitial instead of looping once re-auth was already attempted', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?action=REVIEW&_reauth=1`),
+      createEnv()
+    );
+
+    // Not another redirect: breaking the edge-valid / worker-rejects loop.
+    expect(response.status).toBe(401);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(response.headers.get('location')).toBeNull();
+    const body = await response.text();
+    expect(body).toContain('/admin/logout');
+  });
+
+  it('honors a safe same-origin returnTo on the login route', async () => {
+    const returnTo = encodeURIComponent('/admin/dashboard?action=REVIEW');
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/login?returnTo=${returnTo}`),
+      createEnv()
+    );
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location'));
+    expect(location.pathname).toBe('/admin/dashboard');
+    expect(location.searchParams.get('action')).toBe('REVIEW');
+  });
+
+  it('rejects an off-site returnTo and falls back to the dashboard', async () => {
+    for (const evil of ['https://evil.com/x', '//evil.com', '/\\evil.com', 'javascript:alert(1)', '/notadmin/x']) {
+      const response = await worker.fetch(
+        new Request(`${ADMIN}/admin/login?returnTo=${encodeURIComponent(evil)}`),
+        createEnv()
+      );
+
+      expect(response.status).toBe(302);
+      const location = new URL(response.headers.get('location'));
+      expect(location.host).toBe('moderation.admin.divine.video');
+      expect(location.pathname).toBe('/admin/dashboard');
+      expect(location.search).toBe('');
+    }
+  });
+
+  it('still serves the dashboard HTML for an authenticated navigation', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?action=REVIEW`, {
+        headers: { 'cf-access-jwt-assertion': 'test-access-token' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+  });
+
+  it('leaves the JSON 401 contract intact for unauthenticated API requests', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/api/videos?action=REVIEW`),
+      createEnv()
+    );
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    expect(response.headers.get('location')).toBeNull();
+    await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
+  });
+
+  it('does not loop when the _reauth marker is pre-seeded with a non-1 value', async () => {
+    // A crafted/stale `_reauth` (any value) must trip the guard, not redirect
+    // forever appending markers (ERR_TOO_MANY_REDIRECTS).
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?_reauth=0`),
+      createEnv()
+    );
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(response.headers.get('location')).toBeNull();
+  });
+
+  it('strips the _reauth marker after a successful re-auth so later failures retry again', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?action=REVIEW&_reauth=1`, {
+        headers: { 'cf-access-jwt-assertion': 'test-access-token' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location'));
+    expect(location.pathname).toBe('/admin/dashboard');
+    expect(location.searchParams.get('action')).toBe('REVIEW');
+    expect(location.searchParams.has('_reauth')).toBe(false);
+  });
+});
