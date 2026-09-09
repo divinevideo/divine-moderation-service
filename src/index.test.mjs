@@ -8113,4 +8113,32 @@ describe('Admin auth-failure recovery (returnTo + re-auth)', () => {
     expect(response.headers.get('location')).toBeNull();
     await expect(response.json()).resolves.toEqual({ error: 'Unauthorized' });
   });
+
+  it('does not loop when the _reauth marker is pre-seeded with a non-1 value', async () => {
+    // A crafted/stale `_reauth` (any value) must trip the guard, not redirect
+    // forever appending markers (ERR_TOO_MANY_REDIRECTS).
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?_reauth=0`),
+      createEnv()
+    );
+
+    expect(response.status).toBe(401);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(response.headers.get('location')).toBeNull();
+  });
+
+  it('strips the _reauth marker after a successful re-auth so later failures retry again', async () => {
+    const response = await worker.fetch(
+      new Request(`${ADMIN}/admin/dashboard?action=REVIEW&_reauth=1`, {
+        headers: { 'cf-access-jwt-assertion': 'test-access-token' }
+      }),
+      createEnv()
+    );
+
+    expect(response.status).toBe(302);
+    const location = new URL(response.headers.get('location'));
+    expect(location.pathname).toBe('/admin/dashboard');
+    expect(location.searchParams.get('action')).toBe('REVIEW');
+    expect(location.searchParams.has('_reauth')).toBe(false);
+  });
 });

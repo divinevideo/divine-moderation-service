@@ -1677,17 +1677,34 @@ const REAUTH_INTERSTITIAL_HTML = `<!doctype html>
 // rather than redirecting into an infinite loop.
 async function pageAuthGate(request, env, url) {
   const authError = await requireAuth(request, env);
-  if (!authError) return null;
 
-  if (url.searchParams.get('_reauth') === '1') {
+  if (!authError) {
+    // Re-auth succeeded. Strip the one-shot marker so a later, unrelated
+    // failure at this URL still gets the normal retry rather than the
+    // dead-end interstitial.
+    if (url.searchParams.has('_reauth')) {
+      const clean = new URL(url);
+      clean.searchParams.delete('_reauth');
+      return Response.redirect(`${url.origin}${clean.pathname}${clean.search}`, 302);
+    }
+    return null;
+  }
+
+  // Already redirected through login once for this navigation and still
+  // failing (e.g. edge session valid but the worker rejects the token): show
+  // a way out instead of looping. Any `_reauth` value trips this — the marker
+  // is a presence flag, not a value we control on a crafted/stale URL.
+  if (url.searchParams.has('_reauth')) {
     return new Response(REAUTH_INTERSTITIAL_HTML, {
       status: 401,
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
     });
   }
 
-  const returnTo = `${url.pathname}${url.search}${url.search ? '&' : '?'}_reauth=1`;
-  return Response.redirect(`${url.origin}/admin/login?returnTo=${encodeURIComponent(returnTo)}`, 302);
+  // set() replaces any existing occurrence, so the marker never accumulates.
+  const dest = new URL(url);
+  dest.searchParams.set('_reauth', '1');
+  return Response.redirect(`${url.origin}/admin/login?returnTo=${encodeURIComponent(dest.pathname + dest.search)}`, 302);
 }
 
 export default {
