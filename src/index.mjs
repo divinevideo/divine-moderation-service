@@ -1645,6 +1645,51 @@ async function handlePublicCheckResult(url, env) {
   }));
 }
 
+// Only same-origin admin paths are safe re-auth redirect targets. Reject
+// off-site (`https://`, `//host`), scheme (`javascript:`), backslash-obscured,
+// and non-admin destinations so returnTo can't be an open redirect.
+function safeReturnTo(raw) {
+  return typeof raw === 'string'
+    && raw.startsWith('/admin/')
+    && !raw.includes('\\')
+    && !raw.includes('://')
+    ? raw
+    : null;
+}
+
+// Minimal page shown when re-auth was already attempted for this navigation
+// and still failed. Breaks the edge-valid / worker-rejects redirect loop and
+// gives the user a way out instead of a bare JSON body.
+const REAUTH_INTERSTITIAL_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Sign-in needed</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1.5rem;color:#e0e0e0;background:#0a0a0a}a{color:#60a5fa}</style>
+</head><body>
+<h1>We couldn't sign you in</h1>
+<p>Your admin session looks invalid, or your account may not have access to this tool.</p>
+<p><a href="/admin/logout">Sign out and try again</a>. If it keeps happening, contact an admin.</p>
+</body></html>`;
+
+// Auth gate for HTML page routes. On success returns null. On the first
+// failure it redirects into the Access login carrying a returnTo (with a
+// _reauth marker) so re-auth lands back on the exact view. If that marker is
+// already present the re-auth did not stick, so it shows the interstitial
+// rather than redirecting into an infinite loop.
+async function pageAuthGate(request, env, url) {
+  const authError = await requireAuth(request, env);
+  if (!authError) return null;
+
+  if (url.searchParams.get('_reauth') === '1') {
+    return new Response(REAUTH_INTERSTITIAL_HTML, {
+      status: 401,
+      headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+  }
+
+  const returnTo = `${url.pathname}${url.search}${url.search ? '&' : '?'}_reauth=1`;
+  return Response.redirect(`${url.origin}/admin/login?returnTo=${encodeURIComponent(returnTo)}`, 302);
+}
+
 export default {
   /**
    * HTTP handler for testing and admin dashboard
@@ -1721,7 +1766,10 @@ export default {
     // Login is handled by Cloudflare Zero Trust at the edge
     // Redirect any direct login requests to the dashboard (Zero Trust will prompt if needed)
     if (url.pathname === '/admin/login') {
-      return Response.redirect(`${url.origin}/admin/dashboard`, 302);
+      // Zero Trust re-auth happens at the edge; forward to the originally
+      // requested admin view when returnTo is a safe same-origin path.
+      const dest = safeReturnTo(url.searchParams.get('returnTo')) || '/admin/dashboard';
+      return Response.redirect(`${url.origin}${dest}`, 302);
     }
 
     // Logout via Cloudflare Access
@@ -1732,11 +1780,10 @@ export default {
     }
 
     if (url.pathname === '/admin/dashboard') {
-      // Check authentication (defense-in-depth; Zero Trust handles this at edge)
-      const authError = await requireAuth(request, env);
-      if (authError) {
-        return authError;
-      }
+      // Defense-in-depth; Zero Trust handles this at edge. On failure, recover
+      // into re-auth preserving the deep-link rather than dead-ending on JSON.
+      const gate = await pageAuthGate(request, env, url);
+      if (gate) return gate;
 
       return new Response(dashboardHTML, {
         headers: { 'Content-Type': 'text/html' }
@@ -1744,11 +1791,8 @@ export default {
     }
 
     if (url.pathname === '/admin/review') {
-      // Check authentication (defense-in-depth; Zero Trust handles this at edge)
-      const authError = await requireAuth(request, env);
-      if (authError) {
-        return authError;
-      }
+      const gate = await pageAuthGate(request, env, url);
+      if (gate) return gate;
 
       return new Response(swipeReviewHTML, {
         headers: { 'Content-Type': 'text/html' }
@@ -1756,8 +1800,8 @@ export default {
     }
 
     if (url.pathname === '/admin/messages') {
-      const authError = await requireAuth(request, env);
-      if (authError) return authError;
+      const gate = await pageAuthGate(request, env, url);
+      if (gate) return gate;
 
       return new Response(messagesHTML, {
         headers: { 'Content-Type': 'text/html' }

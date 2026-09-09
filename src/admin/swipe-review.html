@@ -857,6 +857,13 @@
   </div>
 
   <script>
+    // Send an expired-session 401 back through login, carrying the current
+    // view so re-auth returns here instead of the bare dashboard.
+    function redirectToLogin() {
+      const returnTo = encodeURIComponent(location.pathname + location.search);
+      window.location.href = '/admin/login?returnTo=' + returnTo;
+    }
+
     let reviewQueue = [];
     let loadedFlaggedVideos = [];
     let loadedUntriagedVideos = [];
@@ -899,7 +906,7 @@
         ]);
 
         if (flaggedResponse.status === 401 || untriagedResponse.status === 401) {
-          window.location.href = '/admin/login';
+          redirectToLogin();
           return;
         }
 
@@ -2040,7 +2047,7 @@
 
     function logout() {
       document.cookie = 'admin_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-      window.location.href = '/admin/login';
+      redirectToLogin();
     }
 
     // Load on page load
