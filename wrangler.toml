@@ -74,6 +74,11 @@ REACTIVE_MODERATION_ONLY = "true"  # Reactive moderation: queue consumer ack-ski
 
 # Zero Trust JWT verification (for /api/v1/moderate endpoint)
 TEAM_DOMAIN = "https://divinevideo.cloudflareaccess.com"  # Cloudflare Access team domain
+# Application Audience (AUD) tag of the `admin-tools` Access app (*.admin.divine.video/*).
+# Kept as a committed var, not a secret: it is an audience identifier, not a credential,
+# so version control lets review catch a wrong value. A stale value here 401s every admin
+# request (see the 2026-09-09 incident). If the Access app's AUD rotates, update this.
+POLICY_AUD = "2d9f10ee33db581d94ddeb903bb588c4484414f90632c7c7469e4ac30e8c09ce"
 
 # Legacy automated-classifier thresholds (0.0 - 1.0). The upload pipeline no longer
 # calls external moderation providers; these remain for isolated classifier/provider tests
@@ -241,7 +246,7 @@ crons = ["* * * * *", "*/5 * * * *"]
 
 # Secrets (set with: wrangler secret put <NAME>)
 # SERVICE_API_TOKEN - bearer token for authenticated requests to moderation-api.divine.video
-# POLICY_AUD - Zero Trust application audience tag (from Access > Applications > moderation.admin.divine.video > Overview)
+# (POLICY_AUD moved to [vars] above — it is a public audience identifier, not a secret)
 # CF_ACCESS_CLIENT_ID - Cloudflare Access service token ID for relay.divine.video
 # CF_ACCESS_CLIENT_SECRET - Cloudflare Access service token secret for relay.divine.video
 # NOSTR_PRIVATE_KEY - for signing NIP-56 report events to faro.nos.social

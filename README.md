@@ -83,10 +83,11 @@ Bindings, routes, feature flags, and non-secret vars live in `wrangler.toml`. Hi
 | `FUNNELCAKE_ADMIN_URL` / `FUNNELCAKE_LOOKUP_URL` | Relay admin (writes) and video-lookup (reads) hosts. |
 | `*_THRESHOLD_HIGH` / `*_THRESHOLD_MEDIUM` | Legacy classifier thresholds, retained for provider/classifier tests. |
 
+Zero Trust config (`TEAM_DOMAIN`, `POLICY_AUD`) lives in committed `[vars]` in `wrangler.toml`, not as secrets — `POLICY_AUD` is the admin Access app's Application Audience (AUD) tag, so version control lets review catch a wrong value.
+
 Secrets are set with `wrangler secret put <NAME>`. The ones the service reads (see the header of `wrangler.toml` for the full list):
 
 - `SERVICE_API_TOKEN` — bearer token for authenticated `moderation-api.divine.video` requests.
-- `POLICY_AUD` — Zero Trust application audience tag for the admin app.
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` — Cloudflare Access service token for the relay.
 - `NOSTR_PRIVATE_KEY` — signs NIP-56 report events.
 - `MODERATOR_NSEC` / `NOSTR_RELAY_URL` — signs and publishes NIP-32 human-moderator label events.

@@ -81,7 +81,7 @@ Only `moderation.admin.divine.video` is protected. Your other services remain pu
 
 ## Worker Verification
 
-Cloudflare Access remains the edge authorization layer, and the Worker independently verifies its signed JWT as defence in depth. Keep `TEAM_DOMAIN` and the `POLICY_AUD` secret configured for the admin Access application. Do not replace Worker verification with a check for the asserted email header.
+Cloudflare Access remains the edge authorization layer, and the Worker independently verifies its signed JWT as defence in depth. Keep `TEAM_DOMAIN` and `POLICY_AUD` (both committed `[vars]` in `wrangler.toml`) matching the admin Access application; `POLICY_AUD` is the app's Application Audience (AUD) tag. Do not replace Worker verification with a check for the asserted email header.
 
 **Available headers in your Worker:**
 ```javascript
