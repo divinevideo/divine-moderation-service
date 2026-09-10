@@ -1,8 +1,11 @@
 # Cloudflare Access Setup
 
-This protects `moderation.admin.divine.video` with Cloudflare Access, allowing only `@divine.video` email addresses.
+`moderation.admin.divine.video` is protected by the shared Cloudflare Access
+application named `admin-tools`. That application covers
+`*.admin.divine.video/*`, so this service must use its existing Application
+Audience (AUD) tag rather than create a hostname-specific application.
 
-## Quick Setup
+## Verify The Shared Application
 
 ### 1. Get Your Cloudflare Account ID
 
@@ -16,31 +19,40 @@ This protects `moderation.admin.divine.video` with Cloudflare Access, allowing o
 Go to: https://dash.cloudflare.com/profile/api-tokens
 
 **Required permissions:**
-- Account > Zero Trust > Edit
+- Account > Zero Trust > Read
 
-### 3. Run the Setup Script
+### 3. Inspect The Existing Application
 
 ```bash
 export CLOUDFLARE_ACCOUNT_ID="your-account-id-here"
 export CLOUDFLARE_API_TOKEN="your-api-token-here"
 
-./scripts/setup-cloudflare-access.sh
+curl -s \
+  "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq '.result[] | select(.name == "admin-tools") | {name, domain, aud}'
 ```
 
-## What This Does
+Confirm that the result covers `*.admin.divine.video/*`. Do not create a
+separate application for `moderation.admin.divine.video`: Cloudflare assigns
+each application its own AUD, and a second application would make the Worker
+reject tokens from the shared application.
 
-1. **Creates an Access Application** for `moderation.admin.divine.video`
-2. **Creates an Access Policy** that allows all `@divine.video` email addresses
-3. Configures 24-hour session duration
+## Repository Configuration
 
-**Protected domain:**
-- `https://moderation.admin.divine.video`
+`wrangler.toml` commits both values used for Worker-side JWT verification:
 
-## After Running the Script
+- `TEAM_DOMAIN` is the Cloudflare Access issuer.
+- `POLICY_AUD` is the `admin-tools` application's AUD.
+
+If the shared application's AUD changes, update `POLICY_AUD` in a reviewed
+commit. Do not create or replace Access applications from this repository.
+
+## Access Configuration
 
 ### Configure Identity Provider (One-Time)
 
-You need at least one identity provider for authentication:
+The shared application needs at least one identity provider for authentication:
 
 1. Go to: Zero Trust → Settings → Authentication
 2. Add a provider (easiest: **One-time PIN**)
@@ -53,13 +65,13 @@ Or add:
 - Azure AD
 - etc.
 
-### Set Up DNS
+### DNS
 
-Point `moderation.admin.divine.video` to your admin application:
+Point `moderation.admin.divine.video` to this Worker:
 
 ```bash
 # If using Cloudflare Workers:
-# Add a route/CNAME for moderation.admin.divine.video to this worker
+# Add a route/CNAME for moderation.admin.divine.video to this Worker
 
 # Or if using a custom origin server:
 # Add an A/AAAA record pointing to your server
@@ -75,7 +87,7 @@ Point `moderation.admin.divine.video` to your admin application:
 
 ## Other Domains (Not Protected)
 
-Only `moderation.admin.divine.video` is protected. Your other services remain publicly accessible:
+Only the admin hostname is protected for this service. Related public domains remain publicly accessible:
 - `moderation-api.divine.video` - Public and service-facing moderation API
 - `cdn.divine.video` - Public video CDN
 

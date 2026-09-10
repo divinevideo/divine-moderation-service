@@ -85,7 +85,7 @@ Bindings, routes, feature flags, and non-secret vars live in `wrangler.toml`. Hi
 
 Zero Trust config (`TEAM_DOMAIN`, `POLICY_AUD`) lives in committed `[vars]` in `wrangler.toml`, not as secrets — `POLICY_AUD` is the admin Access app's Application Audience (AUD) tag, so version control lets review catch a wrong value.
 
-Secrets are set with `wrangler secret put <NAME>`. The ones the service reads (see the header of `wrangler.toml` for the full list):
+Secrets are set with `wrangler secret put <NAME>`. The ones the service reads (see the secrets block near the end of `wrangler.toml` for the full list):
 
 - `SERVICE_API_TOKEN` — bearer token for authenticated `moderation-api.divine.video` requests.
 - `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` — Cloudflare Access service token for the relay.
