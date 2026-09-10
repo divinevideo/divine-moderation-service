@@ -107,15 +107,20 @@ const token = request.headers.get('cf-access-jwt-assertion');
 - Make sure you've configured at least one identity provider
 - Check the Access logs: Zero Trust → Logs → Access
 
-**Script fails with API error:**
-- Verify your API token has "Account > Zero Trust > Edit" permissions
+**Application query fails with an API error:**
+- Verify your API token has "Account > Zero Trust > Read" permission
 - Check that CLOUDFLARE_ACCOUNT_ID is correct
 
-**Need to update the policy:**
+**Need to change the shared application:**
+
+Coordinate the change with the Platform team because it affects every
+`*.admin.divine.video` service. After an AUD change, update `POLICY_AUD` in
+`wrangler.toml` in the same rollout.
+
+To inspect the current configuration:
+
 ```bash
 # List applications
 curl -X GET "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-
-# Update via dashboard or API
 ```
