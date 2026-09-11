@@ -5,6 +5,23 @@ application named `admin-tools`. That application covers
 `*.admin.divine.video/*`, so this service must use its existing Application
 Audience (AUD) tag rather than create a hostname-specific application.
 
+## Check Which Application Fronts The Host
+
+Access publishes the AUD of whichever application actually serves a hostname
+as the `kid` query parameter of its login redirect, so this needs no
+credentials:
+
+```bash
+curl -so /dev/null -w '%{redirect_url}\n' https://moderation.admin.divine.video/
+# https://divinevideo.cloudflareaccess.com/cdn-cgi/access/login/moderation.admin.divine.video?kid=<AUD>&...
+```
+
+The `kid` value must equal `POLICY_AUD` in `wrangler.toml`. Run this before
+changing `POLICY_AUD` and after any Access change: it reports the effective
+application for this exact hostname, so it also catches a more specific
+application shadowing the shared wildcard — the API query below only shows
+that the shared application exists.
+
 ## Verify The Shared Application
 
 ### 1. Get Your Cloudflare Account ID
@@ -35,8 +52,9 @@ curl -s \
 
 Confirm that the result covers `*.admin.divine.video/*`. Do not create a
 separate application for `moderation.admin.divine.video`: Cloudflare assigns
-each application its own AUD, and a second application would make the Worker
-reject tokens from the shared application.
+each application its own AUD and the more specific application wins, so Access
+would start minting tokens with the new AUD and the Worker, still configured
+with the shared one, would reject every admin request.
 
 ## Repository Configuration
 
@@ -102,6 +120,16 @@ const token = request.headers.get('cf-access-jwt-assertion');
 ```
 
 ## Troubleshooting
+
+**Every admin request returns `{"error":"Unauthorized"}` after Access login:**
+- `wrangler tail` shows `[AUTH] Cloudflare Access JWT rejected: Invalid token: unexpected "aud" claim value`
+- The committed `POLICY_AUD` does not match the application fronting the host
+  (this was the 2026-09-09 outage). Run the redirect check under
+  [Check Which Application Fronts The Host](#check-which-application-fronts-the-host)
+  and compare its `kid` with `wrangler.toml`.
+- If they differ because the shared application's AUD changed, update
+  `POLICY_AUD` in a reviewed commit. If they differ because a hostname-specific
+  application now shadows the shared one, remove it with the Platform team.
 
 **"Access denied" even with @divine.video email:**
 - Make sure you've configured at least one identity provider
