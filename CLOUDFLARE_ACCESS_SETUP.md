@@ -1,8 +1,28 @@
 # Cloudflare Access Setup
 
-This protects `moderation.admin.divine.video` with Cloudflare Access, allowing only `@divine.video` email addresses.
+`moderation.admin.divine.video` is protected by the shared Cloudflare Access
+application named `admin-tools`. That application covers
+`*.admin.divine.video/*`, so this service must use its existing Application
+Audience (AUD) tag rather than create a hostname-specific application.
 
-## Quick Setup
+## Check Which Application Fronts The Host
+
+Access publishes the AUD of whichever application actually serves a hostname
+as the `kid` query parameter of its login redirect, so this needs no
+credentials:
+
+```bash
+curl -so /dev/null -w '%{redirect_url}\n' https://moderation.admin.divine.video/
+# https://divinevideo.cloudflareaccess.com/cdn-cgi/access/login/moderation.admin.divine.video?kid=<AUD>&...
+```
+
+The `kid` value must equal `POLICY_AUD` in `wrangler.toml`. Run this before
+changing `POLICY_AUD` and after any Access change: it reports the effective
+application for this exact hostname, so it also catches a more specific
+application shadowing the shared wildcard — the API query below only shows
+that the shared application exists.
+
+## Verify The Shared Application
 
 ### 1. Get Your Cloudflare Account ID
 
@@ -16,31 +36,41 @@ This protects `moderation.admin.divine.video` with Cloudflare Access, allowing o
 Go to: https://dash.cloudflare.com/profile/api-tokens
 
 **Required permissions:**
-- Account > Zero Trust > Edit
+- Account > Zero Trust > Read
 
-### 3. Run the Setup Script
+### 3. Inspect The Existing Application
 
 ```bash
 export CLOUDFLARE_ACCOUNT_ID="your-account-id-here"
 export CLOUDFLARE_API_TOKEN="your-api-token-here"
 
-./scripts/setup-cloudflare-access.sh
+curl -s \
+  "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq '.result[] | select(.name == "admin-tools") | {name, domain, aud}'
 ```
 
-## What This Does
+Confirm that the result covers `*.admin.divine.video/*`. Do not create a
+separate application for `moderation.admin.divine.video`: Cloudflare assigns
+each application its own AUD and the more specific application wins, so Access
+would start minting tokens with the new AUD and the Worker, still configured
+with the shared one, would reject every admin request.
 
-1. **Creates an Access Application** for `moderation.admin.divine.video`
-2. **Creates an Access Policy** that allows all `@divine.video` email addresses
-3. Configures 24-hour session duration
+## Repository Configuration
 
-**Protected domain:**
-- `https://moderation.admin.divine.video`
+`wrangler.toml` commits both values used for Worker-side JWT verification:
 
-## After Running the Script
+- `TEAM_DOMAIN` is the Cloudflare Access issuer.
+- `POLICY_AUD` is the `admin-tools` application's AUD.
+
+If the shared application's AUD changes, update `POLICY_AUD` in a reviewed
+commit. Do not create or replace Access applications from this repository.
+
+## Access Configuration
 
 ### Configure Identity Provider (One-Time)
 
-You need at least one identity provider for authentication:
+The shared application needs at least one identity provider for authentication:
 
 1. Go to: Zero Trust → Settings → Authentication
 2. Add a provider (easiest: **One-time PIN**)
@@ -53,13 +83,13 @@ Or add:
 - Azure AD
 - etc.
 
-### Set Up DNS
+### DNS
 
-Point `moderation.admin.divine.video` to your admin application:
+Point `moderation.admin.divine.video` to this Worker:
 
 ```bash
 # If using Cloudflare Workers:
-# Add a route/CNAME for moderation.admin.divine.video to this worker
+# Add a route/CNAME for moderation.admin.divine.video to this Worker
 
 # Or if using a custom origin server:
 # Add an A/AAAA record pointing to your server
@@ -75,13 +105,13 @@ Point `moderation.admin.divine.video` to your admin application:
 
 ## Other Domains (Not Protected)
 
-Only `moderation.admin.divine.video` is protected. Your other services remain publicly accessible:
+Only the admin hostname is protected for this service. Related public domains remain publicly accessible:
 - `moderation-api.divine.video` - Public and service-facing moderation API
 - `cdn.divine.video` - Public video CDN
 
 ## Worker Verification
 
-Cloudflare Access remains the edge authorization layer, and the Worker independently verifies its signed JWT as defence in depth. Keep `TEAM_DOMAIN` and the `POLICY_AUD` secret configured for the admin Access application. Do not replace Worker verification with a check for the asserted email header.
+Cloudflare Access remains the edge authorization layer, and the Worker independently verifies its signed JWT as defence in depth. Keep `TEAM_DOMAIN` and `POLICY_AUD` (both committed `[vars]` in `wrangler.toml`) matching the admin Access application; `POLICY_AUD` is the app's Application Audience (AUD) tag. Do not replace Worker verification with a check for the asserted email header.
 
 **Available headers in your Worker:**
 ```javascript
@@ -91,19 +121,34 @@ const token = request.headers.get('cf-access-jwt-assertion');
 
 ## Troubleshooting
 
+**Every admin request returns `{"error":"Unauthorized"}` after Access login:**
+- `wrangler tail` shows `[AUTH] Cloudflare Access JWT rejected: Invalid token: unexpected "aud" claim value`
+- The committed `POLICY_AUD` does not match the application fronting the host
+  (this was the 2026-09-09 outage). Run the redirect check under
+  [Check Which Application Fronts The Host](#check-which-application-fronts-the-host)
+  and compare its `kid` with `wrangler.toml`.
+- If they differ because the shared application's AUD changed, update
+  `POLICY_AUD` in a reviewed commit. If they differ because a hostname-specific
+  application now shadows the shared one, remove it with the Platform team.
+
 **"Access denied" even with @divine.video email:**
 - Make sure you've configured at least one identity provider
 - Check the Access logs: Zero Trust → Logs → Access
 
-**Script fails with API error:**
-- Verify your API token has "Account > Zero Trust > Edit" permissions
+**Application query fails with an API error:**
+- Verify your API token has "Account > Zero Trust > Read" permission
 - Check that CLOUDFLARE_ACCOUNT_ID is correct
 
-**Need to update the policy:**
+**Need to change the shared application:**
+
+Coordinate the change with the Platform team because it affects every
+`*.admin.divine.video` service. After an AUD change, update `POLICY_AUD` in
+`wrangler.toml` in the same rollout.
+
+To inspect the current configuration:
+
 ```bash
 # List applications
 curl -X GET "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-
-# Update via dashboard or API
 ```
