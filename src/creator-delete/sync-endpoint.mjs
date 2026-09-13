@@ -8,6 +8,7 @@ import { validateNip98Header } from './nip98.mjs';
 import { processKind5 } from './process.mjs';
 import { checkRateLimit } from './rate-limit.mjs';
 import { readDeleteBody, parseSignedDeleteEvent } from './request-event.mjs';
+import { measureDeletePhase, responsePerformance } from './performance.mjs';
 
 export const PER_PUBKEY_LIMIT = 5;
 export const PER_IP_LIMIT = 30;
@@ -24,6 +25,10 @@ function logRequest(t0, kind5_id, status_code, extra = {}) {
 }
 
 export async function handleSyncDelete(request, deps) {
+  return measureDeletePhase('request', () => runSyncDelete(request, deps), responsePerformance);
+}
+
+async function runSyncDelete(request, deps) {
   const t0 = Date.now();
   const { db, kv, ctx, fetchKind5WithRetry, fetchTargetEvent, callBlossomDelete, budgetMs = 8000 } = deps;
 
@@ -37,7 +42,9 @@ export async function handleSyncDelete(request, deps) {
 
   // IP rate limit BEFORE NIP-98 validation — limits crypto work from unauthenticated callers
   const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
-  const ipCheck = await checkRateLimit(kv, { key: `ip:${clientIp}`, limit: PER_IP_LIMIT, windowSeconds: RATE_WINDOW_SECONDS });
+  const ipCheck = await measureDeletePhase('ip_rate_limit',
+    () => checkRateLimit(kv, { key: `ip:${clientIp}`, limit: PER_IP_LIMIT, windowSeconds: RATE_WINDOW_SECONDS }),
+    result => ({ outcome: result.allowed ? 'allowed' : 'limited' }));
   if (!ipCheck.allowed) {
     logRequest(t0, kind5_id, 429);
     return jsonResponse(429, {
@@ -55,14 +62,18 @@ export async function handleSyncDelete(request, deps) {
     return jsonResponse(status, { error: status === 413 ? 'Deletion request body exceeds 64 KiB' : 'Unable to read deletion request body' });
   }
 
-  const auth = await validateNip98Header(request.headers.get('Authorization'), url.toString(), 'POST', bodyBytes);
+  const auth = await measureDeletePhase('auth',
+    () => validateNip98Header(request.headers.get('Authorization'), url.toString(), 'POST', bodyBytes),
+    result => ({ outcome: result.valid ? 'valid' : 'invalid' }));
   if (!auth.valid) {
     logRequest(t0, kind5_id, 401);
     return jsonResponse(401, { error: `NIP-98 validation failed: ${auth.error}` });
   }
 
   // Per-pubkey rate limit AFTER NIP-98 (pubkey only known after validation)
-  const pubkeyCheck = await checkRateLimit(kv, { key: `pubkey:${auth.pubkey}`, limit: PER_PUBKEY_LIMIT, windowSeconds: RATE_WINDOW_SECONDS });
+  const pubkeyCheck = await measureDeletePhase('pubkey_rate_limit',
+    () => checkRateLimit(kv, { key: `pubkey:${auth.pubkey}`, limit: PER_PUBKEY_LIMIT, windowSeconds: RATE_WINDOW_SECONDS }),
+    result => ({ outcome: result.allowed ? 'allowed' : 'limited' }));
   if (!pubkeyCheck.allowed) {
     logRequest(t0, kind5_id, 429);
     return jsonResponse(429, {
@@ -76,7 +87,8 @@ export async function handleSyncDelete(request, deps) {
   const supplied = bodyBytes.byteLength > 0;
   const kind5 = supplied
     ? parseSignedDeleteEvent(bodyBytes, kind5_id)
-    : await fetchKind5WithRetry(kind5_id);
+    : await measureDeletePhase('kind5_lookup', () => fetchKind5WithRetry(kind5_id),
+        result => ({ outcome: result ? 'found' : 'unresolved' }));
   if (supplied && !kind5) {
     logRequest(t0, kind5_id, 400);
     return jsonResponse(400, { error: 'Body must contain a valid signed kind 5 event matching the URL, with valid e-tags' });
@@ -98,12 +110,17 @@ export async function handleSyncDelete(request, deps) {
     return jsonResponse(400, { error: 'Kind 5 event has no e-tags; nothing to delete' });
   }
 
-  const processing = processKind5(kind5, {
+  const processing = measureDeletePhase('processing', () => processKind5(kind5, {
     db,
-    fetchTargetEvent,
-    callBlossomDelete,
+    fetchTargetEvent: (id) => measureDeletePhase('target_lookup', () => fetchTargetEvent(id),
+      result => ({ outcome: result ? 'found' : 'missing' })),
+    callBlossomDelete: (sha) => measureDeletePhase('blob_delete', () => callBlossomDelete(sha),
+      result => ({ outcome: result.skipped ? 'skipped' : result.success ? 'success' : 'failed', status_code: result.status })),
     triggerLabel: 'sync'
-  });
+  }), result => ({
+    outcome: result.targets.some(t => t.status === 'in_progress') ? 'in_progress'
+      : result.targets.some(t => t.status.startsWith('failed:')) ? 'failed' : 'success'
+  }));
 
   // When the budget elapses we return 202 and let processKind5 keep running.
   // ctx.waitUntil keeps the Worker alive past the Response; without it the
