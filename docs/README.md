@@ -8,6 +8,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [CLAUDE.md](../CLAUDE.md) — working notes for AI-assisted development
 - [CHANGELOG.md](../CHANGELOG.md) — release history
 - [CONTENT_MODERATION.md](../CONTENT_MODERATION.md) — moderation pipeline reference
+- [docs/CREATOR_DELETE_PERFORMANCE.md](CREATOR_DELETE_PERFORMANCE.md) — creator-delete timing events, operator queries, and log settings
 - [docs/integrations/](integrations/) — cross-service contracts (creator-delete, etc.)
 - [Immediate creator deletion](integrations/creator-delete-request.md) — signed deletion request body and legacy-client compatibility
 
