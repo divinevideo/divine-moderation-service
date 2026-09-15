@@ -9,6 +9,7 @@ This directory is the index for repository documentation. Current docs first, hi
 - [CHANGELOG.md](../CHANGELOG.md) — release history
 - [CONTENT_MODERATION.md](../CONTENT_MODERATION.md) — moderation pipeline reference
 - [docs/integrations/](integrations/) — cross-service contracts (creator-delete, etc.)
+- [Immediate creator deletion](integrations/creator-delete-request.md) — signed deletion request body and legacy-client compatibility
 
 ## Historical
 

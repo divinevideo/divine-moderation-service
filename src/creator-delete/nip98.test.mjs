@@ -113,6 +113,31 @@ describe('validateNip98Header', () => {
     expect(result.error).toMatch(/Signature/);
   });
 
+  it.each([
+    null,
+    { kind: 27235, tags: [null] },
+    { kind: 27235, created_at: 'invalid', tags: [] },
+    { kind: 27235, tags: [['method', 42]] }
+  ])('rejects malformed untrusted auth events without throwing: %j', async event => {
+    if (event && event.created_at === undefined) event.created_at = Math.floor(Date.now() / 1000);
+    const header = `Nostr ${btoa(JSON.stringify(event))}`;
+    expect((await validateNip98Header(header, 'https://x/y', 'POST')).valid).toBe(false);
+  });
+
+  it('rejects duplicate payload tags even when one hash matches', async () => {
+    const bytes = new TextEncoder().encode('{}');
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    const hash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    const event = finalizeEvent({
+      kind: 27235, created_at: Math.floor(Date.now() / 1000), content: '',
+      tags: [['u', 'https://x/y'], ['method', 'POST'], ['payload', hash], ['payload', '0'.repeat(64)]]
+    }, sk);
+    const header = `Nostr ${btoa(JSON.stringify(event))}`;
+    const result = await validateNip98Header(header, 'https://x/y', 'POST', bytes);
+    expect(result.valid).toBe(false);
+    expect(result.error).toMatch(/payload/);
+  });
+
   describe('URL canonicalization', () => {
     it('accepts signed https://host:443/ when request is https://host/', async () => {
       const header = signNip98('https://moderation-api.divine.video:443/api/delete/abc123', 'POST');
