@@ -8076,7 +8076,17 @@ describe('Admin auth-failure recovery (returnTo + re-auth)', () => {
   });
 
   it('rejects an off-site returnTo and falls back to the dashboard', async () => {
-    for (const evil of ['https://evil.com/x', '//evil.com', '/\\evil.com', 'javascript:alert(1)', '/notadmin/x']) {
+    for (const evil of [
+      'https://evil.com/x',
+      '//evil.com',
+      '/\\evil.com',
+      'javascript:alert(1)',
+      '/notadmin/x',
+      // Traversal inside the allowlist prefix still resolves outside it.
+      '/admin/../../evil',
+      '/admin/%2e%2e/x',
+      '/admin/..//evil.com'
+    ]) {
       const response = await worker.fetch(
         new Request(`${ADMIN}/admin/login?returnTo=${encodeURIComponent(evil)}`),
         createEnv()

@@ -1649,11 +1649,17 @@ async function handlePublicCheckResult(url, env) {
 // off-site (`https://`, `//host`), scheme (`javascript:`), backslash-obscured,
 // and non-admin destinations so returnTo can't be an open redirect.
 function safeReturnTo(raw) {
-  return typeof raw === 'string'
-    && raw.startsWith('/admin/')
-    && !raw.includes('\\')
-    && !raw.includes('://')
-    ? raw
+  if (typeof raw !== 'string'
+    || !raw.startsWith('/admin/')
+    || raw.includes('\\')
+    || raw.includes('://')) {
+    return null;
+  }
+  // `/admin/../x` and `/admin/%2e%2e/x` both parse out of the allowlist, so
+  // the prefix is only trustworthy after the URL parser has normalized it.
+  const resolved = new URL(raw, 'https://placeholder.invalid');
+  return resolved.pathname.startsWith('/admin/')
+    ? resolved.pathname + resolved.search
     : null;
 }
 
