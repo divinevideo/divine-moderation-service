@@ -2,7 +2,7 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: NIP-98 HTTP Authorization header validation for creator-delete endpoints.
-// ABOUTME: Validates base64-encoded kind 27235 event with u, method tags, ±60s clock drift, signature.
+// ABOUTME: Validates kind 27235 URL, method, freshness, signature, and optional request-body binding.
 
 import { verifyEvent } from 'nostr-tools/pure';
 
@@ -55,7 +55,7 @@ function normalizeUrl(url) {
   }
 }
 
-export async function validateNip98Header(authorizationHeader, expectedUrl, expectedMethod) {
+export async function validateNip98Header(authorizationHeader, expectedUrl, expectedMethod, payloadBytes) {
   if (!authorizationHeader || !authorizationHeader.startsWith('Nostr ')) {
     return { valid: false, error: 'Missing or malformed Authorization header (expected "Nostr <base64>")' };
   }
@@ -70,17 +70,23 @@ export async function validateNip98Header(authorizationHeader, expectedUrl, expe
     return { valid: false, error: `Invalid base64 or JSON in Authorization header: ${e.message}` };
   }
 
+  if (!event || typeof event !== 'object') {
+    return { valid: false, error: 'Authorization event must be an object' };
+  }
   if (event.kind !== EXPECTED_KIND) {
     return { valid: false, error: `Expected kind ${EXPECTED_KIND}, got ${event.kind}` };
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - event.created_at) > CLOCK_DRIFT_SECONDS) {
+  if (!Number.isInteger(event.created_at) || Math.abs(now - event.created_at) > CLOCK_DRIFT_SECONDS) {
     return { valid: false, error: `created_at ${event.created_at} outside ±${CLOCK_DRIFT_SECONDS}s window (server now: ${now})` };
   }
 
   if (!Array.isArray(event.tags)) {
     return { valid: false, error: 'Event missing tags array' };
+  }
+  if (event.tags.some(tag => !Array.isArray(tag) || tag.some(value => typeof value !== 'string'))) {
+    return { valid: false, error: 'Event has malformed tags' };
   }
 
   const uTag = event.tags.find(t => t[0] === 'u')?.[1];
@@ -103,8 +109,23 @@ export async function validateNip98Header(authorizationHeader, expectedUrl, expe
     return { valid: false, error: `method tag '${methodTag}' does not match expected method '${expectedMethod}'` };
   }
 
-  if (!verifyEvent(event)) {
+  let signatureValid = false;
+  try {
+    signatureValid = verifyEvent(event);
+  } catch {
+    // Invalid untrusted event shapes must return 401, not throw out of auth.
+  }
+  if (!signatureValid) {
     return { valid: false, error: 'Signature verification failed' };
+  }
+
+  if (payloadBytes?.byteLength > 0) {
+    const payloadTags = event.tags.filter(tag => tag[0] === 'payload');
+    const digest = await crypto.subtle.digest('SHA-256', payloadBytes);
+    const expectedHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    if (payloadTags.length !== 1 || payloadTags[0][1] !== expectedHash) {
+      return { valid: false, error: 'payload tag does not match request body SHA-256' };
+    }
   }
 
   return { valid: true, pubkey: event.pubkey };

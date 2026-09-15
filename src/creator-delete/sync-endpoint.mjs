@@ -2,11 +2,12 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: POST /api/delete/{kind5_id} — synchronous creator-delete handler.
-// ABOUTME: NIP-98 author-only auth; fetches kind 5 with read-after-write retries; runs processKind5 within budget.
+// ABOUTME: NIP-98 author-only auth; accepts signed kind 5 or legacy relay lookup; runs processKind5 within budget.
 
 import { validateNip98Header } from './nip98.mjs';
 import { processKind5 } from './process.mjs';
 import { checkRateLimit } from './rate-limit.mjs';
+import { readDeleteBody, parseSignedDeleteEvent } from './request-event.mjs';
 
 export const PER_PUBKEY_LIMIT = 5;
 export const PER_IP_LIMIT = 30;
@@ -45,7 +46,16 @@ export async function handleSyncDelete(request, deps) {
     });
   }
 
-  const auth = await validateNip98Header(request.headers.get('Authorization'), url.toString(), 'POST');
+  let bodyBytes;
+  try {
+    bodyBytes = await readDeleteBody(request);
+  } catch (error) {
+    const status = error.status === 413 ? 413 : 400;
+    logRequest(t0, kind5_id, status);
+    return jsonResponse(status, { error: status === 413 ? 'Deletion request body exceeds 64 KiB' : 'Unable to read deletion request body' });
+  }
+
+  const auth = await validateNip98Header(request.headers.get('Authorization'), url.toString(), 'POST', bodyBytes);
   if (!auth.valid) {
     logRequest(t0, kind5_id, 401);
     return jsonResponse(401, { error: `NIP-98 validation failed: ${auth.error}` });
@@ -61,7 +71,16 @@ export async function handleSyncDelete(request, deps) {
     });
   }
 
-  const kind5 = await fetchKind5WithRetry(kind5_id);
+  // The publishing client already holds the signed event. Validate it directly
+  // to avoid waiting for relay database visibility after publication succeeds.
+  const supplied = bodyBytes.byteLength > 0;
+  const kind5 = supplied
+    ? parseSignedDeleteEvent(bodyBytes, kind5_id)
+    : await fetchKind5WithRetry(kind5_id);
+  if (supplied && !kind5) {
+    logRequest(t0, kind5_id, 400);
+    return jsonResponse(400, { error: 'Body must contain a valid signed kind 5 event matching the URL, with valid e-tags' });
+  }
   if (!kind5) {
     logRequest(t0, kind5_id, 404);
     return jsonResponse(404, { error: 'Kind 5 not found on Funnelcake after retries' });
