@@ -244,9 +244,12 @@ crons = ["* * * * *", "*/5 * * * *"]
 # POLICY_AUD - Zero Trust application audience tag (from Access > Applications > moderation.admin.divine.video > Overview)
 # CF_ACCESS_CLIENT_ID - Cloudflare Access service token ID for relay.divine.video
 # CF_ACCESS_CLIENT_SECRET - Cloudflare Access service token secret for relay.divine.video
-# NOSTR_PRIVATE_KEY - the service's single Nostr signing key. Signs NIP-56 report
-# events, NIP-32 moderator labels, and NIP-17 enforcement DMs, and its derived
-# pubkey is what dm_log records in sender_pubkey / recipient_pubkey. Do NOT set
+# NOSTR_PRIVATE_KEY - the service's single Nostr signing key, used everywhere
+# this service signs or authenticates: NIP-56 report events, NIP-32 moderator
+# labels, NIP-17 enforcement DMs, the kind-10050 DM inbox announcement, the
+# NIP-42 AUTH challenge when polling for DMs, and the NIP-98 token that
+# authorizes Funnelcake quarantine add/remove calls. Its derived pubkey is
+# what dm_log records in sender_pubkey / recipient_pubkey. Do NOT set
 # MODERATOR_NSEC: DM and label signing were unified onto this key in #31 and
 # nothing has read that variable since. Provisioning it does nothing, and its
 # presence in a runbook implies a retired key is still live somewhere.
