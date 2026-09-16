@@ -237,11 +237,13 @@ CREATOR_DELETE_RELAY_URL = "wss://relay.divine.video"
 
 # dm_log one-year retention sweep (Trust & Safety decision, PR #219,
 # 2026-09-14: Charlie, Mike, Aleysha -- "One year it is!"). Off by default:
-# nobody has run the production sizing query yet (divine-mobile#7850), so
-# flip to "true" via `wrangler secret put` only after that row count is
-# known and reviewed. KV-throttled to ~daily once enabled; deletes dm_log
-# rows older than one year and any dm_conversation_read_state row left
-# orphaned by that (see pruneExpiredDmLog in src/nostr/dm-store.mjs).
+# nobody has run the production sizing query yet (divine-mobile#7850).
+# Activation order is load-bearing: apply migration 013 remotely, verify
+# idx_dm_log_created_at exists, run and review the sizing query, then change
+# this tracked value to "true" and deploy. `wrangler secret put` cannot
+# override a deployed [vars] value. KV-throttled to ~daily once enabled;
+# deletes dm_log rows older than one year and any dm_conversation_read_state
+# row left orphaned by that (see pruneExpiredDmLog in src/nostr/dm-store.mjs).
 DM_LOG_RETENTION_ENABLED = "false"
 
 # Cron trigger for relay polling - runs every 5 minutes

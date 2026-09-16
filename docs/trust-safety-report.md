@@ -261,9 +261,17 @@ like any other row, with no special-casing needed.
 **Not yet active.** `DM_LOG_RETENTION_ENABLED` (`wrangler.toml`) defaults to
 `false`: nobody has run the production sizing query from `#7850` against the
 live `dm_log` table yet, so the row count this sweep would delete on its
-first run is unmeasured. Flipping the flag to `true` (`wrangler secret put`,
-per the comment beside it) is a deliberate operational decision, not this
-deploy.
+first run is unmeasured. Activation is a deliberate production change, not
+part of this deploy, and must happen in this order:
+
+1. Apply migration 013 to the remote `blossom-webhook-events` D1 database with
+   `npx wrangler d1 migrations apply blossom-webhook-events --remote`.
+2. Verify `idx_dm_log_created_at` exists in the remote database before any
+   deletion is enabled.
+3. Run and review the production sizing query from `#7850`.
+4. Change the tracked `DM_LOG_RETENTION_ENABLED` value to `"true"` in
+   `wrangler.toml`, review that configuration change, and deploy it. A
+   `wrangler secret put` cannot override a deployed `[vars]` value.
 
 ---
 
