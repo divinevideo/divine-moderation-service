@@ -5297,6 +5297,34 @@ async function runMigration() {
         }
       }
 
+      // Prune dm_log rows past the Trust & Safety-decided one-year retention
+      // (PR #219, decided 2026-09-14) and any dm_conversation_read_state row
+      // left orphaned by that. Flag-gated and off by default: nobody has run
+      // the production sizing query yet (divine-mobile#7850), so activation
+      // is a deliberate operational decision, not this deploy. KV-throttled
+      // to ~daily since the delete is a full retention sweep, not a
+      // per-message operation.
+      if (env.DM_LOG_RETENTION_ENABLED === 'true') {
+        try {
+          const lastStr = env.MODERATION_KV
+            ? await env.MODERATION_KV.get('dm-log-retention:last-pruned')
+            : null;
+          const parsedLast = lastStr ? parseInt(lastStr, 10) : 0;
+          const last = Number.isFinite(parsedLast) ? parsedLast : 0;
+          const dayMs = 24 * 60 * 60 * 1000;
+          if (Date.now() - last >= dayMs) {
+            const { pruneExpiredDmLog } = await import('./nostr/dm-store.mjs');
+            const { deletedMessages, deletedReadStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
+            console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s)`);
+            if (env.MODERATION_KV) {
+              await env.MODERATION_KV.put('dm-log-retention:last-pruned', String(Date.now()));
+            }
+          }
+        } catch (err) {
+          console.error('[DM-RETENTION] Prune failed:', err);
+        }
+      }
+
       // Republish moderation@'s NIP-17 DM inbox relay list (kind 10050) ~daily so the
       // account is reachable over standard NIP-17. Flag-gated so it can ship dormant
       // until the relay accepts kind 10050 (divine-funnelcake#536); KV-throttled to

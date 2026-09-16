@@ -212,17 +212,17 @@ This creates an auditable record of human moderation decisions on the Nostr prot
 | **KV** `quarantine:{sha256}` | Quarantine flag with reason and moderator info | 90 days |
 | **D1** `moderation_results` | Action, provider, scores JSON, categories, raw response, timestamps, reviewer info | Permanent |
 | **D1** `user_reports` | User-submitted reports with auto-escalation | Permanent |
-| **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body | **Indefinite — undecided.** See below |
-| **D1** `dm_conversation_read_state` | Moderator read marker, one row per conversation | Indefinite; no cleanup, and no foreign key to `dm_log` |
+| **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body | **One year, decided.** Sweep implemented but disabled pending activation — see below |
+| **D1** `dm_conversation_read_state` | Moderator read marker, one row per conversation | Pruned alongside `dm_log` once a conversation's last message expires; same activation gate |
 | **Blossom** `media.divine.video` | Source video files | Permanent |
 
-### `dm_log` is retained by omission, not by decision
+### `dm_log`: one year, decided — enforcement not yet active
 
-Every other row above has a lifetime somebody chose. `dm_log` has never had
-one: no `DELETE`, no TTL, no scheduled sweep, no lifecycle rule — and until
-this row was added, no entry in this table either.
+Every other row above has a lifetime somebody chose. `dm_log` didn't, until
+now: there was no `DELETE`, no TTL, no scheduled sweep, no lifecycle rule —
+and until this row was added, no entry in this table either.
 
-Three things make that worth deciding rather than leaving:
+Three things made that worth deciding rather than leaving:
 
 - **`content` is the message, not a reference to it.** The same string that is
   gift-wrapped is stored, so a row is a byte-identical server-side plaintext
@@ -242,17 +242,28 @@ runs 169–602 bytes, and on disk with the three indexes a row costs roughly
 1.0–1.25 KB. Volume is not the reason to decide this.
 
 Retaining enforcement records through an erasure request is a normal and
-defensible posture. It simply has to be chosen. The decision is tracked at
-`divinevideo/divine-mobile#7850`; the client-side half of the picture is in that
-repo's `mobile/docs/DM_RETENTION.md`.
+defensible posture, and it has been chosen: **one year**, decided 2026-09-14
+by Trust & Safety (Charlie Patrea, Mike Bradley, Aleysha Rose — "One year it
+is!") in `divinevideo/divine-moderation-service#219`. The question is tracked
+at `divinevideo/divine-mobile#7850`; the client-side half of the picture is in
+that repo's `mobile/docs/DM_RETENTION.md`.
 
-One mechanical note for whoever implements a decision: a moderation key
-rotation forks `conversation_id`, which is `SHA-256(sorted(pubkey pair))`, so
-rows written under a retired key form a disjoint set that
-`getConversationByPubkey` — which derives the id from the *current* key —
-already cannot reach. They are separable without touching live threads.
-`dm_conversation_read_state` has no foreign key, so any pruning must delete the
-matching read-state rows in the same transaction.
+`pruneExpiredDmLog` (`src/nostr/dm-store.mjs`) implements the decision: a
+cron-driven sweep deletes `dm_log` rows older than one year and, in the same
+D1 batch, any `dm_conversation_read_state` row left orphaned once every
+message in its conversation has expired — a conversation with any surviving
+message keeps its read marker. A moderation key rotation forks
+`conversation_id` (`SHA-256(sorted(pubkey pair))`), so rows written under a
+retired key are already a disjoint set that `getConversationByPubkey` — which
+derives the id from the *current* key — cannot reach; the sweep ages them out
+like any other row, with no special-casing needed.
+
+**Not yet active.** `DM_LOG_RETENTION_ENABLED` (`wrangler.toml`) defaults to
+`false`: nobody has run the production sizing query from `#7850` against the
+live `dm_log` table yet, so the row count this sweep would delete on its
+first run is unmeasured. Flipping the flag to `true` (`wrangler secret put`,
+per the comment beside it) is a deliberate operational decision, not this
+deploy.
 
 ---
 
