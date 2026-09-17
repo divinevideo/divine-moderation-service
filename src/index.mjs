@@ -1645,9 +1645,13 @@ async function handlePublicCheckResult(url, env) {
   }));
 }
 
-// Only same-origin admin paths are safe re-auth redirect targets. Reject
+// Only same-origin admin page paths are safe re-auth redirect targets. Reject
 // off-site (`https://`, `//host`), scheme (`javascript:`), backslash-obscured,
-// and non-admin destinations so returnTo can't be an open redirect.
+// non-admin destinations, and the pages that are not re-auth landings (login
+// itself, logout, and the JSON API routes) so returnTo can't be an open
+// redirect or a forced sign-out.
+const ADMIN_REAUTH_NON_PAGE_PATHS = ['/admin/login', '/admin/logout'];
+
 function safeReturnTo(raw) {
   if (typeof raw !== 'string'
     || !raw.startsWith('/admin/')
@@ -1658,9 +1662,12 @@ function safeReturnTo(raw) {
   // `/admin/../x` and `/admin/%2e%2e/x` both parse out of the allowlist, so
   // the prefix is only trustworthy after the URL parser has normalized it.
   const resolved = new URL(raw, 'https://placeholder.invalid');
-  return resolved.pathname.startsWith('/admin/')
-    ? resolved.pathname + resolved.search
-    : null;
+  if (!resolved.pathname.startsWith('/admin/')
+    || ADMIN_REAUTH_NON_PAGE_PATHS.includes(resolved.pathname)
+    || resolved.pathname.startsWith('/admin/api/')) {
+    return null;
+  }
+  return resolved.pathname + resolved.search;
 }
 
 // Minimal page shown when re-auth was already attempted for this navigation

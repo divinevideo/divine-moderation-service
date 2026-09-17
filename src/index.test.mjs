@@ -8085,7 +8085,10 @@ describe('Admin auth-failure recovery (returnTo + re-auth)', () => {
       // Traversal inside the allowlist prefix still resolves outside it.
       '/admin/../../evil',
       '/admin/%2e%2e/x',
-      '/admin/..//evil.com'
+      '/admin/..//evil.com',
+      // Non-page admin routes must not be re-auth landings.
+      '/admin/logout',
+      '/admin/api/videos'
     ]) {
       const response = await worker.fetch(
         new Request(`${ADMIN}/admin/login?returnTo=${encodeURIComponent(evil)}`),
