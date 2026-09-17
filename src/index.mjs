@@ -4053,9 +4053,9 @@ async function runMigration() {
           kv: env.MODERATION_KV,
           ctx,
           fetchKind5WithRetry: (id) => fetchKind5WithRetry(id, {
-            fetchEventById: (eid) => fetchNostrEventById(eid, [relayUrl], env)
+            fetchEventById: (eid) => fetchNostrEventById(eid, [relayUrl], env, { observePerformance: true })
           }),
-          fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env, { throwOnTransient: true }),
+          fetchTargetEvent: (eid) => fetchNostrEventById(eid, [relayUrl], env, { throwOnTransient: true, observePerformance: true }),
           callBlossomDelete
         });
       }

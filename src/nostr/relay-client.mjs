@@ -6,6 +6,7 @@
 
 import { verifyEvent } from 'nostr-tools/pure';
 import { extractMediaShaFromEvent } from '../validation.mjs';
+import { startDeletePhase } from '../creator-delete/performance.mjs';
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
 
@@ -540,6 +541,11 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
     // endpoint returns a raw Nostr event: { id, pubkey, created_at, kind, tags, content, sig }.
     const apiBaseUrl = relayUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:').replace(/\/$/, '');
     relaysAttempted++;
+    const finish = options.observePerformance
+      ? startDeletePhase('relay_lookup', { attempt: relaysAttempted })
+      : null;
+    let status_code;
+    let outcome = 'transport_error';
     try {
       const headers = { 'Accept': 'application/json' };
       if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
@@ -547,7 +553,9 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
         headers['CF-Access-Client-Secret'] = env.CF_ACCESS_CLIENT_SECRET;
       }
       const response = await fetch(`${apiBaseUrl}/api/event/${eventId}`, { headers });
+      status_code = response.status;
       if (!response.ok) {
+        outcome = response.status === 404 ? 'missing' : 'transient';
         // Only a genuine 404 is a definitive "not found". 401/403 (auth
         // blips), 5xx, and 429 are transient and must be retried, not read
         // as "event absent" — otherwise the sweep advances its watermark
@@ -560,13 +568,17 @@ export async function fetchNostrEventById(eventId, relays = ['wss://relay.divine
       // a wrong-id, malformed, or signature-invalid body fails the validator
       // and falls through to `continue` (transient). Neither is treated as
       // "event absent" — the caller must not act on an event it didn't ask for.
+      outcome = 'invalid';
       const event = await response.json();
       if (isRequestedSignedEvent(event, eventId)) {
         anyDefinitiveResponse = true;
+        outcome = 'found';
         return event;
       }
     } catch {
       continue;
+    } finally {
+      finish?.({ outcome, status_code });
     }
   }
 

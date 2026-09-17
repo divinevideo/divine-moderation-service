@@ -16,6 +16,17 @@ routes = [
   { pattern = "moderation-api.divine.video/*", zone_name = "divine.video" }
 ]
 
+# Persist application measurements, including low-volume deletion failures.
+# Skip automatic invocation logs, whose messages include complete request URLs.
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = false
+persist = true
+
 # KV for storing moderation results
 [[kv_namespaces]]
 binding = "MODERATION_KV"
