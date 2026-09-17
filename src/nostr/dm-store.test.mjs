@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { computeConversationId, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead } from './dm-store.mjs';
+import { computeConversationId, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead, pruneExpiredDmLog } from './dm-store.mjs';
 
 /**
  * Create a mock D1 database that tracks calls and stores data in-memory
@@ -779,5 +779,117 @@ describe('DM Store - unread / markConversationRead against real D1', () => {
     const secondReadAt = (await db.prepare('SELECT read_at FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first()).read_at;
 
     expect(secondReadAt).toBe('2099-01-01 00:00:00');
+  });
+});
+
+describe('DM Store - pruneExpiredDmLog against real D1', () => {
+  const db = env.BLOSSOM_DB;
+
+  const MODERATOR = 'f'.repeat(64);
+  const CREATOR_A = ('a'.repeat(63) + '1').slice(0, 64);
+  const CREATOR_B = ('a'.repeat(63) + '2').slice(0, 64);
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM dm_conversation_read_state').run();
+  });
+
+  async function backdateMessage(nostrEventId, timestamp) {
+    await db.prepare('UPDATE dm_log SET created_at = ? WHERE nostr_event_id = ?').bind(timestamp, nostrEventId).run();
+  }
+
+  it('deletes a dm_log row older than one year and keeps a recent one', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old',
+    });
+    await backdateMessage('evt-old', '2000-01-01 00:00:00');
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'fresh',
+      nostrEventId: 'evt-new',
+    });
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedMessages).toBe(1);
+    const remaining = await db.prepare('SELECT nostr_event_id FROM dm_log').all();
+    expect(remaining.results.map((r) => r.nostr_event_id)).toEqual(['evt-new']);
+  });
+
+  it('deletes the read-state row for a conversation whose only message expired', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old',
+    });
+    await backdateMessage('evt-old', '2000-01-01 00:00:00');
+    await markConversationRead(db, conversationId);
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedReadStates).toBe(1);
+    const readState = await db.prepare('SELECT * FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(readState).toBeNull();
+  });
+
+  it('keeps the read-state row for a conversation that still has a non-expired message', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_B);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_B,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-2',
+    });
+    await backdateMessage('evt-old-2', '2000-01-01 00:00:00');
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_B,
+      recipientPubkey: MODERATOR,
+      content: 'fresh',
+      nostrEventId: 'evt-new-2',
+    });
+    await markConversationRead(db, conversationId);
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedMessages).toBe(1);
+    expect(result.deletedReadStates).toBe(0);
+    const readState = await db.prepare('SELECT * FROM dm_conversation_read_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(readState).not.toBeNull();
+  });
+
+  it('is a no-op when nothing has expired', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'fresh',
+      nostrEventId: 'evt-new-3',
+    });
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result).toEqual({ deletedMessages: 0, deletedReadStates: 0 });
+    const remaining = await db.prepare('SELECT COUNT(*) AS n FROM dm_log').first();
+    expect(remaining.n).toBe(1);
   });
 });

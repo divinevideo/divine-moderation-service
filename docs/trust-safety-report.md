@@ -212,7 +212,66 @@ This creates an auditable record of human moderation decisions on the Nostr prot
 | **KV** `quarantine:{sha256}` | Quarantine flag with reason and moderator info | 90 days |
 | **D1** `moderation_results` | Action, provider, scores JSON, categories, raw response, timestamps, reviewer info | Permanent |
 | **D1** `user_reports` | User-submitted reports with auto-escalation | Permanent |
+| **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body | **One year, decided.** Sweep implemented but disabled pending activation — see below |
+| **D1** `dm_conversation_read_state` | Moderator read marker, one row per conversation | Pruned alongside `dm_log` once a conversation's last message expires; same activation gate |
 | **Blossom** `media.divine.video` | Source video files | Permanent |
+
+### `dm_log`: one year, decided — enforcement not yet active
+
+Every other row above has a lifetime somebody chose. `dm_log` didn't, until
+now: there was no `DELETE`, no TTL, no scheduled sweep, no lifecycle rule —
+and until this row was added, no entry in this table either.
+
+Three things made that worth deciding rather than leaving:
+
+- **`content` is the message, not a reference to it.** The same string that is
+  gift-wrapped is stored, so a row is a byte-identical server-side plaintext
+  copy of an end-to-end-encrypted message.
+- **It outlives the user's own copy.** NIP-59 tells relays to delete
+  `kind:1059` events addressed to anyone who requests a NIP-62 vanish, and
+  funnelcake does. Nothing propagates that erasure here, so after a user
+  deletes their account Divine still holds the notice explaining why they were
+  actioned, keyed to their pubkey, and they hold nothing.
+- **This is not what the table was for.** `docs/moderation-dm-plan.md` specifies
+  `dm_log` as an *operational index for the admin dashboard* with the *relay as
+  source of truth for message content*. Both halves have quietly stopped being
+  true.
+
+Sizing, so the decision is not made in the dark: a `moderation_notice` body
+runs 169–602 bytes, and on disk with the three indexes a row costs roughly
+1.0–1.25 KB. Volume is not the reason to decide this.
+
+Retaining enforcement records through an erasure request is a normal and
+defensible posture, and it has been chosen: **one year**, decided 2026-09-14
+by Trust & Safety (Charlie Patrea, Mike Bradley, Aleysha Rose — "One year it
+is!") in `divinevideo/divine-moderation-service#219`. The question is tracked
+at `divinevideo/divine-mobile#7850`; the client-side half of the picture is in
+that repo's `mobile/docs/DM_RETENTION.md`.
+
+`pruneExpiredDmLog` (`src/nostr/dm-store.mjs`) implements the decision: a
+cron-driven sweep deletes `dm_log` rows older than one year and, in the same
+D1 batch, any `dm_conversation_read_state` row left orphaned once every
+message in its conversation has expired — a conversation with any surviving
+message keeps its read marker. A moderation key rotation forks
+`conversation_id` (`SHA-256(sorted(pubkey pair))`), so rows written under a
+retired key are already a disjoint set that `getConversationByPubkey` — which
+derives the id from the *current* key — cannot reach; the sweep ages them out
+like any other row, with no special-casing needed.
+
+**Not yet active.** `DM_LOG_RETENTION_ENABLED` (`wrangler.toml`) defaults to
+`false`: nobody has run the production sizing query from `#7850` against the
+live `dm_log` table yet, so the row count this sweep would delete on its
+first run is unmeasured. Activation is a deliberate production change, not
+part of this deploy, and must happen in this order:
+
+1. Apply migration 013 to the remote `blossom-webhook-events` D1 database with
+   `npx wrangler d1 migrations apply blossom-webhook-events --remote`.
+2. Verify `idx_dm_log_created_at` exists in the remote database before any
+   deletion is enabled.
+3. Run and review the production sizing query from `#7850`.
+4. Change the tracked `DM_LOG_RETENTION_ENABLED` value to `"true"` in
+   `wrangler.toml`, review that configuration change, and deploy it. A
+   `wrangler secret put` cannot override a deployed `[vars]` value.
 
 ---
 

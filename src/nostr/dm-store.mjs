@@ -27,6 +27,7 @@ export async function initDmLogTable(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_conversation ON dm_log(conversation_id)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_log(recipient_pubkey)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_sha256 ON dm_log(sha256)').run();
+  await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_log_created_at ON dm_log(created_at)').run();
   await initDmReadStateTable(db);
 }
 
@@ -85,6 +86,38 @@ export async function markConversationRead(db, conversationId) {
     ON CONFLICT(conversation_id) DO UPDATE SET read_at = CURRENT_TIMESTAMP
     WHERE CURRENT_TIMESTAMP > dm_conversation_read_state.read_at
   `).bind(conversationId).run();
+}
+
+/**
+ * Delete dm_log rows older than the Trust & Safety-decided one-year
+ * retention period, and any dm_conversation_read_state row left orphaned
+ * once every message in its conversation has expired. Both deletes run as
+ * one D1 batch (atomic) because dm_conversation_read_state has no foreign
+ * key to dm_log -- see PR #219 for the retention decision (Trust & Safety,
+ * 2026-09-14: Charlie, Mike, Aleysha) and the sizing/key-rotation notes.
+ *
+ * A row is kept until strictly one year old, comparing created_at as text
+ * against `datetime('now', '-1 years')` -- both are SQLite's
+ * CURRENT_TIMESTAMP-format text ("YYYY-MM-DD HH:MM:SS"), the same
+ * comparability markConversationRead already relies on. A read-state row is
+ * deleted only when NO dm_log row remains for its conversation_id; a
+ * conversation with any surviving message keeps its read marker.
+ * @param {D1Database} db
+ * @returns {Promise<{deletedMessages: number, deletedReadStates: number}>}
+ */
+export async function pruneExpiredDmLog(db) {
+  const [messagesResult, readStateResult] = await db.batch([
+    db.prepare(`DELETE FROM dm_log WHERE created_at < datetime('now', '-1 years')`),
+    db.prepare(`
+      DELETE FROM dm_conversation_read_state
+      WHERE conversation_id NOT IN (SELECT DISTINCT conversation_id FROM dm_log)
+    `),
+  ]);
+
+  return {
+    deletedMessages: messagesResult.meta.changes,
+    deletedReadStates: readStateResult.meta.changes,
+  };
 }
 
 export async function getConversations(db, { limit = 20, offset = 0, moderatorPubkey } = {}) {
