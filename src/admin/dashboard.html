@@ -2175,6 +2175,13 @@
   <div class="video-grid" id="video-grid"></div>
 
   <script>
+    // Send an expired-session 401 back through login, carrying the current
+    // view so re-auth returns here (with its filter) instead of the bare dashboard.
+    function redirectToLogin() {
+      const returnTo = encodeURIComponent(location.pathname + location.search);
+      window.location.href = '/admin/login?returnTo=' + returnTo;
+    }
+
     let allVideos = [];
     let currentLookupSha = null;
     let currentLookupVideo = null;
@@ -2293,7 +2300,7 @@
         const response = await fetch(`/admin/api/videos?${params}`);
 
         if (response.status === 401) {
-          window.location.href = '/admin/login';
+          redirectToLogin();
           return;
         }
 
@@ -2663,7 +2670,7 @@
       try {
         const response = await fetch(`/admin/api/video/${encodeURIComponent(sha256)}`);
         if (response.status === 401) {
-          window.location.href = '/admin/login';
+          redirectToLogin();
           return;
         }
 
@@ -2819,7 +2826,7 @@
       try {
         const response = await fetch('/admin/api/untriaged?limit=50&offset=' + triageOffset);
         if (response.status === 401) {
-          window.location.href = '/admin/login';
+          redirectToLogin();
           return;
         }
 
@@ -4844,8 +4851,9 @@
     }
 
     function logout() {
-      document.cookie = 'admin_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-      window.location.href = '/admin/login';
+      // Clear the Cloudflare Access session at the edge; /admin/login only
+      // re-auths, so it can never actually sign the user out.
+      window.location.href = '/admin/logout';
     }
 
     function copyToClipboard(text) {
@@ -5599,7 +5607,7 @@
 
       try {
         const resp = await fetch('/admin/api/thresholds');
-        if (resp.status === 401) { window.location.href = '/admin/login'; return; }
+        if (resp.status === 401) { redirectToLogin(); return; }
         const data = await resp.json();
         currentThresholds = data.thresholds;
         defaultThresholds = data.defaults;
