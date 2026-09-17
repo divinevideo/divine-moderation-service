@@ -192,6 +192,10 @@ Use the existing `relay-client.mjs` connect-query-EOSE-close pattern.
 
 ### 3.2 Add to Cron Trigger
 
+> Superseded: this snippet predates the switch away from `MODERATOR_NSEC`. That
+> variable is retired and must not be provisioned. The shipped code derives the
+> moderator DM pubkey from `NOSTR_PRIVATE_KEY` (see `src/nostr/dm-reader.mjs`).
+
 In the existing `scheduled()` handler (runs `*/5 * * * *`), add inbox sync:
 
 ```javascript
