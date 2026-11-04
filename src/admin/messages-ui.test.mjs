@@ -307,3 +307,39 @@ describe('messages UI — failed load-more recovery (#207)', () => {
     expect(messagesHTML).toMatch(/conversationsOffset \+= page\.length;\s*\n\s*conversationsError = false;/);
   });
 });
+
+// divine-mobile#7340: a reporter can include the direct message they are
+// reporting. The reader stores it as dm_log.unverified_excerpt, apart from the
+// reporter's note; the UI must say where it came from and that it is unverified.
+describe('messages UI — reporter-included message', () => {
+  it('renders the excerpt under its provenance, routed through escapeHtml', () => {
+    // escapeHtml needs a DOM, so stand in a marker that proves the excerpt
+    // went through it rather than straight into innerHTML.
+    globalThis.escapeHtml = (s) => `[escaped:${s}]`;
+    try {
+      const unverifiedExcerptHtml = extractFunction(messagesHTML, 'unverifiedExcerptHtml');
+      const html = unverifiedExcerptHtml('<img src=x onerror=alert(1)>');
+
+      expect(html).toContain('[escaped:<img src=x onerror=alert(1)>]');
+      expect(html.replace('[escaped:<img src=x onerror=alert(1)>]', '')).not.toContain('<img');
+      expect(html).toContain('Unverified message excerpt');
+      expect(html).toContain('Provided by the reporter');
+      expect(html).toContain('not proof of what was sent');
+    } finally {
+      delete globalThis.escapeHtml;
+    }
+  });
+
+  it('adds the excerpt to a message bubble only when the row has one', () => {
+    const fn = messagesHTML.slice(
+      messagesHTML.indexOf('function createMessageBubble('),
+      messagesHTML.indexOf('function appendOutgoingBubble('),
+    );
+    expect(fn).toContain("if (typeof msg.unverified_excerpt === 'string' && msg.unverified_excerpt)");
+    expect(fn).toContain('html += unverifiedExcerptHtml(msg.unverified_excerpt);');
+  });
+
+  it('keeps the excerpt\'s own line breaks', () => {
+    expect(messagesHTML).toMatch(/\.unverified-excerpt-text\s*\{[^}]*white-space:\s*pre-wrap/);
+  });
+});
