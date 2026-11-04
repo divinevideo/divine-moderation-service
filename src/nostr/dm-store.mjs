@@ -47,8 +47,14 @@ export async function initDmLogTable(db) {
 export async function ensureDmLogExcerptColumn(db) {
   const columns = await db.prepare('PRAGMA table_info(dm_log)').all();
   const hasColumn = (columns?.results || []).some((column) => column.name === 'unverified_excerpt');
-  if (!hasColumn) {
+  if (hasColumn) return;
+  try {
     await db.prepare('ALTER TABLE dm_log ADD COLUMN unverified_excerpt TEXT').run();
+  } catch (err) {
+    // The cron sync and a moderator's Refresh can both run the first sync
+    // after a deploy. If the other one added the column after our check, the
+    // column is there, which is all this needed.
+    if (!/duplicate column name/i.test(err?.message || '')) throw err;
   }
 }
 

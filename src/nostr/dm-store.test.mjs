@@ -936,6 +936,38 @@ describe('DM Store - unverified excerpt column against real D1', () => {
     expect(await dmLogColumns()).toContain('unverified_excerpt');
   });
 
+  // The cron sync and a moderator's Refresh can both run the first sync after
+  // a deploy. Both read the schema before either alters it, so the slower one
+  // hits a column the faster one just added; that must not fail its sync.
+  it('tolerates another sync adding the column between its check and its ALTER', async () => {
+    await createPreExcerptDmLog();
+    const { results: staleColumns } = await db.prepare('PRAGMA table_info(dm_log)').all();
+    await ensureDmLogExcerptColumn(db); // the other sync wins the race
+    const racingDb = {
+      prepare(sql) {
+        const statement = db.prepare(sql);
+        if (sql.startsWith('PRAGMA table_info(dm_log)')) {
+          return { all: async () => ({ results: staleColumns }) };
+        }
+        return statement;
+      },
+    };
+
+    await expect(ensureDmLogExcerptColumn(racingDb)).resolves.toBeUndefined();
+    expect(await dmLogColumns()).toContain('unverified_excerpt');
+  });
+
+  it('still surfaces an ALTER failure that is not the race', async () => {
+    const brokenDb = {
+      prepare(sql) {
+        if (sql.startsWith('PRAGMA')) return { all: async () => ({ results: [] }) };
+        return { run: async () => { throw new Error('D1_ERROR: no such table: dm_log'); } };
+      },
+    };
+
+    await expect(ensureDmLogExcerptColumn(brokenDb)).rejects.toThrow('no such table');
+  });
+
   it('initDmLogTable creates a table that already has the column', async () => {
     await db.prepare('DROP TABLE IF EXISTS dm_log').run();
     await initDmLogTable(db);
