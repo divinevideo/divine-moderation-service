@@ -363,7 +363,9 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const isReport = Boolean(relatedSha256 || hasReportTag);
   const claimsExcerpt = isReport && !isOutgoing && hasUnverifiedExcerptTag(rumorTags);
   const excerptSplit = claimsExcerpt ? splitUnverifiedExcerpt(content) : null;
-  if (claimsExcerpt && !excerptSplit) {
+  // Warn on first sight only: the two-day re-poll overlap would otherwise
+  // repeat it every tick.
+  if (claimsExcerpt && !excerptSplit && !alreadyLogged) {
     console.warn(`[DM-READER] Report DM ${giftWrapId} is tagged with an included message but has no excerpt section; storing it whole`);
   }
   const reporterContent = excerptSplit ? excerptSplit.note : content;

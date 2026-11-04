@@ -4,7 +4,7 @@
 // ABOUTME: Tests for DM inbox reader module (dm-reader.mjs)
 // ABOUTME: Verifies pubkey derivation, inbox sync behavior, and error handling
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { wrapEvent } from 'nostr-tools/nip59';
@@ -533,6 +533,22 @@ describe('DM Reader - processRumor reporter-included message', () => {
 
     expect(dm.content).toBe(NOTE);
     expect(dm.unverified_excerpt).toBeNull();
+  });
+
+  // syncInbox re-reads two days of gift wraps on every tick, so a warning
+  // about one malformed DM must not repeat every five minutes.
+  it('warns once, not on every re-poll, about a tagged report with no excerpt section', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const rumor = { pubkey: REPORTER, tags: [...REPORT_TAGS, EVIDENCE_TAG], content: NOTE, created_at: Math.floor(Date.now() / 1000) };
+      await processRumor(rumor, 'evt-tag-no-heading', MODERATOR, { BLOSSOM_DB: db });
+      await processRumor(rumor, 'evt-tag-no-heading', MODERATOR, { BLOSSOM_DB: db });
+
+      const excerptWarnings = warn.mock.calls.filter(([message]) => String(message).includes('has no excerpt section'));
+      expect(excerptWarnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   // Only a report has a reporter for the excerpt to have come from.
