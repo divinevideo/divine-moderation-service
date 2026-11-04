@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { computeConversationId, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead, pruneExpiredDmLog } from './dm-store.mjs';
+import { computeConversationId, ensureDmLogExcerptColumn, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead, pruneExpiredDmLog } from './dm-store.mjs';
 
 /**
  * Create a mock D1 database that tracks calls and stores data in-memory
@@ -891,5 +891,98 @@ describe('DM Store - pruneExpiredDmLog against real D1', () => {
     expect(result).toEqual({ deletedMessages: 0, deletedReadStates: 0 });
     const remaining = await db.prepare('SELECT COUNT(*) AS n FROM dm_log').first();
     expect(remaining.n).toBe(1);
+  });
+});
+
+// A reporter can include the message they are reporting (divine-mobile#7340).
+// It lives in its own dm_log column, so production's existing table needs the
+// column added in code: CI deploys on merge but never applies migrations/.
+describe('DM Store - unverified excerpt column against real D1', () => {
+  const db = env.BLOSSOM_DB;
+  const MODERATOR = 'f'.repeat(64);
+  const REPORTER = ('a'.repeat(63) + '1').slice(0, 64);
+
+  // dm_log exactly as migrations/003-dm-support.sql created it in production.
+  async function createPreExcerptDmLog() {
+    await db.prepare('DROP TABLE IF EXISTS dm_log').run();
+    await db.prepare(`
+      CREATE TABLE dm_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        sha256 TEXT,
+        direction TEXT NOT NULL,
+        sender_pubkey TEXT NOT NULL,
+        recipient_pubkey TEXT NOT NULL,
+        message_type TEXT,
+        content TEXT NOT NULL,
+        nostr_event_id TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+  }
+
+  async function dmLogColumns() {
+    const { results } = await db.prepare('PRAGMA table_info(dm_log)').all();
+    return results.map((column) => column.name);
+  }
+
+  it('adds the column to a dm_log created before it existed, and is safe to run again', async () => {
+    await createPreExcerptDmLog();
+    expect(await dmLogColumns()).not.toContain('unverified_excerpt');
+
+    await ensureDmLogExcerptColumn(db);
+    await ensureDmLogExcerptColumn(db);
+
+    expect(await dmLogColumns()).toContain('unverified_excerpt');
+  });
+
+  it('initDmLogTable creates a table that already has the column', async () => {
+    await db.prepare('DROP TABLE IF EXISTS dm_log').run();
+    await initDmLogTable(db);
+    expect(await dmLogColumns()).toContain('unverified_excerpt');
+  });
+
+  it('stores the excerpt apart from the content and returns it with the thread', async () => {
+    await db.prepare('DROP TABLE IF EXISTS dm_log').run();
+    await initDmLogTable(db);
+    const conversationId = computeConversationId(MODERATOR, REPORTER);
+
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: REPORTER,
+      recipientPubkey: MODERATOR,
+      messageType: 'conversation_report',
+      content: 'DM Message Report\nReason: Harassment',
+      unverifiedExcerpt: 'you will regret this',
+      nostrEventId: 'evt-excerpt',
+    });
+
+    const [row] = await getConversation(db, conversationId);
+    expect(row.content).toBe('DM Message Report\nReason: Harassment');
+    expect(row.unverified_excerpt).toBe('you will regret this');
+  });
+
+  // dm-sender's logDm calls (moderator notices and replies) run on paths that
+  // never ensure the column. A message without an excerpt must not name it,
+  // or every one of those writes would fail until the DM reader next ran.
+  it('logs a message without an excerpt into a dm_log that lacks the column', async () => {
+    await createPreExcerptDmLog();
+    const conversationId = computeConversationId(MODERATOR, REPORTER);
+
+    const result = await logDm(db, {
+      conversationId,
+      direction: 'outgoing',
+      senderPubkey: MODERATOR,
+      recipientPubkey: REPORTER,
+      messageType: 'moderator_reply',
+      content: 'Thanks, we are looking into it.',
+      nostrEventId: 'evt-no-excerpt',
+    });
+
+    expect(result.id).toBeGreaterThan(0);
+    const [row] = await getConversation(db, conversationId);
+    expect(row.content).toBe('Thanks, we are looking into it.');
+    expect(row).not.toHaveProperty('unverified_excerpt');
   });
 });

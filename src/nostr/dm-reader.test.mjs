@@ -7,9 +7,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { wrapEvent } from 'nostr-tools/nip59';
 import { bytesToHex } from '@noble/hashes/utils';
 import { fetchGiftWraps, getModeratorPubkey, processRumor, resolveReportedAt, syncInbox } from './dm-reader.mjs';
 import { initDmLogTable } from './dm-store.mjs';
+import { UNVERIFIED_EXCERPT_HEADING } from './dm-evidence.mjs';
 import { initReportsTable } from '../reports.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
@@ -466,6 +468,117 @@ describe('DM Reader - processRumor classify logic (real D1)', () => {
   });
 });
 
+// A reporter can include the direct message they are reporting
+// (divine-mobile#7340). It arrives at the end of the DM body under a fixed
+// heading, with an ['evidence', 'unverified_excerpt'] tag on the rumor.
+describe('DM Reader - processRumor reporter-included message', () => {
+  const db = env.BLOSSOM_DB;
+  const MODERATOR = ('f'.repeat(63) + '1').slice(0, 64);
+  const REPORTER = ('a'.repeat(63) + '1').slice(0, 64);
+  const RECIPIENT = ('b'.repeat(63) + '1').slice(0, 64);
+  const SHA256 = ('c'.repeat(63) + '1').slice(0, 64);
+  const NOTE = 'DM Message Report\nReason: Harassment\nMessage ID: ' + 'e'.repeat(64) + '\nDetails: keeps messaging me';
+  const EXCERPT = 'you will regret this';
+  const CONTENT = `${NOTE}\n\n${UNVERIFIED_EXCERPT_HEADING}\n${EXCERPT}`;
+  const REPORT_TAGS = [
+    ['p', MODERATOR],
+    ['L', 'social.nos.ontology'],
+    ['l', 'NS-harassment', 'social.nos.ontology'],
+    ['report_type', 'profanity'],
+  ];
+  const EVIDENCE_TAG = ['evidence', 'unverified_excerpt'];
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await initReportsTable(db);
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS moderation_results (
+        sha256 TEXT PRIMARY KEY, action TEXT, provider TEXT, scores TEXT,
+        categories TEXT, raw_response TEXT, moderated_at TEXT,
+        reviewed_by TEXT, reviewed_at TEXT, review_notes TEXT, uploaded_by TEXT
+      )`).run();
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM user_reports').run();
+    await db.prepare('DELETE FROM moderation_results').run();
+  });
+
+  async function storedDm(rumor) {
+    await processRumor(
+      { created_at: Math.floor(Date.now() / 1000), ...rumor },
+      'evt-' + Math.random().toString(36).slice(2),
+      MODERATOR,
+      { BLOSSOM_DB: db },
+    );
+    return db.prepare('SELECT * FROM dm_log').first();
+  }
+
+  it('stores the included message as its own field, apart from the reporter\'s note', async () => {
+    const dm = await storedDm({ pubkey: REPORTER, tags: [...REPORT_TAGS, EVIDENCE_TAG], content: CONTENT });
+
+    expect(dm.message_type).toBe('conversation_report');
+    expect(dm.content).toBe(NOTE);
+    expect(dm.unverified_excerpt).toBe(EXCERPT);
+  });
+
+  // The heading is text anyone can type, so only the tag marks an excerpt.
+  it('keeps a report whole when the body has the heading but the rumor has no tag', async () => {
+    const dm = await storedDm({ pubkey: REPORTER, tags: REPORT_TAGS, content: CONTENT });
+
+    expect(dm.content).toBe(CONTENT);
+    expect(dm.unverified_excerpt).toBeNull();
+  });
+
+  it('keeps a tagged report whole when the heading is missing', async () => {
+    const dm = await storedDm({ pubkey: REPORTER, tags: [...REPORT_TAGS, EVIDENCE_TAG], content: NOTE });
+
+    expect(dm.content).toBe(NOTE);
+    expect(dm.unverified_excerpt).toBeNull();
+  });
+
+  // Only a report has a reporter for the excerpt to have come from.
+  it('keeps an ordinary reply whole even when it carries the tag', async () => {
+    const dm = await storedDm({ pubkey: REPORTER, tags: [['p', MODERATOR], EVIDENCE_TAG], content: CONTENT });
+
+    expect(dm.message_type).toBe('creator_reply');
+    expect(dm.content).toBe(CONTENT);
+    expect(dm.unverified_excerpt).toBeNull();
+  });
+
+  it('keeps the moderator\'s own outgoing copy whole even when it carries the tag', async () => {
+    const dm = await storedDm({
+      pubkey: MODERATOR,
+      tags: [['p', RECIPIENT], ...REPORT_TAGS.slice(1), EVIDENCE_TAG],
+      content: CONTENT,
+    });
+
+    expect(dm.direction).toBe('outgoing');
+    expect(dm.content).toBe(CONTENT);
+    expect(dm.unverified_excerpt).toBeNull();
+  });
+
+  // Today's DM-message reports name no blob, so they never reach
+  // recordReportForReview. A report that does name one must still not carry
+  // the excerpt into user_reports or moderation_results: those are the
+  // records automated enforcement reads, and user_reports is not under
+  // dm_log's one-year retention.
+  it('records a report that also names a blob without the included message', async () => {
+    const dm = await storedDm({
+      pubkey: REPORTER,
+      tags: [...REPORT_TAGS, ['sha256', SHA256], EVIDENCE_TAG],
+      content: CONTENT,
+    });
+    expect(dm.unverified_excerpt).toBe(EXCERPT);
+
+    const report = await db.prepare('SELECT * FROM user_reports').first();
+    expect(report.reason).toBe(NOTE);
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results').first();
+    expect(moderation.action).toBe('REVIEW');
+    expect(JSON.parse(moderation.raw_response).reason).toBe(NOTE);
+    expect(moderation.raw_response).not.toContain(EXCERPT);
+  });
+});
+
 describe('DM Reader - resolveReportedAt', () => {
   const NOW_MS = Date.parse('2026-08-09T12:00:00.000Z');
   const NOW_SECONDS = Math.floor(NOW_MS / 1000);
@@ -838,5 +951,60 @@ describe('DM Reader - syncInbox checkpoint guard', () => {
     } finally {
       restore();
     }
+  });
+
+  // syncInbox runs from the cron trigger, which never reaches the fetch
+  // handler, and production's dm_log predates the excerpt column. The first
+  // tick after a deploy must add the column itself, or the insert fails and
+  // the report is never logged.
+  it('stores an included message against a dm_log created before the excerpt column existed', async () => {
+    const db = env.BLOSSOM_DB;
+    await db.prepare('DROP TABLE IF EXISTS dm_log').run();
+    await db.prepare(`
+      CREATE TABLE dm_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        sha256 TEXT,
+        direction TEXT NOT NULL,
+        sender_pubkey TEXT NOT NULL,
+        recipient_pubkey TEXT NOT NULL,
+        message_type TEXT,
+        content TEXT NOT NULL,
+        nostr_event_id TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+
+    const reporterSk = generateSecretKey();
+    const giftWrap = wrapEvent({
+      kind: 14,
+      content: `DM Message Report\nReason: Harassment\n\n${UNVERIFIED_EXCERPT_HEADING}\nyou will regret this`,
+      tags: [
+        ['p', testPubkey],
+        ['L', 'social.nos.ontology'],
+        ['l', 'NS-harassment', 'social.nos.ontology'],
+        ['report_type', 'profanity'],
+        ['evidence', 'unverified_excerpt'],
+      ],
+      created_at: Math.floor(Date.now() / 1000),
+    }, reporterSk, testPubkey);
+
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.reply(['EVENT', msg[1], giftWrap]);
+        ctx.reply(['EOSE', msg[1]]);
+      }
+    });
+
+    try {
+      const result = await syncInbox({ NOSTR_PRIVATE_KEY: testHex, BLOSSOM_DB: db });
+      expect(result).toEqual({ synced: 1, skipped: 0, errors: 0 });
+    } finally {
+      restore();
+    }
+
+    const dm = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dm.content).toBe('DM Message Report\nReason: Harassment');
+    expect(dm.unverified_excerpt).toBe('you will regret this');
   });
 });

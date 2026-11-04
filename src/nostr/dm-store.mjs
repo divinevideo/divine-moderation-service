@@ -28,7 +28,28 @@ export async function initDmLogTable(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_log(recipient_pubkey)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_sha256 ON dm_log(sha256)').run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_log_created_at ON dm_log(created_at)').run();
+  await ensureDmLogExcerptColumn(db);
   await initDmReadStateTable(db);
+}
+
+/**
+ * Add dm_log.unverified_excerpt where it is missing: the message a reporter
+ * chose to include in a moderation DM (see dm-evidence.mjs), kept apart from
+ * their own note so the admin Messages UI can label it unverified.
+ *
+ * In code rather than in migrations/ for the reason initReportsTable gives: CI
+ * deploys the worker on merge but never runs `wrangler d1 migrations apply`.
+ * The DM reader calls this before it writes, and only the reader writes the
+ * column -- logDm leaves it out of every insert that has no excerpt -- so the
+ * other dm_log writers keep working against a table that has not been altered.
+ * @param {D1Database} db
+ */
+export async function ensureDmLogExcerptColumn(db) {
+  const columns = await db.prepare('PRAGMA table_info(dm_log)').all();
+  const hasColumn = (columns?.results || []).some((column) => column.name === 'unverified_excerpt');
+  if (!hasColumn) {
+    await db.prepare('ALTER TABLE dm_log ADD COLUMN unverified_excerpt TEXT').run();
+  }
 }
 
 /**
@@ -56,17 +77,26 @@ export async function findDmByNostrEventId(db, nostrEventId) {
   return db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(nostrEventId).first();
 }
 
-export async function logDm(db, { conversationId, sha256, direction, senderPubkey, recipientPubkey, messageType, content, nostrEventId }) {
+export async function logDm(db, { conversationId, sha256, direction, senderPubkey, recipientPubkey, messageType, content, nostrEventId, unverifiedExcerpt = null }) {
   // Dedup by nostr_event_id if provided
   if (nostrEventId) {
     const existing = await findDmByNostrEventId(db, nostrEventId);
     if (existing) return existing;
   }
 
+  const columns = ['conversation_id', 'sha256', 'direction', 'sender_pubkey', 'recipient_pubkey', 'message_type', 'content', 'nostr_event_id'];
+  const values = [conversationId, sha256 || null, direction, senderPubkey, recipientPubkey, messageType || null, content, nostrEventId || null];
+  // Named only when there is an excerpt: the writers that never have one run
+  // on paths that never ensure the column (see ensureDmLogExcerptColumn).
+  if (unverifiedExcerpt != null) {
+    columns.push('unverified_excerpt');
+    values.push(unverifiedExcerpt);
+  }
+
   const result = await db.prepare(`
-    INSERT INTO dm_log (conversation_id, sha256, direction, sender_pubkey, recipient_pubkey, message_type, content, nostr_event_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(conversationId, sha256 || null, direction, senderPubkey, recipientPubkey, messageType || null, content, nostrEventId || null).run();
+    INSERT INTO dm_log (${columns.join(', ')})
+    VALUES (${columns.map(() => '?').join(', ')})
+  `).bind(...values).run();
 
   return { id: result.meta.last_row_id };
 }
