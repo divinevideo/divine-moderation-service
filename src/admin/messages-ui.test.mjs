@@ -325,6 +325,10 @@ describe('messages UI — reporter-included message', () => {
       expect(html).toContain('Unverified message excerpt');
       expect(html).toContain('Provided by the reporter');
       expect(html).toContain('not proof of what was sent');
+      // The sender does sign the NIP-17 seal; it is the message text the
+      // reporter forwards that carries no signature anyone can check.
+      expect(html).toContain('carries no signature anyone can check');
+      expect(html).not.toContain('are not signed');
     } finally {
       delete globalThis.escapeHtml;
     }
