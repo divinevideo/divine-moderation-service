@@ -357,7 +357,9 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // can type), and only an incoming report has a reporter it came from.
   // Everything below uses `reporterContent`: the excerpt never reaches
   // user_reports or moderation_results, the records automated enforcement
-  // reads, and so stays under dm_log's one-year retention alone.
+  // reads, and so lives only in dm_log, which has a decided one-year retention
+  // that user_reports lacks (the sweep waits on DM_LOG_RETENTION_ENABLED; see
+  // docs/trust-safety-report.md).
   const isReport = Boolean(relatedSha256 || hasReportTag);
   const claimsExcerpt = isReport && !isOutgoing && hasUnverifiedExcerptTag(rumorTags);
   const excerptSplit = claimsExcerpt ? splitUnverifiedExcerpt(content) : null;

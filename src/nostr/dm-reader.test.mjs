@@ -559,8 +559,8 @@ describe('DM Reader - processRumor reporter-included message', () => {
   // Today's DM-message reports name no blob, so they never reach
   // recordReportForReview. A report that does name one must still not carry
   // the excerpt into user_reports or moderation_results: those are the
-  // records automated enforcement reads, and user_reports is not under
-  // dm_log's one-year retention.
+  // records automated enforcement reads, and user_reports has no retention
+  // limit, unlike dm_log's decided one year.
   it('records a report that also names a blob without the included message', async () => {
     const dm = await storedDm({
       pubkey: REPORTER,
