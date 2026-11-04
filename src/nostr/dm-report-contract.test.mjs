@@ -266,9 +266,12 @@ describe('divine-mobile#6593 cross-repo contract', () => {
 
   // divine-mobile#7340: a report made from a direct message may include that
   // message. ReportSubmissionCubit builds the body with the 'DM Message
-  // Report' / 'Message ID' labels from ReportContentDialog.showForMessage.
+  // Report' / 'Message ID' labels from ReportContentDialog.showForMessage,
+  // then names the sender, since a private report has no other channel that
+  // does.
   it('a DM-message report that includes the message stores it as its own unverified field', async () => {
     const note = 'DM Message Report\nReason: Harassment\nMessage ID: ' + 'd'.repeat(64)
+      + '\nSender Pubkey: ' + 'e'.repeat(64)
       + '\nDetails: keeps messaging me';
     const message = 'you will regret this\nsee you soon';
 
