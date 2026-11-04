@@ -345,9 +345,9 @@ describe('messages UI — reporter-included message', () => {
       relativeTime: () => 'just now',
       badgeLabel: (t) => t,
     };
-    Object.assign(globalThis, stubs);
-    globalThis.unverifiedExcerptHtml = extractFunction(messagesHTML, 'unverifiedExcerptHtml');
     try {
+      Object.assign(globalThis, stubs);
+      globalThis.unverifiedExcerptHtml = extractFunction(messagesHTML, 'unverifiedExcerptHtml');
       const createMessageBubble = extractFunction(messagesHTML, 'createMessageBubble');
       const bubble = (extra) => createMessageBubble({
         direction: 'incoming',
