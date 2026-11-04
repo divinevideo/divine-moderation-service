@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS dm_log (
   nostr_event_id TEXT,                 -- gift-wrap event ID on relay
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+-- dm_log.unverified_excerpt TEXT is added in code, not by a migration: see
+-- ensureDmLogExcerptColumn in src/nostr/dm-store.mjs (CI never applies migrations).
 CREATE INDEX IF NOT EXISTS idx_dm_conversation ON dm_log(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_dm_recipient ON dm_log(recipient_pubkey);
 CREATE INDEX IF NOT EXISTS idx_dm_sha256 ON dm_log(sha256);

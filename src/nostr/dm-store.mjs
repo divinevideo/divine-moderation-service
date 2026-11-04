@@ -21,7 +21,8 @@ export async function initDmLogTable(db) {
       message_type TEXT,
       content TEXT NOT NULL,
       nostr_event_id TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      unverified_excerpt TEXT
     )
   `).run();
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_conversation ON dm_log(conversation_id)').run();
