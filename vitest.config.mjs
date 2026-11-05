@@ -43,7 +43,7 @@ export default defineWorkersConfig({
       provider: 'v8',
       reporter: ['text', 'json-summary'],
       include: ['src/**/*.mjs'],
-      exclude: ['src/**/*.test.mjs', 'src/admin/*.html'],
+      exclude: ['src/**/*.test.mjs', 'src/**/*.test-helper.mjs', 'src/admin/*.html'],
     },
   },
 });

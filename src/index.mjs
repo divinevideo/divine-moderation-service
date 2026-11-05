@@ -830,8 +830,15 @@ async function resolveSecret(binding) {
 }
 
 async function callRelayAdminAction(env, payload) {
-  const rpcBody = relayRpcForAction(payload);
-  const url = `${getRelayAdminUrl(env)}/api/relay-rpc`;
+  return postToRelayAdmin(env, '/api/relay-rpc', relayRpcForAction(payload));
+}
+
+// One POST to relay-admin: its data on success, a RelayAdminError on a
+// refusal, and a plain Error when it cannot be reached. Shared by the ban RPCs
+// above and the media lift check (#231) so both use the same transport, key
+// and timeout.
+async function postToRelayAdmin(env, path, body) {
+  const url = `${getRelayAdminUrl(env)}${path}`;
 
   // Prefer the worker-to-worker service binding when configured: it bypasses the
   // public CF edge and CF Access (the source of the deprecated-endpoint 522 and
@@ -863,7 +870,7 @@ async function callRelayAdminAction(env, payload) {
     headers: viaBinding
       ? { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey || '' }
       : getRelayAdminHeaders(env),
-    body: JSON.stringify(rpcBody),
+    body: JSON.stringify(body),
     redirect: 'manual',
     signal: controller.signal
   };
@@ -956,6 +963,65 @@ function relayAdminFailureResponse(error, env) {
     status: 502,
     headers: { 'Content-Type': 'application/json' }
   });
+}
+
+// SAFE and AGE_RESTRICTED can make a file more visible. relay manager refuses
+// those while the file's owner has an open age review (divine-relay-manager
+// #335), but the dashboard writes here without going through it, so it asks
+// relay manager's lift check first (#231) instead of restating the rules.
+const MEDIA_LIFT_ACTIONS = new Set(['SAFE', 'AGE_RESTRICTED']);
+
+// relay manager's refusals that mean "not this file, not now", each with the
+// status it sends. Passed through so the dashboard can say why. Any other
+// failure, including one with an unexpected status, is "could not ask".
+const LIFT_REFUSAL_STATUS = {
+  media_record_missing: 409,
+  owner_unreadable: 503,
+  age_review_check_failed: 503,
+  state_unreadable: 503
+};
+
+function liftCheckUnavailable(error) {
+  console.error('[ADMIN] Media lift check failed; refusing:', error);
+  return jsonResponse(502, {
+    success: false,
+    error: 'Could not confirm with relay manager that this file may be made more visible; refusing',
+    code: 'lift_check_unavailable'
+  });
+}
+
+function liftCheckFailureResponse(error, env) {
+  const code = error instanceof RelayAdminError ? error.code : null;
+  if (code === 'age_review_active' && error.upstreamStatus === 409) {
+    return relayAdminFailureResponse(error, env);
+  }
+  if (code && LIFT_REFUSAL_STATUS[code] === error.upstreamStatus) {
+    return jsonResponse(error.upstreamStatus, { success: false, error: error.message, code });
+  }
+  return liftCheckUnavailable(error);
+}
+
+// Ask relay manager whether `action` may go ahead on this file. Returns the
+// lowercase hash it checked, which is the one to write, or the Response to send
+// instead. Fails closed: anything short of a checked allow naming this file is
+// a refusal. Check-then-act, as on relay manager's own route: a case opened
+// between the check and the write is not seen.
+async function checkMediaLift(env, sha256, action) {
+  if (!isValidSha256(sha256)) {
+    return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
+  }
+
+  let data;
+  try {
+    data = await postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action });
+  } catch (error) {
+    return liftCheckFailureResponse(error, env);
+  }
+
+  if (data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256.toLowerCase()) {
+    return liftCheckUnavailable(new Error(`Unexpected lift check answer: ${JSON.stringify(data)}`));
+  }
+  return { sha256: data.sha256 };
 }
 
 async function deleteRelayEventIds(eventIds, env, reason) {
@@ -2380,7 +2446,7 @@ export default {
         return authError;
       }
 
-      const sha256 = url.pathname.split('/')[4];
+      let sha256 = url.pathname.split('/')[4];
       const { action, reason, scores, videoUrl, uploadedBy } = await request.json();
 
       // Validate action
@@ -2389,6 +2455,16 @@ export default {
           status: 400,
           headers: { 'Content-Type': 'application/json' }
         });
+      }
+
+      // Before anything is written: a lift must clear relay manager's age-review
+      // guard (#231). An Undo or an Edit Scores that sends SAFE is a lift too.
+      if (MEDIA_LIFT_ACTIONS.has(action)) {
+        const lift = await checkMediaLift(env, sha256, action);
+        if (lift instanceof Response) {
+          return lift;
+        }
+        sha256 = lift.sha256;
       }
 
       // Get existing moderation result — check D1 first, fall back to KV

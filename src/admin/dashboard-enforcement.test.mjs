@@ -1,11 +1,12 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// ABOUTME: Runs the dashboard's real enforcement handler and toast against stubs
-// ABOUTME: so the age-review refusal path is covered by behaviour, not substrings
+// ABOUTME: Runs the dashboard's real enforcement and media-decision handlers and toast
+// ABOUTME: against stubs so the age-review refusal path is covered by behaviour, not substrings
 
 import { describe, expect, it } from 'vitest';
 import dashboardHTML from './dashboard.html';
+import { extractFunction } from './extract-function.test-helper.mjs';
 
 // dashboard.html has no build step, so the rest of its suite asserts on source
 // substrings. That signal is inverted for this path: dropping the structured
@@ -18,91 +19,16 @@ const CASE_ID = '2f3a1c48-9d5e-4b17-9c0a-6e8b1d7f4a20';
 const BLOCK_MESSAGE = 'This account is under age review. Restrict or clear it from the Age Review flow.';
 const CASE_URL = `https://relay.admin.divine.video/age-review?case=${CASE_ID}`;
 
-// Read one function's source out of the page by name. Braces are only counted
-// in code: the scanner walks over strings, template literals (including nested
-// `${}` substitutions) and comments, so a brace inside one cannot end the
-// function early. That makes extraction survive reformatting of the function it
-// pulls, which is the whole point of testing it this way. Regex literals are not
-// tracked; neither extracted function contains one.
-//
-// `mustContain` is the guard on the one failure this cannot otherwise detect.
-// The brace scanner below is mode-aware, but the name search on the next line is
-// a plain regex over raw source: an earlier textual `function showToast(` in a
-// comment or a string hijacks the start index and yields a different function
-// that still parses. That failure is silent — no throw, no SyntaxError, just
-// tests passing against code the page does not ship. Naming a line that only
-// the real body contains turns it into a loud one.
-function extractFunction(source, name, mustContain) {
-  const match = new RegExp(`(?:async\\s+)?function\\s+${name}\\s*\\(`).exec(source);
-  if (!match) {
-    throw new Error(`extractFunction: no declaration of ${name} in dashboard.html`);
-  }
-
-  const start = match.index;
-  const stack = [];
-  let opened = false;
-
-  for (let i = start; i < source.length;) {
-    const ch = source[i];
-    const next = source[i + 1];
-    const mode = stack[stack.length - 1];
-
-    if (mode === "'" || mode === '"') {
-      if (ch === '\\') { i += 2; continue; }
-      if (ch === mode) { stack.pop(); }
-      i += 1;
-    } else if (mode === '`') {
-      if (ch === '\\') { i += 2; continue; }
-      if (ch === '`') { stack.pop(); i += 1; continue; }
-      if (ch === '$' && next === '{') { stack.push('${'); i += 2; continue; }
-      i += 1;
-    } else if (mode === '//') {
-      if (ch === '\n') { stack.pop(); }
-      i += 1;
-    } else if (mode === '/*') {
-      if (ch === '*' && next === '/') { stack.pop(); i += 2; continue; }
-      i += 1;
-    } else if (ch === '/' && next === '/') {
-      stack.push('//');
-      i += 2;
-    } else if (ch === '/' && next === '*') {
-      stack.push('/*');
-      i += 2;
-    } else if (ch === "'" || ch === '"' || ch === '`') {
-      stack.push(ch);
-      i += 1;
-    } else if (ch === '{') {
-      stack.push('{');
-      opened = true;
-      i += 1;
-    } else if (ch === '}') {
-      stack.pop();
-      i += 1;
-      if (opened && stack.length === 0) {
-        const extracted = source.slice(start, i);
-        if (!extracted.includes(mustContain)) {
-          throw new Error(
-            `extractFunction: extracted a ${name} that does not contain ${JSON.stringify(mustContain)} `
-            + '— the name search matched an earlier occurrence, so this is the wrong function'
-          );
-        }
-        return extracted;
-      }
-    } else {
-      i += 1;
-    }
-  }
-
-  throw new Error(`extractFunction: braces never balanced while reading ${name}`);
-}
-
 const SHOW_TOAST_SRC = extractFunction(dashboardHTML, 'showToast', "actionBtn.className = 'toast-action'");
 const HIDE_TOAST_SRC = extractFunction(dashboardHTML, 'hideToast', "toast.classList.add('hiding')");
-const UPDATE_SRC = extractFunction(dashboardHTML, 'updateUploaderEnforcement', "startsWith('https://')");
+const UPDATE_SRC = extractFunction(dashboardHTML, 'updateUploaderEnforcement', 'offerRefusalCase(error)');
+const REFUSAL_SRC = extractFunction(dashboardHTML, 'moderationRefusal', 'failure.caseUrl');
+const OFFER_CASE_SRC = extractFunction(dashboardHTML, 'offerRefusalCase', "startsWith('https://')");
 
 // workerd blocks the AsyncFunction constructor, but `new Function` is allowed and
-// its generated body may declare an async function the ordinary way. The three
-// sources are dropped into one scope so the handler calls the page's real toast.
+// its generated body may declare an async function the ordinary way. The
+// sources are dropped into one scope so the handler calls the page's real
+// refusal helpers and toast.
 const mintDashboardFns = new Function('ctx', `
   const {
     document, window, fetch, setTimeout, console,
@@ -111,6 +37,8 @@ const mintDashboardFns = new Function('ctx', `
   let currentToast = null;
   ${SHOW_TOAST_SRC}
   ${HIDE_TOAST_SRC}
+  ${REFUSAL_SRC}
+  ${OFFER_CASE_SRC}
   ${UPDATE_SRC}
   return { showToast, updateUploaderEnforcement };
 `);
@@ -418,5 +346,151 @@ describe('dashboard toast action button', () => {
     harness.showToast('Saved', null, 5000);
 
     expect(toastAction(latestToast(harness))).toBeNull();
+  });
+});
+
+// The page's five ways of writing a media decision. Each can be a lift, which
+// relay manager refuses while the file's owner has an open age review (#231).
+const MARK_SAFE_SRC = extractFunction(dashboardHTML, 'markAsSafe', "action: 'SAFE'");
+const LOOKUP_ACTION_SRC = extractFunction(dashboardHTML, 'lookupModerationAction', 'Direct lookup moderation action');
+const QUICK_ACTION_SRC = extractFunction(dashboardHTML, 'quickAction', 'Quick action:');
+const UNDO_SRC = extractFunction(dashboardHTML, 'undoLastAction', 'Undo: reverted to');
+const SAVE_EDITS_SRC = extractFunction(dashboardHTML, 'saveEdits', 'Manual score override by moderator');
+
+const mintDecisionFns = new Function('ctx', `
+  const {
+    document, window, fetch, setTimeout, console, alert, setLookupStatus,
+    getVideoBySha, refreshLookupResultIfMatches, removeLookupResultIfMatches,
+    isFocusedLookupResult, loadRealStats, showHeaderUndo, clearUndo, applyFilters,
+    closeEditModal, loadVideos, lookupVideo, allVideos, paginationState
+  } = ctx;
+  let currentToast = null;
+  let lastAction = ctx.lastAction;
+  let currentEditingSha256 = ctx.currentEditingSha256;
+  let currentLookupSha = null;
+  ${SHOW_TOAST_SRC}
+  ${HIDE_TOAST_SRC}
+  ${REFUSAL_SRC}
+  ${OFFER_CASE_SRC}
+  ${MARK_SAFE_SRC}
+  ${LOOKUP_ACTION_SRC}
+  ${QUICK_ACTION_SRC}
+  ${UNDO_SRC}
+  ${SAVE_EDITS_SRC}
+  return { markAsSafe, lookupModerationAction, quickAction, undoLastAction, saveEdits };
+`);
+
+const SHA = 'ab'.repeat(32);
+const LIFT_BLOCK = 'The account that owns this file has an open age review.';
+
+function createDecisionHarness(response) {
+  const harness = createHarness({ response });
+  const alerts = [];
+  const video = { sha256: SHA, action: 'AGE_RESTRICTED', cdnUrl: 'https://media.test/v.mp4', uploaded_by: PUBKEY };
+  const elements = {
+    'edit-action': { value: 'SAFE' },
+    'edit-reason': { value: '' },
+    'filter-action': { value: 'TRIAGE' }
+  };
+  const ctx = {
+    document: {
+      createElement: createNode,
+      body: harness.body,
+      querySelectorAll: () => [],
+      getElementById: (id) => elements[id] ?? null
+    },
+    window: { open: (...args) => { harness.opened.push(args); } },
+    console: { error: () => {}, log: () => {} },
+    setTimeout: (fn, delay) => { harness.timers.push({ fn, delay }); return harness.timers.length; },
+    alert: (message) => { alerts.push(message); },
+    setLookupStatus: (message, isError = false) => { harness.statusLines.push({ message, isError }); },
+    getVideoBySha: () => video,
+    refreshLookupResultIfMatches: async () => false,
+    removeLookupResultIfMatches: () => {},
+    isFocusedLookupResult: () => false,
+    loadRealStats: () => {},
+    showHeaderUndo: () => {},
+    clearUndo: () => {},
+    applyFilters: () => {},
+    closeEditModal: () => {},
+    loadVideos: async () => {},
+    lookupVideo: async () => {},
+    allVideos: [video],
+    paginationState: { currentCursor: null },
+    lastAction: { sha256: SHA, previousAction: 'SAFE', previousData: video },
+    currentEditingSha256: SHA,
+    fetch: async (url, init) => {
+      harness.fetchCalls.push({ url, init });
+      return {
+        ok: response.status >= 200 && response.status < 300,
+        status: response.status,
+        json: async () => response.body
+      };
+    }
+  };
+  return { ...harness, ...mintDecisionFns(ctx), alerts };
+}
+
+function button() {
+  const node = createNode('button');
+  node.innerHTML = 'Approve';
+  node.closest = () => null;
+  return node;
+}
+
+const DECISIONS = [
+  ['markAsSafe', (h) => h.markAsSafe(SHA, button())],
+  ['lookupModerationAction', (h) => h.lookupModerationAction(SHA, 'SAFE', button())],
+  ['quickAction', (h) => h.quickAction(SHA, 'SAFE')],
+  ['undoLastAction', (h) => h.undoLastAction()],
+  ['saveEdits', (h) => h.saveEdits()]
+];
+
+describe('dashboard media decisions refused by the lift check', () => {
+  it.each(DECISIONS)('%s offers the case when the lift is refused', async (_name, run) => {
+    const harness = createDecisionHarness({
+      status: 409,
+      body: {
+        success: false,
+        error: LIFT_BLOCK,
+        code: 'age_review_active',
+        caseId: CASE_ID,
+        state: 'open_reported',
+        caseUrl: CASE_URL
+      }
+    });
+
+    await run(harness);
+
+    expect(harness.fetchCalls[0].url).toBe(`/admin/api/moderate/${SHA}`);
+    const toast = latestToast(harness);
+    expect(toastText(toast)).toBe(`${LIFT_BLOCK} (case ${CASE_ID})`);
+    const action = toastAction(toast);
+    expect(action.textContent).toBe('Open case');
+    action.onclick();
+    expect(harness.opened).toEqual([[CASE_URL, '_blank', 'noopener']]);
+    expect(harness.alerts).toEqual([]);
+  });
+
+  it.each(DECISIONS)('%s says why when a refusal names no case', async (_name, run) => {
+    const harness = createDecisionHarness({
+      status: 502,
+      body: {
+        success: false,
+        error: 'Could not confirm with relay manager that this file may be made more visible; refusing',
+        code: 'lift_check_unavailable'
+      }
+    });
+
+    await run(harness);
+
+    const said = [
+      ...harness.alerts,
+      ...harness.statusLines.map((line) => line.message),
+      ...harness.toasts.map(toastText)
+    ];
+    expect(said.some((text) => text?.includes('Could not confirm with relay manager'))).toBe(true);
+    expect(harness.opened).toEqual([]);
+    expect(harness.toasts.map(toastAction).filter(Boolean)).toEqual([]);
   });
 });

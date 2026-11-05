@@ -3370,6 +3370,10 @@
             loadRealStats();
           }, 500);
         } else {
+          const failure = await moderationRefusal(response);
+          if (!offerRefusalCase(failure)) {
+            showToast(`Approve failed: ${failure.message}`, null, 5000);
+          }
           button.innerHTML = '❌ Failed';
           setTimeout(() => {
             button.innerHTML = originalText;
@@ -3404,8 +3408,7 @@
         });
 
         if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.error || `HTTP ${response.status}`);
+          throw await moderationRefusal(response);
         }
 
         loadRealStats();
@@ -3431,8 +3434,46 @@
       } catch (error) {
         button.innerHTML = originalText;
         button.disabled = false;
-        setLookupStatus(`Action failed: ${error.message}`, true);
+        if (!offerRefusalCase(error)) {
+          setLookupStatus(`Action failed: ${error.message}`, true);
+        }
       }
+    }
+
+    // A refused call, as an Error that carries the refusal's case. An un-ban
+    // of an account under age review, or a lift over one of its files (#231),
+    // comes back as a 409 naming the case that has to be resolved first.
+    async function moderationRefusal(response) {
+      const data = await response.json().catch(() => ({}));
+      const failure = new Error(data.error || `HTTP ${response.status}`);
+      failure.caseId = data.caseId || null;
+      failure.caseUrl = data.caseUrl || null;
+      return failure;
+    }
+
+    // An age-review block is a refusal that names where to go next, not a
+    // dead end. Offer the case instead of a bare red error, which is what
+    // makes the hold actionable rather than looking broken. Returns whether it
+    // did, so the caller can fall back to its own error otherwise.
+    // Only follow an https link: this arrives over the wire and is handed
+    // to window.open, so a javascript:/data: scheme must never be openable.
+    function offerRefusalCase(error) {
+      const caseUrl = typeof error?.caseUrl === 'string' && error.caseUrl.startsWith('https://')
+        ? error.caseUrl
+        : null;
+      if (!caseUrl) {
+        return false;
+      }
+      // caseUrl is only built when caseId survived validation, so in
+      // practice the id is always here. Kept as a ternary because the two
+      // fields arrive as independent keys off the wire, and a link with no
+      // id printed is still worth offering.
+      const blockedMessage = error.caseId
+        ? `${error.message} (case ${error.caseId})`
+        : error.message;
+      showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
+      setLookupStatus(blockedMessage, true);
+      return true;
     }
 
     async function updateUploaderEnforcement(pubkey, payload, button, successMessage) {
@@ -3447,15 +3488,8 @@
           body: JSON.stringify(payload)
         });
 
-        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          const failure = new Error(data.error || `HTTP ${response.status}`);
-          // Carry the structured refusal through the throw. An un-ban of an
-          // account under age review comes back as a 409 naming the case that
-          // has to be resolved first, and the catch below routes to it.
-          failure.caseId = data.caseId || null;
-          failure.caseUrl = data.caseUrl || null;
-          throw failure;
+          throw await moderationRefusal(response);
         }
 
         // Confirm success immediately (before the slower list refresh) so the
@@ -3481,26 +3515,9 @@
         button.innerHTML = originalText;
         button.disabled = false;
 
-        // An age-review block is a refusal that names where to go next, not a
-        // dead end. Offer the case instead of a bare red toast, which is what
-        // makes the enforcement hold actionable rather than looking broken.
-        // Only follow an https link: this arrives over the wire and is handed
-        // to window.open, so a javascript:/data: scheme must never be openable.
-        // Anything else falls through to the plain toast below, which carries
-        // the refusal message but not the case id.
-        const caseUrl = typeof error.caseUrl === 'string' && error.caseUrl.startsWith('https://')
-          ? error.caseUrl
-          : null;
-        if (caseUrl) {
-          // caseUrl is only built when caseId survived validation, so in
-          // practice the id is always here. Kept as a ternary because the two
-          // fields arrive as independent keys off the wire, and a link with no
-          // id printed is still worth offering.
-          const blockedMessage = error.caseId
-            ? `${error.message} (case ${error.caseId})`
-            : error.message;
-          showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
-          setLookupStatus(blockedMessage, true);
+        // Anything but a case to open falls through to the plain toast below,
+        // which carries the refusal message but not the case id.
+        if (offerRefusalCase(error)) {
           return;
         }
 
@@ -5120,7 +5137,7 @@
         });
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw await moderationRefusal(response);
         }
 
         const result = await response.json();
@@ -5171,7 +5188,9 @@
           card.style.opacity = '1';
           card.style.pointerEvents = 'auto';
         });
-        alert('Failed to update: ' + error.message);
+        if (!offerRefusalCase(error)) {
+          alert('Failed to update: ' + error.message);
+        }
       }
     }
 
@@ -5217,6 +5236,12 @@
             applyFilters();
           }
           loadRealStats();
+        } else {
+          // An Undo back to SAFE or AGE_RESTRICTED is a lift, and can be refused.
+          const failure = await moderationRefusal(response);
+          if (!offerRefusalCase(failure)) {
+            alert('Undo failed: ' + failure.message);
+          }
         }
       } catch (err) {
         console.error('Undo failed:', err);
@@ -5343,7 +5368,7 @@
         });
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw await moderationRefusal(response);
         }
 
         const result = await response.json();
@@ -5359,7 +5384,9 @@
         alert('Successfully updated scores and action');
       } catch (error) {
         console.error('Failed to update:', error);
-        alert('Failed to update: ' + error.message);
+        if (!offerRefusalCase(error)) {
+          alert('Failed to update: ' + error.message);
+        }
       }
     }
 
