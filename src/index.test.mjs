@@ -58,6 +58,19 @@ import worker from './index.mjs';
 
 const SHA256 = 'a'.repeat(64);
 
+// relay manager's lift check, allowing every lift: a SAFE or AGE_RESTRICTED on
+// /admin/api/moderate asks it first (#231). Its refusals are covered in
+// admin-moderate-lift-check.test.mjs.
+const ALLOW_MEDIA_LIFTS = {
+  RELAY_ADMIN_API_KEY: 'test-relay-admin-key',
+  RELAY_ADMIN: {
+    async fetch(_url, init) {
+      const { sha256 } = JSON.parse(init.body);
+      return Response.json({ success: true, allowed: true, checked: true, sha256: sha256.toLowerCase() });
+    }
+  }
+};
+
 function createDbMock({
   moderationResults = new Map(),
   moderationListRows = [],
@@ -2473,6 +2486,7 @@ describe('notifyBlossom integration via admin moderate endpoint', () => {
         async list() { return { keys: [], list_complete: true, cursor: null }; }
       },
       MODERATION_QUEUE: { async send() {} },
+      ...ALLOW_MEDIA_LIFTS,
     };
 
     const origFetch = globalThis.fetch;
@@ -5546,6 +5560,7 @@ describe('POST /admin/api/moderate/:sha256', () => {
     const kvStore = new Map();
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
+      ...ALLOW_MEDIA_LIFTS,
       MODERATION_KV: {
         store: kvStore,
         async get(key) { return kvStore.get(key) ?? null; },
@@ -5590,6 +5605,7 @@ describe('POST /admin/api/moderate/:sha256', () => {
 
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
+      ...ALLOW_MEDIA_LIFTS,
       BLOSSOM_DB: {
         prepare(sql) {
           let bindings = [];
@@ -5658,6 +5674,7 @@ describe('POST /admin/api/moderate/:sha256', () => {
     const kvStore = new Map();
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
+      ...ALLOW_MEDIA_LIFTS,
       BLOSSOM_DB: createDbMock({
         moderationResults: new Map([[sha, {
           sha256: sha,
@@ -5724,6 +5741,7 @@ describe('POST /admin/api/verify-category/:sha256', () => {
         async list() { return { keys: [], list_complete: true, cursor: null }; }
       },
       MODERATION_QUEUE: { async send() {} },
+      ...ALLOW_MEDIA_LIFTS,
       ...overrides
     };
   }

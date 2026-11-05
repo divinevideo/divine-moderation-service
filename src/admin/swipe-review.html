@@ -1695,7 +1695,7 @@
         });
 
         if (!response.ok) {
-          throw new Error('HTTP ' + response.status);
+          throw await moderationRefusal(response);
         }
 
         reviewedCount++;
@@ -1723,6 +1723,12 @@
               reviewedSha256s.delete(sha256);
               showCurrentVideo();
               showToast('Action undone', null, 2000);
+            } else {
+              // An Undo back to SAFE or AGE_RESTRICTED is a lift, and can be refused.
+              const failure = await moderationRefusal(undoResponse);
+              if (!offerRefusalCase(failure)) {
+                showToast('Undo failed: ' + failure.message, null, 3000);
+              }
             }
           } catch (err) {
             console.error('Undo failed:', err);
@@ -1735,8 +1741,42 @@
 
       } catch (error) {
         console.error('Failed to update action:', error);
-        showToast('Failed to update: ' + error.message, null, 3000);
+        // A swipe fades the card out before the decision is sent. It did not
+        // happen, so draw the same card again.
+        showCurrentVideo();
+        if (!offerRefusalCase(error)) {
+          showToast('Failed to update: ' + error.message, null, 3000);
+        }
       }
+    }
+
+    // A refused call, as an Error that carries the refusal's case. A lift over
+    // a file whose owner is under age review comes back as a 409 naming the
+    // case that has to be resolved first (#231).
+    async function moderationRefusal(response) {
+      const data = await response.json().catch(() => ({}));
+      const failure = new Error(data.error || 'HTTP ' + response.status);
+      failure.caseId = data.caseId || null;
+      failure.caseUrl = data.caseUrl || null;
+      return failure;
+    }
+
+    // Offer the case a refusal names instead of a bare error, so the hold is
+    // something to act on rather than a dead end. Returns whether it did.
+    // Only follow an https link: this arrives over the wire and is handed to
+    // window.open, so a javascript:/data: scheme must never be openable.
+    function offerRefusalCase(error) {
+      const caseUrl = typeof error?.caseUrl === 'string' && error.caseUrl.startsWith('https://')
+        ? error.caseUrl
+        : null;
+      if (!caseUrl) {
+        return false;
+      }
+      const blockedMessage = error.caseId
+        ? error.message + ' (case ' + error.caseId + ')'
+        : error.message;
+      showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
+      return true;
     }
 
     function skipVideo() {
@@ -1777,7 +1817,7 @@
       }
     });
 
-    function showToast(message, onUndo = null, duration = 5000) {
+    function showToast(message, onUndo = null, duration = 5000, actionLabel = 'Undo') {
       if (currentToast) {
         currentToast.remove();
       }
@@ -1793,7 +1833,7 @@
       if (onUndo) {
         const undoBtn = document.createElement('button');
         undoBtn.className = 'toast-undo';
-        undoBtn.textContent = 'Undo';
+        undoBtn.textContent = actionLabel;
         undoBtn.onclick = () => {
           onUndo();
           hideToast(toast);
