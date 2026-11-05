@@ -1741,6 +1741,9 @@
 
       } catch (error) {
         console.error('Failed to update action:', error);
+        // A swipe fades the card out before the decision is sent. It did not
+        // happen, so draw the same card again.
+        showCurrentVideo();
         if (!offerRefusalCase(error)) {
           showToast('Failed to update: ' + error.message, null, 3000);
         }

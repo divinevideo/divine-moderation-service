@@ -41,6 +41,7 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED') {
   const toasts = [];
   const opened = [];
   const fetches = [];
+  let renders = 0;
   const body = node('body');
   body.appendChild = (child) => { toasts.push(child); return child; };
   const fns = mintSwipeFns({
@@ -50,7 +51,7 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED') {
     console: { error: () => {}, log: () => {} },
     reviewQueue: [{ sha256: SHA, action: previousAction, isUntriaged: false }],
     reviewedSha256s: new Set(),
-    showCurrentVideo: () => {},
+    showCurrentVideo: () => { renders += 1; },
     fetch: async (url, init) => {
       fetches.push({ url, body: JSON.parse(init.body) });
       const response = responses.shift();
@@ -64,7 +65,7 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED') {
   const latest = () => toasts[toasts.length - 1];
   const text = (toast) => toast.children.find((c) => c.className === 'toast-message')?.textContent;
   const button = (toast) => toast.children.find((c) => c.className === 'toast-undo') ?? null;
-  return { ...fns, toasts, opened, fetches, latest, text, button };
+  return { ...fns, toasts, opened, fetches, latest, text, button, renders: () => renders };
 }
 
 const REFUSED = {
@@ -85,6 +86,8 @@ describe('swipe review media decisions refused by the lift check', () => {
     action.onclick();
     expect(h.opened).toEqual([[CASE_URL, '_blank', 'noopener']]);
     expect(h.state()).toEqual({ currentIndex: 0, reviewedCount: 0 });
+    // The swipe left the card faded out; drawing it again brings it back.
+    expect(h.renders()).toBe(1);
   });
 
   it('offers the case when an Undo back to a lift is refused', async () => {
@@ -98,6 +101,20 @@ describe('swipe review media decisions refused by the lift check', () => {
     expect(h.fetches[1].body.action).toBe('SAFE');
     expect(h.text(h.latest())).toBe(`${LIFT_BLOCK} (case ${CASE_ID})`);
     expect(h.button(h.latest()).textContent).toBe('Open case');
+  });
+
+  it('says why when an Undo is refused without a case', async () => {
+    const h = swipeHarness([
+      { status: 200, body: { success: true } },
+      { status: 502, body: { success: false, error: 'Could not confirm with relay manager', code: 'lift_check_unavailable' } }
+    ], 'SAFE');
+
+    await h.handleAction(SHA, 'PERMANENT_BAN');
+    h.button(h.latest()).onclick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(h.text(h.latest())).toBe('Undo failed: Could not confirm with relay manager');
+    expect(h.button(h.latest())).toBeNull();
   });
 
   it('says why when a refusal names no case', async () => {

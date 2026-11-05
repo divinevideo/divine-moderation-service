@@ -830,13 +830,14 @@ async function resolveSecret(binding) {
 }
 
 async function callRelayAdminAction(env, payload) {
-  return postToRelayAdmin(env, '/api/relay-rpc', relayRpcForAction(payload));
+  const { data } = await postToRelayAdmin(env, '/api/relay-rpc', relayRpcForAction(payload));
+  return data;
 }
 
-// One POST to relay-admin: its data on success, a RelayAdminError on a
-// refusal, and a plain Error when it cannot be reached. Shared by the ban RPCs
-// above and the media lift check (#231) so both use the same transport, key
-// and timeout.
+// One POST to relay-admin: its status and data on success, a RelayAdminError
+// on a refusal, and a plain Error when it cannot be reached. Shared by the ban
+// RPCs above and the media lift check (#231) so both use the same transport,
+// key and timeout. The timeout covers the response headers, not its body.
 async function postToRelayAdmin(env, path, body) {
   const url = `${getRelayAdminUrl(env)}${path}`;
 
@@ -913,7 +914,7 @@ async function postToRelayAdmin(env, path, body) {
     });
   }
 
-  return data;
+  return { status: response.status, data };
 }
 
 // Turn a relay-admin failure into a response a caller can route on.
@@ -1003,23 +1004,40 @@ function liftCheckFailureResponse(error, env) {
 
 // Ask relay manager whether `action` may go ahead on this file. Returns the
 // lowercase hash it checked, which is the one to write, or the Response to send
-// instead. Fails closed: anything short of a checked allow naming this file is
-// a refusal. Check-then-act, as on relay manager's own route: a case opened
-// between the check and the write is not seen.
+// instead. Fails closed: anything short of a 200 checked allow naming this
+// file, within the deadline, is a refusal. Check-then-act, as on relay
+// manager's own route: a case opened between the check and the write is not
+// seen.
 async function checkMediaLift(env, sha256, action) {
   if (!isValidSha256(sha256)) {
     return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
   }
 
+  // postToRelayAdmin's own timeout stops at the headers. A write must not wait
+  // on a body that never finishes, or go ahead on one that arrives late, so the
+  // whole answer has one deadline. The abandoned call's result is ignored.
+  const call = postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action });
+  call.catch(() => {});
+  let timeoutId;
+  const deadline = new Promise((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new Error(`Lift check did not answer within ${RELAY_ADMIN_TIMEOUT_MS / 1000}s`)),
+      RELAY_ADMIN_TIMEOUT_MS
+    );
+  });
+
+  let status;
   let data;
   try {
-    data = await postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action });
+    ({ status, data } = await Promise.race([call, deadline]));
   } catch (error) {
     return liftCheckFailureResponse(error, env);
+  } finally {
+    clearTimeout(timeoutId);
   }
 
-  if (data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256.toLowerCase()) {
-    return liftCheckUnavailable(new Error(`Unexpected lift check answer: ${JSON.stringify(data)}`));
+  if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256.toLowerCase()) {
+    return liftCheckUnavailable(new Error(`Unexpected lift check answer: HTTP ${status} ${JSON.stringify(data)}`));
   }
   return { sha256: data.sha256 };
 }

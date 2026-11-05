@@ -208,7 +208,8 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
     ['a 200 that does not allow', () => Response.json({ success: true, allowed: false, checked: true, sha256: SHA })],
     ['a 200 that did not check', () => Response.json({ success: true, allowed: true, checked: false, sha256: SHA })],
     ['a 200 naming another file', () => Response.json({ success: true, allowed: true, checked: true, sha256: 'cd'.repeat(32) })],
-    ['a 200 that is not JSON', () => new Response('ok', { status: 200 })]
+    ['a 200 that is not JSON', () => new Response('ok', { status: 200 })],
+    ['a 202 that allows', () => Response.json({ success: true, allowed: true, checked: true, sha256: SHA }, { status: 202 })]
   ])('refuses on %s', async (_label, answer) => {
     liftAnswer = answer;
 
@@ -217,6 +218,43 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
     expect(response.status).toBe(502);
     expect(await response.json()).toMatchObject({ success: false, code: 'lift_check_unavailable' });
     expectNoWrites();
+  });
+
+  // A refusal is passed through only as relay manager sends it. A known code
+  // under another status is not one of its answers, so it is "could not ask".
+  it.each([
+    ['age_review_active', 503],
+    ['media_record_missing', 503],
+    ['owner_unreadable', 409],
+    ['state_unreadable', 500]
+  ])('treats %s at %i as no answer', async (code, status) => {
+    liftAnswer = () => Response.json({ success: false, error: 'refused', code, caseId: CASE_ID }, { status });
+
+    const response = await moderate(SHA, { action: 'SAFE' });
+
+    expect(response.status).toBe(502);
+    expect(await response.json()).toMatchObject({ success: false, code: 'lift_check_unavailable' });
+    expectNoWrites();
+  });
+
+  it('refuses when the answer does not finish arriving in time', async () => {
+    vi.useFakeTimers();
+    try {
+      // Headers arrive, the body never does.
+      liftAnswer = () => new Response(new ReadableStream({ start() {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      });
+
+      const pending = moderate(SHA, { action: 'SAFE' });
+      await vi.advanceTimersByTimeAsync(15001);
+      const response = await pending;
+
+      expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({ success: false, code: 'lift_check_unavailable' });
+      expectNoWrites();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('refuses without asking when the path does not name a sha256', async () => {
