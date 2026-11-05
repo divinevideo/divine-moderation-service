@@ -8,7 +8,8 @@ import { getPublicKey, finalizeEvent, verifyEvent } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import * as nip44 from 'nostr-tools/nip44';
 import { makeAuthEvent } from 'nostr-tools/nip42';
-import { computeConversationId, findDmByNostrEventId, logDm } from './dm-store.mjs';
+import { computeConversationId, ensureDmLogExcerptColumn, findDmByNostrEventId, logDm } from './dm-store.mjs';
+import { hasUnverifiedExcerptTag, splitUnverifiedExcerpt } from './dm-evidence.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
 import { findReportByReporter, initReportsTable } from '../reports.mjs';
@@ -151,9 +152,12 @@ export async function syncInbox(env) {
   // runs from the cron trigger too, which never touches it. Without this, the
   // first tick after a deploy could reach a user_reports table that has no
   // `source` column yet and drop every report it decrypted -- processRumor
-  // catches the write failure and moves on.
+  // catches the write failure and moves on. The same goes for dm_log's
+  // unverified_excerpt column: without it, a report that includes a message
+  // would fail to log at all.
   if (env.BLOSSOM_DB) {
     await initReportsTable(env.BLOSSOM_DB);
+    await ensureDmLogExcerptColumn(env.BLOSSOM_DB);
   }
 
   // Get last sync timestamp from KV
@@ -345,6 +349,27 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
     console.warn(`[DM-READER] Ignoring invalid sha256 tag on report DM ${giftWrapId}`);
   }
 
+  // A reporter may include the direct message they are reporting
+  // (divine-mobile#7340). It is unverified -- the rumor is unsigned, so it is
+  // what the reporter's app showed -- and is split off into its own field so
+  // the admin Messages UI can say so instead of rendering it as the
+  // reporter's words. Only the tag marks one (the heading alone is text anyone
+  // can type), and only an incoming report has a reporter it came from.
+  // Everything below uses `reporterContent`: the excerpt never reaches
+  // user_reports or moderation_results, the records automated enforcement
+  // reads, and so lives only in dm_log, which has a decided one-year retention
+  // that user_reports lacks (the sweep waits on DM_LOG_RETENTION_ENABLED; see
+  // docs/trust-safety-report.md).
+  const isReport = Boolean(relatedSha256 || hasReportTag);
+  const claimsExcerpt = isReport && !isOutgoing && hasUnverifiedExcerptTag(rumorTags);
+  const excerptSplit = claimsExcerpt ? splitUnverifiedExcerpt(content) : null;
+  // Warn on first sight only: the two-day re-poll overlap would otherwise
+  // repeat it every tick.
+  if (claimsExcerpt && !excerptSplit && !alreadyLogged) {
+    console.warn(`[DM-READER] Report DM ${giftWrapId} is tagged with an included message but has no excerpt section; storing it whole`);
+  }
+  const reporterContent = excerptSplit ? excerptSplit.note : content;
+
   // user_reports.sha256 is NOT NULL (it exists to count distinct
   // reporters per piece of content for escalation policy -- see
   // reports.mjs), so this can only ever fire when a sha256 tag is
@@ -378,7 +403,7 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
           sha256: relatedSha256,
           reporterPubkey: senderPubkey,
           reportType,
-          reason: content,
+          reason: reporterContent,
           source: 'dm-report',
           reportedAt: resolveReportedAt(createdAt),
         });
@@ -403,7 +428,7 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // sha256 alone would render a user report or a DM-message report as an
   // ordinary reply in the admin Messages UI, which is a display gap rather
   // than the deliberate user_reports non-goal above.
-  const messageType = (relatedSha256 || hasReportTag)
+  const messageType = isReport
     ? 'conversation_report'
     : (isOutgoing ? 'moderator_reply' : 'creator_reply');
   const result = await logDm(env.BLOSSOM_DB, {
@@ -411,7 +436,8 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
     nostrEventId: giftWrapId,
     senderPubkey,
     recipientPubkey,
-    content,
+    content: reporterContent,
+    unverifiedExcerpt: excerptSplit?.excerpt ?? null,
     direction,
     messageType,
     sha256: relatedSha256

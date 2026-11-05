@@ -22,14 +22,23 @@ const SHA256 = 'b'.repeat(64);
 
 // Byte-for-byte what ContentReportingService.moderationDmTags() produces,
 // after dm_repository.sendMessage -> nip17_message_service.buildRumor
-// prepends the ['p', recipient] tag.
-function mobileReportDmTags({ nip32Label, nip56Type, sha256 }) {
+// prepends the ['p', recipient] tag. reportContent appends
+// unverifiedExcerptTag last when the reporter includes the reported message
+// (divine-mobile#7340).
+function mobileReportDmTags({ nip32Label, nip56Type, sha256, includesMessage = false }) {
   return [
     ['L', 'social.nos.ontology'],
     ['l', nip32Label, 'social.nos.ontology'],
     ['report_type', nip56Type],
     ...(sha256 ? [['sha256', sha256]] : []),
+    ...(includesMessage ? [['evidence', 'unverified_excerpt']] : []),
   ];
+}
+
+// ContentReportingService._moderationDmContent: the report body, then the
+// included message under its heading.
+function mobileDmContentWithMessage(body, message) {
+  return `${body}\n\nUnverified message excerpt provided by the reporter:\n${message}`;
 }
 
 describe('divine-mobile#6593 cross-repo contract', () => {
@@ -253,6 +262,87 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     expect(dm.message_type).toBe('conversation_report');
     const report = await db.prepare('SELECT * FROM user_reports').first();
     expect(report).toBeFalsy(); // user_reports.sha256 is NOT NULL — by design
+  });
+
+  // divine-mobile#7340: a report made from a direct message may include that
+  // message. ReportSubmissionCubit builds the body with the 'DM Message
+  // Report' / 'Message ID' labels from ReportContentDialog.showForMessage,
+  // then names the sender, since a private report has no other channel that
+  // does.
+  it('a DM-message report that includes the message stores it as its own unverified field', async () => {
+    const note = 'DM Message Report\nReason: Harassment\nMessage ID: ' + 'd'.repeat(64)
+      + '\nSender Pubkey: ' + 'e'.repeat(64)
+      + '\nDetails: keeps messaging me';
+    const message = 'you will regret this\nsee you soon';
+
+    const { rumor, outcome } = await roundTrip(
+      mobileReportDmTags({
+        nip32Label: 'NS-harassment',
+        nip56Type: 'profanity', // contentFilterReasonToNip56Type(harassment)
+        sha256: null, // a direct message has no blob
+        includesMessage: true,
+      }),
+      mobileDmContentWithMessage(note, message),
+      'gw-dm-excerpt',
+    );
+
+    // The tag order divine-mobile sends, pinned.
+    expect(rumor.tags).toEqual([
+      ['p', moderatorPubkey],
+      ['L', 'social.nos.ontology'],
+      ['l', 'NS-harassment', 'social.nos.ontology'],
+      ['report_type', 'profanity'],
+      ['evidence', 'unverified_excerpt'],
+    ]);
+    expect(outcome).toBe('synced');
+
+    const dm = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dm.message_type).toBe('conversation_report');
+    expect(dm.content).toBe(note);
+    expect(dm.unverified_excerpt).toBe(message);
+    expect(await db.prepare('SELECT * FROM user_reports').first()).toBeFalsy();
+  });
+
+  // The excerpt is whatever the reporter's app decrypted: a NIP-17 rumor is
+  // unsigned, so it proves nothing about what was sent. Today a DM-message
+  // report names no blob and so never reaches the report path at all. This
+  // pins the case where one does: the report still lands for review, but the
+  // excerpt stays out of every record automated enforcement reads, and two
+  // such reports do not escalate.
+  it('an included message never reaches automated enforcement, even on a report that names a blob', async () => {
+    const message = 'this is definitely what they sent';
+    const secondReporterSk = generateSecretKey();
+
+    for (const [i, sk] of [reporterSk, secondReporterSk].entries()) {
+      await roundTrip(
+        mobileReportDmTags({
+          nip32Label: 'NS-sexualContent',
+          nip56Type: 'nudity',
+          sha256: SHA256,
+          includesMessage: true,
+        }),
+        mobileDmContentWithMessage(
+          'Content Report\nReason: Sexual Content\nEvent: ' + 'e'.repeat(64),
+          message,
+        ),
+        `gw-excerpt-enforcement-${i}`,
+        sk,
+      );
+    }
+
+    const reports = await db.prepare('SELECT * FROM user_reports').all();
+    expect(reports.results).toHaveLength(2);
+    for (const report of reports.results) {
+      expect(report.reason).not.toContain(message);
+    }
+
+    const moderation = await db.prepare('SELECT * FROM moderation_results').first();
+    expect(moderation.action).toBe('REVIEW');
+    expect(moderation.raw_response).not.toContain(message);
+
+    // Moderators still have it, in the DM, labelled.
+    const dms = await db.prepare('SELECT unverified_excerpt FROM dm_log').all();
+    expect(dms.results.map((row) => row.unverified_excerpt)).toEqual([message, message]);
   });
 
   it('the DM and the kind-1984 poller agree, so INSERT OR IGNORE cannot mis-pin', async () => {

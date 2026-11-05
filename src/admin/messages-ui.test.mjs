@@ -307,3 +307,71 @@ describe('messages UI — failed load-more recovery (#207)', () => {
     expect(messagesHTML).toMatch(/conversationsOffset \+= page\.length;\s*\n\s*conversationsError = false;/);
   });
 });
+
+// divine-mobile#7340: a reporter can include the direct message they are
+// reporting. The reader stores it as dm_log.unverified_excerpt, apart from the
+// reporter's note; the UI must say where it came from and that it is unverified.
+describe('messages UI — reporter-included message', () => {
+  it('renders the excerpt under its provenance, routed through escapeHtml', () => {
+    // escapeHtml needs a DOM, so stand in a marker that proves the excerpt
+    // went through it rather than straight into innerHTML.
+    globalThis.escapeHtml = (s) => `[escaped:${s}]`;
+    try {
+      const unverifiedExcerptHtml = extractFunction(messagesHTML, 'unverifiedExcerptHtml');
+      const html = unverifiedExcerptHtml('<img src=x onerror=alert(1)>');
+
+      expect(html).toContain('[escaped:<img src=x onerror=alert(1)>]');
+      expect(html.replace('[escaped:<img src=x onerror=alert(1)>]', '')).not.toContain('<img');
+      expect(html).toContain('Unverified message excerpt');
+      expect(html).toContain('Provided by the reporter');
+      // Who sent the message is the reporter's claim as much as its text, and
+      // the sender and message ID lines in their note carry no label of their
+      // own, so the note has to cover them too.
+      expect(html).toContain('like the sender and message ID in their note');
+      expect(html).toContain('not proof of what was sent or who sent it');
+      // The sender does sign the NIP-17 seal, but the reporter doesn't forward
+      // it: what reaches us is the unsigned message and the reporter's word.
+      expect(html).toContain('Nothing in this report is signed by the sender');
+      expect(html).not.toContain('are not signed');
+    } finally {
+      delete globalThis.escapeHtml;
+    }
+  });
+
+  // Runs the shipped createMessageBubble with the page helpers it calls
+  // stood in, so the excerpt branch is exercised for every shape a row can
+  // take: a value, null (a row from before this change, once the column
+  // exists), missing (a table the column has not been added to yet), or empty.
+  it('adds the excerpt block to a message bubble only when the row has one', () => {
+    const stubs = {
+      document: { createElement: () => ({ className: '', innerHTML: '' }) },
+      escapeHtml: (s) => String(s ?? ''),
+      relativeTime: () => 'just now',
+      badgeLabel: (t) => t,
+    };
+    try {
+      Object.assign(globalThis, stubs);
+      globalThis.unverifiedExcerptHtml = extractFunction(messagesHTML, 'unverifiedExcerptHtml');
+      const createMessageBubble = extractFunction(messagesHTML, 'createMessageBubble');
+      const bubble = (extra) => createMessageBubble({
+        direction: 'incoming',
+        content: 'DM Message Report',
+        message_type: 'conversation_report',
+        created_at: '2026-11-04 12:00:00',
+        ...extra,
+      }).innerHTML;
+
+      expect(bubble({ unverified_excerpt: 'you will regret this' })).toContain('unverified-excerpt');
+      expect(bubble({ unverified_excerpt: 'you will regret this' })).toContain('you will regret this');
+      expect(bubble({ unverified_excerpt: null })).not.toContain('unverified-excerpt');
+      expect(bubble({})).not.toContain('unverified-excerpt');
+      expect(bubble({ unverified_excerpt: '' })).not.toContain('unverified-excerpt');
+    } finally {
+      for (const key of [...Object.keys(stubs), 'unverifiedExcerptHtml']) delete globalThis[key];
+    }
+  });
+
+  it('keeps the excerpt\'s own line breaks', () => {
+    expect(messagesHTML).toMatch(/\.unverified-excerpt-text\s*\{[^}]*white-space:\s*pre-wrap/);
+  });
+});

@@ -373,6 +373,33 @@
       background: rgba(255,255,255,0.15);
     }
 
+    /* A message the reporter chose to include in a DM report. Set apart from
+       the reporter's own note so it never reads as their words or as proof. */
+    .unverified-excerpt {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-left: 3px solid #f59e0b;
+      border-radius: 4px;
+      background: rgba(245, 158, 11, 0.08);
+    }
+
+    .unverified-excerpt-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #fbbf24;
+    }
+
+    .unverified-excerpt-text {
+      margin-top: 4px;
+      white-space: pre-wrap;
+    }
+
+    .unverified-excerpt-note {
+      margin-top: 6px;
+      font-size: 11px;
+      opacity: 0.7;
+    }
+
     /* --- Compose Box --- */
     .compose-box {
       padding: 16px 20px;
@@ -1050,6 +1077,20 @@
       container.scrollTop = container.scrollHeight;
     }
 
+    // The message a reporter chose to include when reporting a direct message
+    // (divine-mobile#7340). The sender signs a DM's outer seal, but the
+    // reporter forwards only the unsigned message text, so this is what the
+    // reporter's app showed, and the label has to say so. The same goes for
+    // who sent it: the sender and message ID lines in the reporter's note are
+    // their claim too, and render as plain text, so the note covers them.
+    function unverifiedExcerptHtml(excerpt) {
+      return '<div class="unverified-excerpt">'
+        + '<div class="unverified-excerpt-label">Unverified message excerpt</div>'
+        + '<div class="unverified-excerpt-text">' + escapeHtml(excerpt) + '</div>'
+        + '<div class="unverified-excerpt-note">Provided by the reporter, like the sender and message ID in their note. Nothing in this report is signed by the sender, so this is what the reporter\'s app showed, not proof of what was sent or who sent it.</div>'
+        + '</div>';
+    }
+
     // Build a single message bubble. Shared by renderThread (server rows) and
     // the optimistic-send append path (a pending outgoing bubble).
     function createMessageBubble(msg) {
@@ -1058,6 +1099,10 @@
       bubble.className = 'message-bubble ' + direction + (msg.pending ? ' pending' : '');
 
       let html = '<div>' + escapeHtml(msg.content || msg.message || '') + '</div>';
+
+      if (typeof msg.unverified_excerpt === 'string' && msg.unverified_excerpt) {
+        html += unverifiedExcerptHtml(msg.unverified_excerpt);
+      }
 
       if (msg.sha256) {
         const sha256 = String(msg.sha256);

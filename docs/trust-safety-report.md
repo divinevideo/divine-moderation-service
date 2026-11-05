@@ -212,7 +212,7 @@ This creates an auditable record of human moderation decisions on the Nostr prot
 | **KV** `quarantine:{sha256}` | Quarantine flag with reason and moderator info | 90 days |
 | **D1** `moderation_results` | Action, provider, scores JSON, categories, raw response, timestamps, reviewer info | Permanent |
 | **D1** `user_reports` | User-submitted reports with auto-escalation | Permanent |
-| **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body | **One year, decided.** Sweep implemented but disabled pending activation — see below |
+| **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body, and in `unverified_excerpt` the reported person's message as a reporter's app showed it, when a DM report includes one | **One year, decided.** Sweep implemented but disabled pending activation — see below |
 | **D1** `dm_conversation_read_state` | Moderator read marker, one row per conversation | Pruned alongside `dm_log` once a conversation's last message expires; same activation gate |
 | **Blossom** `media.divine.video` | Source video files | Permanent |
 
