@@ -1078,14 +1078,16 @@
     }
 
     // The message a reporter chose to include when reporting a direct message
-    // (divine-mobile#7340). The sender signs a DM's outer seal, but the inner
-    // message text the reporter forwards is unsigned, so this is what the
-    // reporter's app showed, and the label has to say so.
+    // (divine-mobile#7340). The sender signs a DM's outer seal, but the
+    // reporter forwards only the unsigned message text, so this is what the
+    // reporter's app showed, and the label has to say so. The same goes for
+    // who sent it: the sender and message ID lines in the reporter's note are
+    // their claim too, and render as plain text, so the note covers them.
     function unverifiedExcerptHtml(excerpt) {
       return '<div class="unverified-excerpt">'
         + '<div class="unverified-excerpt-label">Unverified message excerpt</div>'
         + '<div class="unverified-excerpt-text">' + escapeHtml(excerpt) + '</div>'
-        + '<div class="unverified-excerpt-note">Provided by the reporter. The text of a direct message carries no signature anyone can check, so this is what their app showed, not proof of what was sent.</div>'
+        + '<div class="unverified-excerpt-note">Provided by the reporter, like the sender and message ID in their note. Nothing in this report is signed by the sender, so this is what the reporter\'s app showed, not proof of what was sent or who sent it.</div>'
         + '</div>';
     }
 

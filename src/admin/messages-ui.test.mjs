@@ -324,10 +324,14 @@ describe('messages UI — reporter-included message', () => {
       expect(html.replace('[escaped:<img src=x onerror=alert(1)>]', '')).not.toContain('<img');
       expect(html).toContain('Unverified message excerpt');
       expect(html).toContain('Provided by the reporter');
-      expect(html).toContain('not proof of what was sent');
-      // The sender does sign the NIP-17 seal; it is the message text the
-      // reporter forwards that carries no signature anyone can check.
-      expect(html).toContain('carries no signature anyone can check');
+      // Who sent the message is the reporter's claim as much as its text, and
+      // the sender and message ID lines in their note carry no label of their
+      // own, so the note has to cover them too.
+      expect(html).toContain('like the sender and message ID in their note');
+      expect(html).toContain('not proof of what was sent or who sent it');
+      // The sender does sign the NIP-17 seal, but the reporter doesn't forward
+      // it: what reaches us is the unsigned message and the reporter's word.
+      expect(html).toContain('Nothing in this report is signed by the sender');
       expect(html).not.toContain('are not signed');
     } finally {
       delete globalThis.escapeHtml;
