@@ -426,6 +426,11 @@ export async function deliverPendingPrivateReports(env, {
 
   try {
     await initPrivateReportIntakeTable(db);
+    // One timestamp for the whole run: last_attempt_at, delivered_at and a
+    // retry's next_attempt_at count from when the run started, not from each
+    // call. The cron runs every 5 minutes and the first retry waits 5, so a
+    // retry counted from a call late in this run would more often fall just
+    // after the next run's selection and wait 10.
     const now = new Date(nowMs).toISOString();
     const { results } = await db.prepare(`
       SELECT * FROM private_report_intake
