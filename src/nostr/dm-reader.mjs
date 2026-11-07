@@ -509,8 +509,9 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // is atomic. Written apart, a failed intake insert would leave the DM in
   // dm_log looking handled while the re-poll window ran out, and the report
   // would never reach a moderator. Together, a failure leaves neither, and
-  // the next poll retries both, as for any DM whose write failed; the throw
-  // reaches syncInbox, which counts it as an error.
+  // the next poll retries both, as for any DM whose write failed -- but only
+  // while the gift wrap is still inside the reader's re-poll window. The
+  // throw reaches syncInbox, which counts it as an error.
   if (privateReport) {
     try {
       const [dmResult] = await env.BLOSSOM_DB.batch([
@@ -519,7 +520,7 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
       ]);
       return dmResult?.meta?.last_row_id ? 'synced' : 'skipped';
     } catch (writeErr) {
-      console.error(`[DM-READER] Failed to store private report from gift wrap ${giftWrapId}; neither its inbox copy nor its review intake was written, and the next poll retries both:`, writeErr.message);
+      console.error(`[DM-READER] Failed to store private report from gift wrap ${giftWrapId}; neither its inbox copy nor its review intake was written, and the next poll retries both while the gift wrap is still re-polled:`, writeErr.message);
       throw writeErr;
     }
   }

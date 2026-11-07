@@ -294,7 +294,9 @@ no `user_reports` row; until this table it reached only the Messages inbox.
   the gift wrap id when there is none. A re-poll in the reader's two-day
   overlap, or a resend in a new gift wrap, adds nothing. The report's `dm_log`
   row and its intake row are written in one D1 batch, so a failure leaves
-  neither and the next poll retries both, as for any DM whose write failed.
+  neither and the next poll retries both, as for any DM whose write failed —
+  but only while the gift wrap is still inside the reader's two-day re-poll
+  window.
   A private report already in `dm_log` before the intake shipped gets only
   its intake row, on the next poll that sees its gift wrap; a failure there
   is logged as an error and retried only while the gift wrap is still
