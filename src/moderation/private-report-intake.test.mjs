@@ -269,7 +269,9 @@ describe('private report intake', () => {
       expect(relayAdmin.fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('delivers csam, child_safety and underage_user first, then oldest first', async () => {
+    // reported_at comes from the rumor, which the sender writes, so it must
+    // not let a report jump the queue within its class: arrival order does.
+    it('delivers csam, child_safety and underage_user first, then in arrival order', async () => {
       const inserts = [
         { type: 'spam', at: '2026-11-07T08:00:00.000Z' },
         { type: 'underage_user', at: '2026-11-07T10:00:00.000Z' },
@@ -286,8 +288,9 @@ describe('private report intake', () => {
 
       await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS });
 
+      // harassment claims the earliest reported_at but arrived after spam.
       expect(fetchCalls.map(({ body }) => body.reportType)).toEqual([
-        'csam', 'child_safety', 'underage_user', 'harassment', 'spam', 'other',
+        'csam', 'child_safety', 'underage_user', 'spam', 'harassment', 'other',
       ]);
     });
 

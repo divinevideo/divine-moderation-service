@@ -313,8 +313,9 @@ async function resolveTransport(env) {
  * Hand pending private reports to relay-manager. Runs from the cron.
  *
  * Takes a bounded batch of pending rows whose backoff has expired, CSAM, child
- * safety and under-16 reports first and oldest first within each, and POSTs
- * each one. A 200 (including `duplicate: true`, an earlier attempt that
+ * safety and under-16 reports first and in arrival order within each, and
+ * POSTs each one. Arrival order is the row id, not reported_at: that comes
+ * from the rumor, which the sender writes. A 200 (including `duplicate: true`, an earlier attempt that
  * already landed) marks the row delivered; a 400 marks it rejected, which no
  * retry can fix; anything else keeps it pending with its error and a growing
  * backoff. relay-manager dedups on (reporter, report id), the same key as this
@@ -351,7 +352,6 @@ export async function deliverPendingPrivateReports(env, {
           WHEN 'underage_user' THEN 2
           ELSE 3
         END,
-        reported_at ASC,
         id ASC
       LIMIT ?
     `).bind(now, limit).all();
