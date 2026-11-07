@@ -331,11 +331,41 @@ A `rejected` row is logged loudly and needs a person. To find rows that have
 not been delivered:
 
 ```sql
-SELECT report_id, report_type, status, attempts, last_error, next_attempt_at, created_at
+SELECT id, report_id, reporter_pubkey, report_type, gift_wrap_id, status,
+       attempts, last_error, next_attempt_at, created_at
 FROM private_report_intake
 WHERE status != 'delivered'
 ORDER BY created_at;
 ```
+
+#### Re-driving a `rejected` row
+
+relay-manager answers `400` only when it cannot accept the handoff as sent,
+so re-driving a row without fixing the cause gets the same `400` again. Fix
+the cause first, using `last_error`:
+
+- `invalid_body`: the row's data and relay-manager's validation disagree.
+  Correct whichever side is wrong — the row, or relay-manager's validation in
+  a deploy — before re-driving.
+- `report_id_conflict`: this reporter already sent a different report under
+  the same report id, naming another account or reason. Read both DMs in the
+  Messages inbox (`dm_log.nostr_event_id` is the row's `gift_wrap_id`) and
+  decide by hand; re-driving the same row only conflicts again.
+
+Then put the row back in the queue. The next five-minute cron delivers it,
+in priority order, as if it were new:
+
+```sql
+UPDATE private_report_intake
+SET status = 'pending', next_attempt_at = NULL, last_error = NULL
+WHERE status = 'rejected' AND id = <id from the query above>;
+```
+
+Run it against production with
+`npx wrangler d1 execute blossom-webhook-events --remote --command "<statement>"`,
+which needs production D1 access. Name rows by `id`, one at a time; a
+statement without that condition re-drives every rejected report at once.
+`attempts` is left as it is, as the row's history.
 
 ---
 
