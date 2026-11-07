@@ -8,7 +8,7 @@ import { getPublicKey, finalizeEvent, verifyEvent } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import * as nip44 from 'nostr-tools/nip44';
 import { makeAuthEvent } from 'nostr-tools/nip42';
-import { computeConversationId, ensureDmLogExcerptColumn, findDmByNostrEventId, logDm } from './dm-store.mjs';
+import { computeConversationId, ensureDmLogExcerptColumn, findDmByNostrEventId, logDm, prepareDmLogInsert } from './dm-store.mjs';
 import { hasUnverifiedExcerptTag, splitUnverifiedExcerpt } from './dm-evidence.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
@@ -17,6 +17,7 @@ import {
   canonicalPrivateReportType,
   initPrivateReportIntakeTable,
   parseReportedPubkeyTag,
+  preparePrivateReportIntakeInsert,
   recordPrivateReportIntake,
   resolvePrivateReportId,
 } from '../moderation/private-report-intake.mjs';
@@ -270,6 +271,9 @@ export async function syncInbox(env) {
  * @param {Object} env - Environment bindings (BLOSSOM_DB)
  * @returns {Promise<'synced'|'skipped'|null>} null means malformed
  *   (logged internally) and should count as an error, not synced/skipped.
+ * @throws when the dm_log write fails -- for a private report, the batch that
+ *   writes its dm_log and intake rows together -- so syncInbox counts it as an
+ *   error and nothing was stored for the next poll to skip.
  */
 export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const senderPubkey = rumor.pubkey;
@@ -431,27 +435,19 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // its review row above, and a public report's kind-1984 already reaches the
   // same queue. Only identifiers are recorded; the note and any included
   // message stay in dm_log.
-  //
-  // Unlike the report write above, this needs no lookup to skip a re-poll: it
-  // stores no timestamp that moves, so ON CONFLICT DO NOTHING on (reporter,
-  // report id) makes a re-poll, or a resend of the same report in a new gift
-  // wrap, a no-op, while a write that failed is simply tried again.
+  let privateReport = null;
   if (!isOutgoing && isReport && !relatedSha256 && env.BLOSSOM_DB) {
     const reported = parseReportedPubkeyTag(rumorTags);
     if (reported.pubkey) {
-      try {
-        await recordPrivateReportIntake(env.BLOSSOM_DB, {
-          reportId: resolvePrivateReportId(rumorTags, giftWrapId),
-          reporterPubkey: senderPubkey,
-          reportedPubkey: reported.pubkey,
-          reportType: canonicalPrivateReportType(reportType),
-          giftWrapId,
-          hasExcerpt: claimsExcerpt,
-          reportedAt: resolveReportedAt(createdAt),
-        });
-      } catch (intakeErr) {
-        console.warn(`[DM-READER] Failed to record private report from gift wrap ${giftWrapId} for review:`, intakeErr.message);
-      }
+      privateReport = {
+        reportId: resolvePrivateReportId(rumorTags, giftWrapId),
+        reporterPubkey: senderPubkey,
+        reportedPubkey: reported.pubkey,
+        reportType: canonicalPrivateReportType(reportType),
+        giftWrapId,
+        hasExcerpt: claimsExcerpt,
+        reportedAt: resolveReportedAt(createdAt),
+      };
     } else if (reported.present && !alreadyLogged) {
       console.warn(`[DM-READER] Ignoring malformed reported_pubkey tag on report DM ${giftWrapId}; it stays in the inbox but is not queued for review`);
     }
@@ -463,6 +459,19 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // indistinguishable from a fresh insert, so a re-poll used to count as
   // 'synced'.
   if (alreadyLogged) {
+    // A private report already in dm_log was logged before the intake
+    // existed: add its intake row now. The insert is ON CONFLICT DO NOTHING
+    // on (reporter, report id), so a re-poll of a recorded report, or a
+    // resend of it in a new gift wrap, adds nothing. A failure here is
+    // retried on the next poll only while the gift wrap is still inside the
+    // reader's re-poll window, hence an error rather than a warning.
+    if (privateReport) {
+      try {
+        await recordPrivateReportIntake(env.BLOSSOM_DB, privateReport);
+      } catch (intakeErr) {
+        console.error(`[DM-READER] Failed to queue private report from gift wrap ${giftWrapId} for review; its DM is in the inbox, and the queue write is retried only while the gift wrap is re-polled:`, intakeErr.message);
+      }
+    }
     return 'skipped';
   }
 
@@ -475,7 +484,7 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const messageType = isReport
     ? 'conversation_report'
     : (isOutgoing ? 'moderator_reply' : 'creator_reply');
-  const result = await logDm(env.BLOSSOM_DB, {
+  const dmEntry = {
     conversationId,
     nostrEventId: giftWrapId,
     senderPubkey,
@@ -485,7 +494,28 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
     direction,
     messageType,
     sha256: relatedSha256
-  });
+  };
+
+  // A private report's inbox copy and its intake row are one D1 batch, which
+  // is atomic. Written apart, a failed intake insert would leave the DM in
+  // dm_log looking handled while the re-poll window ran out, and the report
+  // would never reach a moderator. Together, a failure leaves neither, and
+  // the next poll retries both, as for any DM whose write failed; the throw
+  // reaches syncInbox, which counts it as an error.
+  if (privateReport) {
+    try {
+      const [dmResult] = await env.BLOSSOM_DB.batch([
+        prepareDmLogInsert(env.BLOSSOM_DB, dmEntry),
+        preparePrivateReportIntakeInsert(env.BLOSSOM_DB, privateReport),
+      ]);
+      return dmResult?.meta?.last_row_id ? 'synced' : 'skipped';
+    } catch (writeErr) {
+      console.error(`[DM-READER] Failed to store private report from gift wrap ${giftWrapId}; neither its inbox copy nor its review intake was written, and the next poll retries both:`, writeErr.message);
+      throw writeErr;
+    }
+  }
+
+  const result = await logDm(env.BLOSSOM_DB, dmEntry);
 
   return result && result.id ? 'synced' : 'skipped';
 }

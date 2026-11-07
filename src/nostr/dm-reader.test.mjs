@@ -10,7 +10,7 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { wrapEvent } from 'nostr-tools/nip59';
 import { bytesToHex } from '@noble/hashes/utils';
 import { fetchGiftWraps, getModeratorPubkey, processRumor, resolveReportedAt, syncInbox } from './dm-reader.mjs';
-import { initDmLogTable } from './dm-store.mjs';
+import { initDmLogTable, logDm } from './dm-store.mjs';
 import { UNVERIFIED_EXCERPT_HEADING } from './dm-evidence.mjs';
 import { initReportsTable } from '../reports.mjs';
 import { initPrivateReportIntakeTable } from '../moderation/private-report-intake.mjs';
@@ -817,9 +817,77 @@ describe('DM Reader - processRumor private report intake', () => {
     expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(2);
   });
 
-  // Same reasoning as the user_reports retry above: the DM is logged whether
-  // or not the intake write succeeded, so a re-poll must still try the write.
-  it('retries an intake write that failed, on the next pass over the same gift wrap', async () => {
+  // The inbox copy and the review intake are one write. If the intake insert
+  // failed on its own, the DM would sit in dm_log looking handled while the
+  // re-poll window ran out, and the report would never reach a moderator. In
+  // one D1 batch a failure leaves neither, and the next poll retries both,
+  // as it does for any DM whose write failed.
+  it('writes the inbox copy and the intake row together, or neither', async () => {
+    let failIntakeWrite = true;
+    const batches = [];
+    const flakyDb = {
+      prepare(sql) {
+        if (failIntakeWrite && sql.includes('INSERT INTO private_report_intake')) {
+          // Fails when the batch executes it, after the dm_log insert ran:
+          // proves the batch rolls the dm_log row back rather than that this
+          // code skipped it.
+          const failing = db.prepare('INSERT INTO private_report_intake (report_id) VALUES (NULL)');
+          return { bind: () => failing };
+        }
+        return db.prepare(sql);
+      },
+      batch: (statements) => {
+        batches.push(statements.length);
+        return db.batch(statements);
+      },
+      exec: (...args) => db.exec(...args),
+    };
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const report = rumor({ tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity' }), content: MESSAGE_NOTE });
+
+      await expect(processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).rejects.toThrow();
+      expect(batches).toEqual([2]);
+      expect(await intakeRows()).toHaveLength(0);
+      expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(0);
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(GIFT_WRAP), expect.any(String));
+
+      // Next poll, D1 healthy: both rows land.
+      failIntakeWrite = false;
+      expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('synced');
+      expect(await intakeRows()).toHaveLength(1);
+      const dms = (await db.prepare('SELECT * FROM dm_log').all()).results;
+      expect(dms).toHaveLength(1);
+      expect(dms[0]).toMatchObject({ nostr_event_id: GIFT_WRAP, message_type: 'conversation_report', content: MESSAGE_NOTE });
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  // A private report DM logged before this intake shipped is already in
+  // dm_log, so the next poll inside the re-poll window adds only its intake
+  // row.
+  it('backfills the intake row for a private report already in dm_log', async () => {
+    const report = rumor({ tags: privateReportTags({ label: 'NS-csam', nip56Type: 'illegal' }), content: MESSAGE_NOTE });
+    await logDm(db, {
+      conversationId: 'e'.repeat(64),
+      nostrEventId: GIFT_WRAP,
+      senderPubkey: REPORTER,
+      recipientPubkey: MODERATOR,
+      content: MESSAGE_NOTE,
+      direction: 'incoming',
+      messageType: 'conversation_report',
+    });
+
+    expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db })).toBe('skipped');
+
+    const rows = await intakeRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ report_id: REPORT_ID, report_type: 'csam', gift_wrap_id: GIFT_WRAP });
+    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+  });
+
+  it('logs a failed backfill as an error and tries it again on the next poll', async () => {
     let failIntakeWrite = true;
     const flakyDb = {
       prepare(sql) {
@@ -831,21 +899,29 @@ describe('DM Reader - processRumor private report intake', () => {
       batch: (...args) => db.batch(...args),
       exec: (...args) => db.exec(...args),
     };
+    const report = rumor({ tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity' }), content: MESSAGE_NOTE });
+    await logDm(db, {
+      conversationId: 'e'.repeat(64),
+      nostrEventId: GIFT_WRAP,
+      senderPubkey: REPORTER,
+      recipientPubkey: MODERATOR,
+      content: MESSAGE_NOTE,
+      direction: 'incoming',
+      messageType: 'conversation_report',
+    });
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      const report = rumor({ tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity' }), content: MESSAGE_NOTE });
-
-      expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('synced');
+      expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('skipped');
       expect(await intakeRows()).toHaveLength(0);
-      expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('private report'), expect.stringContaining('Network connection lost'));
+      expect(error).toHaveBeenCalledWith(expect.stringContaining(GIFT_WRAP), expect.stringContaining('Network connection lost'));
+      expect(warn.mock.calls.filter(([message]) => String(message).includes('private report'))).toHaveLength(0);
 
       failIntakeWrite = false;
       expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('skipped');
-
       expect(await intakeRows()).toHaveLength(1);
-      expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
     } finally {
+      error.mockRestore();
       warn.mockRestore();
     }
   });

@@ -152,7 +152,8 @@ export function canonicalPrivateReportType(reportType) {
 }
 
 /**
- * Record a private report for delivery, once.
+ * Build the INSERT for one private report without running it, so the DM
+ * reader can put it in one D1 batch with the report's dm_log row.
  *
  * ON CONFLICT(reporter_pubkey, report_id) DO NOTHING, so the reader's re-poll
  * of the same gift wrap and a second gift wrap carrying the same report id
@@ -165,9 +166,9 @@ export function canonicalPrivateReportType(reportType) {
  * @param {{reportId: string, reporterPubkey: string, reportedPubkey: string,
  *   reportType: string, giftWrapId: string, hasExcerpt: boolean,
  *   reportedAt: string}} report
- * @returns {Promise<{inserted: boolean}>}
+ * @returns {D1PreparedStatement}
  */
-export async function recordPrivateReportIntake(db, {
+export function preparePrivateReportIntakeInsert(db, {
   reportId,
   reporterPubkey,
   reportedPubkey,
@@ -176,7 +177,7 @@ export async function recordPrivateReportIntake(db, {
   hasExcerpt,
   reportedAt,
 }) {
-  const result = await db.prepare(`
+  return db.prepare(`
     INSERT INTO private_report_intake (
       report_id, reporter_pubkey, reported_pubkey, report_type,
       gift_wrap_id, has_excerpt, reported_at
@@ -190,7 +191,19 @@ export async function recordPrivateReportIntake(db, {
     giftWrapId,
     hasExcerpt ? 1 : 0,
     reportedAt,
-  ).run();
+  );
+}
+
+/**
+ * Record a private report on its own, once: the DM reader's path for a report
+ * whose dm_log row already exists. See preparePrivateReportIntakeInsert.
+ *
+ * @param {D1Database} db
+ * @param {Object} report - as for preparePrivateReportIntakeInsert
+ * @returns {Promise<{inserted: boolean}>}
+ */
+export async function recordPrivateReportIntake(db, report) {
+  const result = await preparePrivateReportIntakeInsert(db, report).run();
   return { inserted: (result?.meta?.changes ?? 0) > 0 };
 }
 

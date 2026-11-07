@@ -84,13 +84,14 @@ export async function findDmByNostrEventId(db, nostrEventId) {
   return db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(nostrEventId).first();
 }
 
-export async function logDm(db, { conversationId, sha256, direction, senderPubkey, recipientPubkey, messageType, content, nostrEventId, unverifiedExcerpt = null }) {
-  // Dedup by nostr_event_id if provided
-  if (nostrEventId) {
-    const existing = await findDmByNostrEventId(db, nostrEventId);
-    if (existing) return existing;
-  }
-
+/**
+ * Build the dm_log INSERT for one message without running it, so a caller can
+ * put it in a D1 batch with a write that must land together with it (the DM
+ * reader does, for a private report's intake row). logDm runs it on its own.
+ * @param {D1Database} db
+ * @returns {D1PreparedStatement}
+ */
+export function prepareDmLogInsert(db, { conversationId, sha256, direction, senderPubkey, recipientPubkey, messageType, content, nostrEventId, unverifiedExcerpt = null }) {
   const columns = ['conversation_id', 'sha256', 'direction', 'sender_pubkey', 'recipient_pubkey', 'message_type', 'content', 'nostr_event_id'];
   const values = [conversationId, sha256 || null, direction, senderPubkey, recipientPubkey, messageType || null, content, nostrEventId || null];
   // Named only when there is an excerpt: the writers that never have one run
@@ -100,10 +101,20 @@ export async function logDm(db, { conversationId, sha256, direction, senderPubke
     values.push(unverifiedExcerpt);
   }
 
-  const result = await db.prepare(`
+  return db.prepare(`
     INSERT INTO dm_log (${columns.join(', ')})
     VALUES (${columns.map(() => '?').join(', ')})
-  `).bind(...values).run();
+  `).bind(...values);
+}
+
+export async function logDm(db, entry) {
+  // Dedup by nostr_event_id if provided
+  if (entry.nostrEventId) {
+    const existing = await findDmByNostrEventId(db, entry.nostrEventId);
+    if (existing) return existing;
+  }
+
+  const result = await prepareDmLogInsert(db, entry).run();
 
   return { id: result.meta.last_row_id };
 }

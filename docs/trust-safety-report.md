@@ -292,8 +292,13 @@ no `user_reports` row; until this table it reached only the Messages inbox.
   unique on (reporter, report id). The report id is the DM's `batch` tag —
   divine-mobile mints it once per report and reuses it on every resend — or
   the gift wrap id when there is none. A re-poll in the reader's two-day
-  overlap, or a resend in a new gift wrap, adds nothing; a failed write is
-  retried on the next poll. The `dm_log` row is written as before.
+  overlap, or a resend in a new gift wrap, adds nothing. The report's `dm_log`
+  row and its intake row are written in one D1 batch, so a failure leaves
+  neither and the next poll retries both, as for any DM whose write failed.
+  A private report already in `dm_log` before the intake shipped gets only
+  its intake row, on the next poll that sees its gift wrap; a failure there
+  is logged as an error and retried only while the gift wrap is still
+  re-polled.
 - **Delivery.** The five-minute cron hands pending rows to relay-manager
   (`POST /api/internal/private-reports` over the `RELAY_ADMIN` service binding,
   falling back to `RELAY_ADMIN_URL` through Cloudflare Access).
