@@ -843,6 +843,34 @@ describe('scheduled private report delivery', () => {
     expect(privateReportMocks.prunePrivateReportIntake).toHaveBeenCalledWith(db);
   });
 
+  it('still records the retention sweep when the intake prune fails', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    privateReportMocks.prunePrivateReportIntake.mockRejectedValueOnce(new Error('D1_ERROR: prune failed'));
+    const kvPuts = [];
+    const db = {
+      ...createDbMock(),
+      async batch() {
+        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }];
+      }
+    };
+
+    try {
+      await runFiveMinuteCron(createCronEnv({
+        DM_LOG_RETENTION_ENABLED: 'true',
+        BLOSSOM_DB: db,
+        MODERATION_KV: {
+          ...createEnv().MODERATION_KV,
+          async put(key, value) { kvPuts.push([key, value]); },
+        },
+      }));
+
+      expect(errorSpy).toHaveBeenCalledWith('[DM-RETENTION] private_report_intake prune failed:', expect.any(Error));
+      expect(kvPuts.map(([key]) => key)).toContain('dm-log-retention:last-pruned');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('does not prune intake rows while dm_log retention is off', async () => {
     privateReportMocks.prunePrivateReportIntake.mockClear();
 
