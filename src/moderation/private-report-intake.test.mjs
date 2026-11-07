@@ -532,6 +532,52 @@ describe('private report intake', () => {
       expect((await rows()).map((row) => row.attempts)).toEqual([1, 1, 0, 0]);
     });
 
+    // The cron runs dm_log retention and the kind-10050 publish after this
+    // step, so a slow relay-manager must not hold it for every row's timeout.
+    // Once the run has used its budget it starts no new handoff; what is left
+    // stays pending for the next tick, in the same order.
+    it('starts no new handoff once the run has used its time budget', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let elapsedMs = 0;
+      relayAdmin.fetch.mockImplementation(async () => {
+        elapsedMs += 40_000;
+        return okResponse();
+      });
+      for (let i = 0; i < 5; i++) {
+        await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(i), giftWrapId: giftWrapId(i) }));
+      }
+
+      const summary = await deliverPendingPrivateReports(deliveryEnv(), {
+        nowMs: NOW_MS,
+        budgetMs: 90_000,
+        clock: () => elapsedMs,
+      });
+
+      // Started at 0s, 40s and 80s; the fourth would start at 120s.
+      expect(relayAdmin.fetch).toHaveBeenCalledTimes(3);
+      expect(summary).toMatchObject({ attempted: 3, delivered: 3, stoppedEarly: true });
+      expect((await rows()).map((row) => row.status))
+        .toEqual(['delivered', 'delivered', 'delivered', 'pending', 'pending']);
+      expect((await rows()).slice(3).map((row) => row.attempts)).toEqual([0, 0]);
+    });
+
+    it('stops after about 90 seconds by default', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      let elapsedMs = 0;
+      relayAdmin.fetch.mockImplementation(async () => {
+        elapsedMs += 50_000;
+        return okResponse();
+      });
+      for (let i = 0; i < 4; i++) {
+        await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(i), giftWrapId: giftWrapId(i) }));
+      }
+
+      await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS, clock: () => elapsedMs });
+
+      // Started at 0s and 50s; the third would start at 100s.
+      expect(relayAdmin.fetch).toHaveBeenCalledTimes(2);
+    });
+
     it('carries on past a 503 for one report, which may be specific to its route', async () => {
       vi.spyOn(console, 'warn').mockImplementation(() => {});
       relayAdmin.fetch.mockImplementation(async (url, init) => (

@@ -34,6 +34,10 @@ const DELIVERY_TIMEOUT_MS = 30000;
 // One timeout is treated as that report's route being slow; this many in a
 // row as relay-manager being unreachable, which ends the run.
 const CONSECUTIVE_TIMEOUTS_TO_STOP = 2;
+// No new handoff starts after this much of a run, so a slow relay-manager
+// holds the cron for at most this plus one call's timeout, not 20 timeouts.
+// The cron's later steps (dm_log retention, the kind-10050 publish) wait on it.
+const DELIVERY_RUN_BUDGET_MS = 90000;
 const RETRY_BASE_DELAY_MS = 5 * 60 * 1000;
 const RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
 
@@ -358,11 +362,16 @@ async function settlePendingRow(db, assignments, values, id) {
  * other gets 503 attempt_in_progress and retries later, and no settle here
  * overwrites a row that is no longer pending.
  *
+ * Bounded in time as well as rows: no handoff starts once the run has used
+ * its budget, so the cron steps after it are not held for long. Reports left
+ * over stay pending for the next run.
+ *
  * Never throws: a delivery failure must not fail the cron step that follows.
  *
  * @param {Object} env - BLOSSOM_DB, RELAY_ADMIN / RELAY_ADMIN_URL, RELAY_ADMIN_API_KEY
- * @param {{nowMs?: number, limit?: number, timeoutMs?: number}} [options]
- *   timeoutMs bounds each call, body included
+ * @param {{nowMs?: number, limit?: number, timeoutMs?: number,
+ *   budgetMs?: number, clock?: () => number}} [options] timeoutMs bounds each
+ *   call, body included; budgetMs bounds the run, measured with clock
  * @returns {Promise<{attempted: number, delivered: number, rejected: number,
  *   retrying: number, stoppedEarly: boolean, error?: string}>}
  */
@@ -370,6 +379,8 @@ export async function deliverPendingPrivateReports(env, {
   nowMs = Date.now(),
   limit = DEFAULT_DELIVERY_BATCH_LIMIT,
   timeoutMs = DELIVERY_TIMEOUT_MS,
+  budgetMs = DELIVERY_RUN_BUDGET_MS,
+  clock = Date.now,
 } = {}) {
   const summary = { attempted: 0, delivered: 0, rejected: 0, retrying: 0, stoppedEarly: false };
   const db = env?.BLOSSOM_DB;
@@ -396,8 +407,14 @@ export async function deliverPendingPrivateReports(env, {
 
     const transport = await resolveTransport(env);
     let consecutiveTimeouts = 0;
+    const startedAt = clock();
 
     for (const row of results) {
+      if (clock() - startedAt >= budgetMs) {
+        summary.stoppedEarly = true;
+        console.warn(`[PRIVATE-REPORTS] Delivery run used its ${budgetMs / 1000}s budget; ${results.length - summary.attempted} report(s) stay pending for the next run`);
+        break;
+      }
       summary.attempted++;
       const result = await postHandoff(transport, row, timeoutMs);
       const attempts = (row.attempts ?? 0) + 1;
