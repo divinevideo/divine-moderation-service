@@ -34,6 +34,7 @@ import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
 import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
 import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
 import { notifyRelay } from './relay-notifier.mjs';
+import { getRelayAdminHeaders, getRelayAdminUrl, resolveSecret } from './relay-admin-transport.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { cachedStat } from './admin/cache.mjs';
@@ -78,15 +79,8 @@ const CATEGORY_TO_LABEL = {
 
 const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
 const API_HOSTNAME = 'moderation-api.divine.video';
-// api-relay-prod.divine.video targets divine-relay-admin-api-prod which has the
-// NOSTR_NSEC Secrets Store binding required by handleModerate -> getSecretKey.
-// relay.admin.divine.video routes to a stale divine-relay-admin-api deployment
-// that lacks the binding and crashes with "Cannot read properties of undefined
-// (reading 'get')" / Cloudflare Error 1101 on every moderate call. Override
-// via env.RELAY_ADMIN_URL if needed for staging or rollback.
-const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
 // Moderator-facing relay-admin UI (Cloudflare Pages), distinct from the API host
-// above. Override via env.RELAY_ADMIN_UI_URL for staging.
+// in relay-admin-transport.mjs. Override via env.RELAY_ADMIN_UI_URL for staging.
 const DEFAULT_RELAY_ADMIN_UI_URL = 'https://relay.admin.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const MODERATION_ACTIONS = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN', 'DELETE'];
@@ -369,10 +363,6 @@ function mergeLookupMetadata(baseVideo, funnelcakeVideo) {
   };
 }
 
-function getRelayAdminUrl(env) {
-  return env.RELAY_ADMIN_URL || DEFAULT_RELAY_ADMIN_URL;
-}
-
 // The relay-admin UI is a different host from the relay-admin API: the worker
 // talks to api-relay-prod.divine.video, but a moderator opens an age-review case
 // in the Pages app at relay.admin.divine.video. Only used to build a link we
@@ -386,19 +376,6 @@ function getRelayAdminUiUrl(env) {
 // is already named, not because the other form is slower.
 function ageReviewCaseUrl(env, caseId) {
   return `${getRelayAdminUiUrl(env)}/age-review?case=${encodeURIComponent(caseId)}`;
-}
-
-function getRelayAdminHeaders(env) {
-  const headers = {
-    'Content-Type': 'application/json'
-  };
-
-  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
-    headers['CF-Access-Client-Id'] = env.CF_ACCESS_CLIENT_ID;
-    headers['CF-Access-Client-Secret'] = env.CF_ACCESS_CLIENT_SECRET;
-  }
-
-  return headers;
 }
 
 
@@ -819,14 +796,6 @@ function relayRpcForAction(payload) {
     default:
       throw new Error(`Unsupported relay admin action: ${payload?.action}`);
   }
-}
-
-// Resolve a secret that may be either a plain string (wrangler secret / [vars])
-// or a Cloudflare Secrets Store binding (async .get()). Mirrors the relay-admin
-// worker's resolveSecret so the shared key works regardless of how it is bound.
-async function resolveSecret(binding) {
-  if (!binding) return null;
-  return typeof binding === 'string' ? binding : await binding.get();
 }
 
 async function callRelayAdminAction(env, payload) {
