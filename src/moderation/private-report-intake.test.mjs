@@ -363,6 +363,42 @@ describe('private report intake', () => {
       });
     }
 
+    // Two runs can overlap (a slow tick and the next one). relay-manager holds
+    // a lease while one attempt is in flight and answers the other with 503
+    // attempt_in_progress; when the first run then marks the row delivered,
+    // the second run's answer must not overwrite it.
+    for (const [label, answer] of [
+      ['503 attempt_in_progress', () => statusResponse(503, { success: false, code: 'attempt_in_progress' })],
+      ['400', () => statusResponse(400, { success: false, code: 'invalid_body' })],
+    ]) {
+      it(`leaves a row another run delivered alone when this run gets ${label}`, async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        relayAdmin.fetch.mockImplementation(async () => {
+          await db.prepare(`
+            UPDATE private_report_intake
+            SET status = 'delivered', outcome = 'queued_in_coop', attempts = 1,
+                delivered_at = '2026-11-07T11:59:00.000Z'
+          `).run();
+          return answer();
+        });
+        await recordPrivateReportIntake(db, intakeRow());
+
+        const summary = await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS });
+
+        const [row] = await rows();
+        expect(row).toMatchObject({
+          status: 'delivered',
+          outcome: 'queued_in_coop',
+          attempts: 1,
+          delivered_at: '2026-11-07T11:59:00.000Z',
+          last_error: null,
+          next_attempt_at: null,
+        });
+        expect(summary).toMatchObject({ attempted: 1, delivered: 0, rejected: 0, retrying: 0 });
+      });
+    }
+
     it('grows the backoff with each attempt, up to a cap', () => {
       expect(privateReportRetryDelayMs(1)).toBe(5 * 60 * 1000);
       expect(privateReportRetryDelayMs(2)).toBe(10 * 60 * 1000);

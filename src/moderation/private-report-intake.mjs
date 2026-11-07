@@ -310,6 +310,21 @@ async function resolveTransport(env) {
 }
 
 /**
+ * Apply one delivery result to a row that is still pending.
+ *
+ * @returns {Promise<boolean>} false when the row was no longer pending: an
+ *   overlapping run settled it first, and its result is kept.
+ */
+async function settlePendingRow(db, assignments, values, id) {
+  const result = await db.prepare(`
+    UPDATE private_report_intake
+    SET ${assignments}
+    WHERE id = ? AND status = 'pending'
+  `).bind(...values, id).run();
+  return (result?.meta?.changes ?? 0) > 0;
+}
+
+/**
  * Hand pending private reports to relay-manager. Runs from the cron.
  *
  * Takes a bounded batch of pending rows whose backoff has expired, CSAM, child
@@ -319,9 +334,11 @@ async function resolveTransport(env) {
  * already landed) marks the row delivered; a 400 marks it rejected, which no
  * retry can fix; anything else keeps it pending with its error and a growing
  * backoff. relay-manager dedups on (reporter, report id), the same key as this
- * table, so a row delivered twice -- an update lost after a successful call,
- * two overlapping runs -- comes back `duplicate: true` rather than as a second
- * review item.
+ * table, so a row delivered again after its update was lost comes back
+ * `duplicate: true` rather than as a second review item. Two overlapping runs
+ * are kept apart by relay-manager's lease: while one attempt holds it, the
+ * other gets 503 attempt_in_progress and retries later, and no settle here
+ * overwrites a row that is no longer pending.
  *
  * Never throws: a delivery failure must not fail the cron step that follows.
  *
@@ -364,33 +381,34 @@ export async function deliverPendingPrivateReports(env, {
       const result = await postHandoff(transport, row);
       const attempts = (row.attempts ?? 0) + 1;
 
+      // Every settle is guarded on status = 'pending': if an overlapping run
+      // settled the row while this call was in flight, its answer stands.
+      // attempts counts up in SQL for the same reason.
       if (result.kind === 'delivered') {
-        await db.prepare(`
-          UPDATE private_report_intake
-          SET status = 'delivered', outcome = ?, attempts = ?, last_attempt_at = ?,
-              delivered_at = ?, last_error = NULL, next_attempt_at = NULL
-          WHERE id = ?
-        `).bind(result.outcome, attempts, now, now, row.id).run();
+        const settled = await settlePendingRow(db, `
+          status = 'delivered', outcome = ?, attempts = attempts + 1, last_attempt_at = ?,
+          delivered_at = ?, last_error = NULL, next_attempt_at = NULL
+        `, [result.outcome, now, now], row.id);
+        if (!settled) continue;
         summary.delivered++;
         console.log(`[PRIVATE-REPORTS] Delivered report ${row.report_id} (${row.report_type}) from gift wrap ${row.gift_wrap_id}: ${result.outcome ?? 'no outcome'}${result.duplicate ? ' (already delivered)' : ''}`);
       } else if (result.kind === 'rejected') {
-        await db.prepare(`
-          UPDATE private_report_intake
-          SET status = 'rejected', attempts = ?, last_attempt_at = ?,
-              last_error = ?, next_attempt_at = NULL
-          WHERE id = ?
-        `).bind(attempts, now, result.error, row.id).run();
+        const settled = await settlePendingRow(db, `
+          status = 'rejected', attempts = attempts + 1, last_attempt_at = ?,
+          last_error = ?, next_attempt_at = NULL
+        `, [now, result.error], row.id);
+        if (!settled) continue;
         summary.rejected++;
         console.error(`[PRIVATE-REPORTS] relay-manager rejected report ${row.report_id} (${row.report_type}) from gift wrap ${row.gift_wrap_id}; it will not be retried and needs a person to look at it: ${result.error}`);
       } else {
         const nextAttemptAt = new Date(nowMs + privateReportRetryDelayMs(attempts)).toISOString();
-        await db.prepare(`
-          UPDATE private_report_intake
-          SET attempts = ?, last_attempt_at = ?, last_error = ?, next_attempt_at = ?
-          WHERE id = ?
-        `).bind(attempts, now, result.error, nextAttemptAt, row.id).run();
-        summary.retrying++;
-        console.warn(`[PRIVATE-REPORTS] Handoff of report ${row.report_id} (${row.report_type}) failed, attempt ${attempts}, retrying after ${nextAttemptAt}: ${result.error}`);
+        const settled = await settlePendingRow(db, `
+          attempts = attempts + 1, last_attempt_at = ?, last_error = ?, next_attempt_at = ?
+        `, [now, result.error, nextAttemptAt], row.id);
+        if (settled) {
+          summary.retrying++;
+          console.warn(`[PRIVATE-REPORTS] Handoff of report ${row.report_id} (${row.report_type}) failed, attempt ${attempts}, retrying after ${nextAttemptAt}: ${result.error}`);
+        }
         if (result.stopRun) {
           summary.stoppedEarly = true;
           break;
