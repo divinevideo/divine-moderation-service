@@ -51,9 +51,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  *
  * It holds identifiers only -- who reported whom, for what, and the gift wrap
  * id that links it to its dm_log row -- never the reporter's note or the
- * message they included, which stay in dm_log. Created in code rather than in migrations/ for the reason
- * initReportsTable gives: CI deploys the worker without running
- * `wrangler d1 migrations apply`.
+ * message they included, which stay in dm_log. Created in code rather than in
+ * migrations/ for the reason initReportsTable gives: CI deploys the worker
+ * without running `wrangler d1 migrations apply`.
  *
  * Retention: a row pairs a reporter with the account they reported, the same
  * pairing the report's dm_log row already holds, so it follows dm_log's
@@ -347,11 +347,12 @@ async function settlePendingRow(db, assignments, values, id) {
  * Takes a bounded batch of pending rows whose backoff has expired, CSAM, child
  * safety and under-16 reports first and in arrival order within each, and
  * POSTs each one. Arrival order is the row id, not reported_at: that comes
- * from the rumor, which the sender writes. A 200 (including `duplicate: true`, an earlier attempt that
- * already landed) marks the row delivered; a 400 marks it rejected, which no
- * retry can fix; anything else keeps it pending with its error and a growing
- * backoff. relay-manager dedups on (reporter, report id), the same key as this
- * table, so a row delivered again after its update was lost comes back
+ * from the rumor, which the sender writes. A 200 with success: true
+ * (including `duplicate: true`, an earlier attempt that already landed) marks
+ * the row delivered; a 400 marks it rejected, which no retry can fix;
+ * anything else keeps it pending with its error and a growing backoff.
+ * relay-manager dedups on (reporter, report id), the same key as this table,
+ * so a row delivered again after its update was lost comes back
  * `duplicate: true` rather than as a second review item. Two overlapping runs
  * are kept apart by relay-manager's lease: while one attempt holds it, the
  * other gets 503 attempt_in_progress and retries later, and no settle here
