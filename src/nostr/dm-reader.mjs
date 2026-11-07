@@ -446,7 +446,6 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
           reportedPubkey: reported.pubkey,
           reportType: canonicalPrivateReportType(reportType),
           giftWrapId,
-          conversationId,
           hasExcerpt: claimsExcerpt,
           reportedAt: resolveReportedAt(createdAt),
         });

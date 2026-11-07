@@ -10,7 +10,7 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { wrapEvent } from 'nostr-tools/nip59';
 import { bytesToHex } from '@noble/hashes/utils';
 import { fetchGiftWraps, getModeratorPubkey, processRumor, resolveReportedAt, syncInbox } from './dm-reader.mjs';
-import { computeConversationId, initDmLogTable } from './dm-store.mjs';
+import { initDmLogTable } from './dm-store.mjs';
 import { UNVERIFIED_EXCERPT_HEADING } from './dm-evidence.mjs';
 import { initReportsTable } from '../reports.mjs';
 import { initPrivateReportIntakeTable } from '../moderation/private-report-intake.mjs';
@@ -643,6 +643,7 @@ describe('DM Reader - processRumor private report intake', () => {
   beforeEach(async () => {
     await initDmLogTable(db);
     await initReportsTable(db);
+    await db.prepare('DROP TABLE IF EXISTS private_report_intake').run();
     await initPrivateReportIntakeTable(db);
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS moderation_results (
@@ -653,7 +654,6 @@ describe('DM Reader - processRumor private report intake', () => {
     await db.prepare('DELETE FROM dm_log').run();
     await db.prepare('DELETE FROM user_reports').run();
     await db.prepare('DELETE FROM moderation_results').run();
-    await db.prepare('DELETE FROM private_report_intake').run();
   });
 
   for (const { name, label, nip56Type, note, reportType } of [
@@ -681,7 +681,6 @@ describe('DM Reader - processRumor private report intake', () => {
           reported_pubkey: REPORTED,
           report_type: reportType,
           gift_wrap_id: GIFT_WRAP,
-          conversation_id: computeConversationId(MODERATOR, REPORTER),
           has_excerpt: includesMessage ? 1 : 0,
           status: 'pending',
           attempts: 0,

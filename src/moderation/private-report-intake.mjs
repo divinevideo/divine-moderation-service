@@ -45,9 +45,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * DM reader's two-day re-poll and the outbox the cron delivers to
  * relay-manager from.
  *
- * It holds identifiers only -- who reported whom, for what, and where the DM
- * is -- never the reporter's note or the message they included, which stay in
- * dm_log. Created in code rather than in migrations/ for the reason
+ * It holds identifiers only -- who reported whom, for what, and the gift wrap
+ * id that links it to its dm_log row -- never the reporter's note or the
+ * message they included, which stay in dm_log. Created in code rather than in migrations/ for the reason
  * initReportsTable gives: CI deploys the worker without running
  * `wrangler d1 migrations apply`.
  *
@@ -70,7 +70,6 @@ export async function initPrivateReportIntakeTable(db) {
       reported_pubkey TEXT NOT NULL,
       report_type TEXT NOT NULL,
       gift_wrap_id TEXT NOT NULL,
-      conversation_id TEXT,
       has_excerpt INTEGER NOT NULL DEFAULT 0,
       reported_at TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending'
@@ -162,8 +161,8 @@ export function canonicalPrivateReportType(reportType) {
  *
  * @param {D1Database} db
  * @param {{reportId: string, reporterPubkey: string, reportedPubkey: string,
- *   reportType: string, giftWrapId: string, conversationId: string,
- *   hasExcerpt: boolean, reportedAt: string}} report
+ *   reportType: string, giftWrapId: string, hasExcerpt: boolean,
+ *   reportedAt: string}} report
  * @returns {Promise<{inserted: boolean}>}
  */
 export async function recordPrivateReportIntake(db, {
@@ -172,22 +171,20 @@ export async function recordPrivateReportIntake(db, {
   reportedPubkey,
   reportType,
   giftWrapId,
-  conversationId,
   hasExcerpt,
   reportedAt,
 }) {
   const result = await db.prepare(`
     INSERT OR IGNORE INTO private_report_intake (
       report_id, reporter_pubkey, reported_pubkey, report_type,
-      gift_wrap_id, conversation_id, has_excerpt, reported_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      gift_wrap_id, has_excerpt, reported_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
   `).bind(
     reportId,
     reporterPubkey,
     reportedPubkey,
     reportType,
     giftWrapId,
-    conversationId ?? null,
     hasExcerpt ? 1 : 0,
     reportedAt,
   ).run();

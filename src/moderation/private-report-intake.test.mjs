@@ -22,7 +22,6 @@ const REPORTER = 'a'.repeat(63) + '1';
 const SECOND_REPORTER = 'a'.repeat(63) + '2';
 const REPORTED = 'b'.repeat(63) + '1';
 const GIFT_WRAP = 'c'.repeat(63) + '1';
-const CONVERSATION = 'd'.repeat(63) + '1';
 const REPORT_ID = '3f2b8c1e-4a5d-4e6f-9a7b-1c2d3e4f5a6b';
 const ADMIN_KEY = 'test-relay-admin-key';
 const NOW_MS = Date.parse('2026-11-07T12:00:00.000Z');
@@ -42,7 +41,6 @@ function intakeRow(overrides = {}) {
     reportedPubkey: REPORTED,
     reportType: 'harassment',
     giftWrapId: GIFT_WRAP,
-    conversationId: CONVERSATION,
     hasExcerpt: false,
     reportedAt: '2026-11-07T11:00:00.000Z',
     ...overrides,
@@ -144,7 +142,6 @@ describe('private report intake', () => {
         reported_pubkey: REPORTED,
         report_type: 'harassment',
         gift_wrap_id: GIFT_WRAP,
-        conversation_id: CONVERSATION,
         has_excerpt: 1,
         reported_at: '2026-11-07T11:00:00.000Z',
         status: 'pending',
@@ -155,6 +152,8 @@ describe('private report intake', () => {
         last_error: null,
         delivered_at: null,
       });
+      // gift_wrap_id links the row to its dm_log row; nothing else is kept.
+      expect(row).not.toHaveProperty('conversation_id');
     });
 
     it('ignores the same report id from the same reporter, from any gift wrap', async () => {
@@ -217,7 +216,7 @@ describe('private report intake', () => {
       expect(PRIVATE_REPORT_INTAKE_PATH).toBe('/api/internal/private-reports');
       expect(init.method).toBe('POST');
       expect(init.headers).toEqual({ 'Content-Type': 'application/json', 'X-Admin-Key': ADMIN_KEY });
-      // Exactly these keys: no excerpt, no note, no conversation id.
+      // Exactly these keys: no excerpt, no note.
       expect(body).toEqual({
         reportId: REPORT_ID,
         reportedPubkey: REPORTED,
