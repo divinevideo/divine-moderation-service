@@ -214,6 +214,7 @@ This creates an auditable record of human moderation decisions on the Nostr prot
 | **D1** `user_reports` | User-submitted reports with auto-escalation | Permanent |
 | **D1** `dm_log` | Every moderation DM, in and out, including the full rendered enforcement-notice body, and in `unverified_excerpt` the reported person's message as a reporter's app showed it, when a DM report includes one | **One year, decided.** Sweep implemented but disabled pending activation — see below |
 | **D1** `dm_conversation_read_state` | Moderator read marker, one row per conversation | Pruned alongside `dm_log` once a conversation's last message expires; same activation gate |
+| **D1** `private_report_intake` | One row per private DM report of a message or an account: reporter, reported account, reason, report and gift wrap ids, and relay-manager delivery state. No message text | **One year, following `dm_log`.** Delivered and rejected rows pruned in the same gated sweep; pending rows kept — see below |
 | **Blossom** `media.divine.video` | Source video files | Permanent |
 
 ### `dm_log`: one year, decided — enforcement not yet active
@@ -272,6 +273,64 @@ part of this deploy, and must happen in this order:
 4. Change the tracked `DM_LOG_RETENTION_ENABLED` value to `"true"` in
    `wrangler.toml`, review that configuration change, and deploy it. A
    `wrangler secret put` cannot override a deployed `[vars]` value.
+
+Activating the sweep also starts pruning settled `private_report_intake`
+rows, below; that needs no further step.
+
+### `private_report_intake`: private DM reports, handed to relay-manager
+
+A report a Divine user makes from a direct message — of the message, or of the
+account that sent it — is **private** (divine-mobile#10718): no public NIP-56
+kind-1984, no support ticket, only the NIP-17 DM to the moderation account. A
+kind-1984 would name the reporter beside the person they message, and a ticket
+can be mirrored into a public issue. The DM names the reported account in a
+`["reported_pubkey", <hex>]` rumor tag and carries no video `sha256`, so it has
+no `user_reports` row; until this table it reached only the Messages inbox.
+
+- **Intake.** `processRumor` (`src/nostr/dm-reader.mjs`) records one row per
+  incoming report DM that has a valid `reported_pubkey` and no valid `sha256`,
+  unique on (reporter, report id). The report id is the DM's `batch` tag —
+  divine-mobile mints it once per report and reuses it on every resend — or
+  the gift wrap id when there is none. A re-poll in the reader's two-day
+  overlap, or a resend in a new gift wrap, adds nothing; a failed write is
+  retried on the next poll. The `dm_log` row is written as before.
+- **Delivery.** The five-minute cron hands pending rows to relay-manager
+  (`POST /api/internal/private-reports` over the `RELAY_ADMIN` service binding,
+  falling back to `RELAY_ADMIN_URL` through Cloudflare Access).
+  relay-manager queues the reported account in Coop, whose CSAM and Child
+  Safety queues are ordered first, or opens an age-review case for an under-16
+  (`underage_user`) report. The cron sends CSAM, child-safety and under-16
+  reports first, oldest first within each. A `200` marks a row `delivered`
+  (also when relay-manager answers `duplicate: true`), a `400` marks it
+  `rejected`, which no retry can fix, and anything else keeps it `pending`
+  with its error and a backoff of five minutes, doubling to at most an hour.
+  Nothing here, or in relay-manager's handling, hides, bans or restricts
+  anyone: every outcome is a review item for a moderator.
+- **Privacy.** The row and the handoff hold identifiers only: reporter,
+  reported account, reason, report and gift wrap ids, and whether a message was
+  included. The reporter's note and the included message stay in `dm_log`, the
+  latter in `unverified_excerpt`; neither leaves this service. The reported
+  account is the reporter's claim — the rumor is unsigned and the reported
+  person's own seal is not forwarded — and is treated as an allegation for
+  human review.
+- **Retention.** A row pairs a reporter with the account they reported, the
+  same pairing the report's `dm_log` row holds, so it follows the `dm_log`
+  decision above: one year. `prunePrivateReportIntake`
+  (`src/moderation/private-report-intake.mjs`) deletes delivered and rejected
+  rows a year after they were recorded, in the same `DM_LOG_RETENTION_ENABLED`
+  sweep, so it is not active yet either. A `pending` row is never pruned: it is
+  a report that has not reached a moderator, and deleting it would lose the
+  report.
+
+A `rejected` row is logged loudly and needs a person. To find rows that have
+not been delivered:
+
+```sql
+SELECT report_id, report_type, status, attempts, last_error, next_attempt_at, created_at
+FROM private_report_intake
+WHERE status != 'delivered'
+ORDER BY created_at;
+```
 
 ---
 
