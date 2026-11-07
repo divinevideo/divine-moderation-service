@@ -363,10 +363,6 @@ describe('private report intake', () => {
       });
     }
 
-    // Two runs can overlap (a slow tick and the next one). relay-manager holds
-    // a lease while one attempt is in flight and answers the other with 503
-    // attempt_in_progress; when the first run then marks the row delivered,
-    // the second run's answer must not overwrite it.
     // The re-drive runbook in docs/trust-safety-report.md tells an operator
     // what to do from relay-manager's code, so last_error has to carry it.
     it('keeps relay-manager\'s error code in last_error', async () => {
@@ -387,6 +383,10 @@ describe('private report intake', () => {
       expect(retrying.last_error).toBe('HTTP 503 coop_not_configured');
     });
 
+    // Two runs can overlap (a slow tick and the next one). relay-manager holds
+    // a lease while one attempt is in flight and answers the other with 503
+    // attempt_in_progress; when the first run then marks the row delivered,
+    // the second run's answer must not overwrite it.
     for (const [label, answer] of [
       ['503 attempt_in_progress', () => statusResponse(503, { success: false, code: 'attempt_in_progress' })],
       ['400', () => statusResponse(400, { success: false, code: 'invalid_body' })],
