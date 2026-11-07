@@ -399,6 +399,31 @@ describe('private report intake', () => {
       });
     }
 
+    // What real fetch does on abort once headers are in: the body stream
+    // errors. A body that never finishes must still be cut off by the timeout,
+    // which therefore has to keep running until the body has been read.
+    function stalledBodyResponse(signal) {
+      const body = new ReadableStream({
+        start(controller) {
+          signal.addEventListener('abort', () => controller.error(new DOMException('The operation was aborted', 'AbortError')));
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+
+    it('times out a response whose body never finishes', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      relayAdmin.fetch.mockImplementation(async (url, init) => stalledBodyResponse(init.signal));
+      await recordPrivateReportIntake(db, intakeRow());
+
+      const summary = await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS, timeoutMs: 50 });
+
+      expect(summary).toMatchObject({ attempted: 1, retrying: 1, delivered: 0 });
+      const [row] = await rows();
+      expect(row.status).toBe('pending');
+      expect(row.last_error).toMatch(/timed out/);
+    }, 5000);
+
     it('grows the backoff with each attempt, up to a cap', () => {
       expect(privateReportRetryDelayMs(1)).toBe(5 * 60 * 1000);
       expect(privateReportRetryDelayMs(2)).toBe(10 * 60 * 1000);

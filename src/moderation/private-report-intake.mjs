@@ -242,9 +242,9 @@ function handoffBody(row) {
  *   failure every other call in this run would hit too: bad credentials or an
  *   unreachable relay-manager.
  */
-async function postHandoff(transport, row) {
+async function postHandoff(transport, row, timeoutMs) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   const init = {
     method: 'POST',
     headers: transport.headers,
@@ -253,21 +253,30 @@ async function postHandoff(transport, row) {
     signal: controller.signal,
   };
 
+  // The timeout covers the body as well as the headers: a response that
+  // stalls after its status line would otherwise hold the run open forever.
   let response;
+  let text;
   try {
     response = transport.binding
       ? await transport.binding.fetch(transport.url, init)
       : await fetch(transport.url, init);
+    text = await response.text();
   } catch (err) {
     const error = err?.name === 'AbortError'
-      ? `timed out after ${DELIVERY_TIMEOUT_MS / 1000}s`
+      ? `timed out after ${timeoutMs / 1000}s`
       : (err?.message || 'request failed');
     return { kind: 'retry', error, stopRun: true };
   } finally {
     clearTimeout(timeoutId);
   }
 
-  const data = await response.json().catch(() => null);
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // Not JSON: classified by status alone below.
+  }
   const detail = typeof data?.error === 'string' && data.error ? `: ${data.error}` : '';
 
   if (response.status === 200 && data?.success === true) {
@@ -343,13 +352,15 @@ async function settlePendingRow(db, assignments, values, id) {
  * Never throws: a delivery failure must not fail the cron step that follows.
  *
  * @param {Object} env - BLOSSOM_DB, RELAY_ADMIN / RELAY_ADMIN_URL, RELAY_ADMIN_API_KEY
- * @param {{nowMs?: number, limit?: number}} [options]
+ * @param {{nowMs?: number, limit?: number, timeoutMs?: number}} [options]
+ *   timeoutMs bounds each call, body included
  * @returns {Promise<{attempted: number, delivered: number, rejected: number,
  *   retrying: number, stoppedEarly: boolean, error?: string}>}
  */
 export async function deliverPendingPrivateReports(env, {
   nowMs = Date.now(),
   limit = DEFAULT_DELIVERY_BATCH_LIMIT,
+  timeoutMs = DELIVERY_TIMEOUT_MS,
 } = {}) {
   const summary = { attempted: 0, delivered: 0, rejected: 0, retrying: 0, stoppedEarly: false };
   const db = env?.BLOSSOM_DB;
@@ -378,7 +389,7 @@ export async function deliverPendingPrivateReports(env, {
 
     for (const row of results) {
       summary.attempted++;
-      const result = await postHandoff(transport, row);
+      const result = await postHandoff(transport, row, timeoutMs);
       const attempts = (row.attempts ?? 0) + 1;
 
       // Every settle is guarded on status = 'pending': if an overlapping run
