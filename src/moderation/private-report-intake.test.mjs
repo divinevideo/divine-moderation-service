@@ -446,6 +446,72 @@ describe('private report intake', () => {
       expect(attempts).toEqual([1, 0, 0]);
     });
 
+    // Fetch rejects with an AbortError once the timeout fires.
+    function hangUntilAborted(init) {
+      return new Promise((resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted', 'AbortError')));
+      });
+    }
+
+    it('stops the run when the fallback is bounced to the Cloudflare Access login', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      globalThis.fetch = vi.fn(async () => new Response(null, {
+        status: 302,
+        headers: { location: 'https://divine.cloudflareaccess.com/cdn-cgi/access/login' },
+      }));
+      for (let i = 0; i < 3; i++) {
+        await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(i), giftWrapId: giftWrapId(i) }));
+      }
+
+      const summary = await deliverPendingPrivateReports(deliveryEnv({
+        RELAY_ADMIN: undefined,
+        RELAY_ADMIN_URL: 'https://relay-admin.example.test',
+      }), { nowMs: NOW_MS });
+
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+      expect(summary).toMatchObject({ attempted: 1, retrying: 1, stoppedEarly: true });
+      expect((await rows())[0].last_error).toContain('Cloudflare Access');
+    });
+
+    // A timeout can be one slow route (Coop for this report's type), so it is
+    // retried for that row and the run goes on. Two in a row look like
+    // relay-manager itself, and the rest of the run would only wait them out.
+    it('retries a single timed-out report and carries on with the run', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // timeout, ok, timeout, ok: never two timeouts in a row.
+      const plan = ['timeout', 'ok', 'timeout', 'ok'];
+      relayAdmin.fetch.mockImplementation(async (url, init) => (
+        plan.shift() === 'timeout' ? hangUntilAborted(init) : okResponse()
+      ));
+      for (let i = 0; i < 4; i++) {
+        await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(i), giftWrapId: giftWrapId(i) }));
+      }
+
+      const summary = await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS, timeoutMs: 20 });
+
+      expect(summary).toMatchObject({ attempted: 4, delivered: 2, retrying: 2, stoppedEarly: false });
+      const timedOut = (await rows()).filter((row) => row.status === 'pending');
+      expect(timedOut).toHaveLength(2);
+      for (const row of timedOut) {
+        expect(row.last_error).toMatch(/timed out/);
+        expect(Date.parse(row.next_attempt_at)).toBe(NOW_MS + privateReportRetryDelayMs(1));
+      }
+    });
+
+    it('stops the run after two consecutive timeouts', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      relayAdmin.fetch.mockImplementation(async (url, init) => hangUntilAborted(init));
+      for (let i = 0; i < 4; i++) {
+        await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(i), giftWrapId: giftWrapId(i) }));
+      }
+
+      const summary = await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS, timeoutMs: 20 });
+
+      expect(relayAdmin.fetch).toHaveBeenCalledTimes(2);
+      expect(summary).toMatchObject({ attempted: 2, retrying: 2, stoppedEarly: true });
+      expect((await rows()).map((row) => row.attempts)).toEqual([1, 1, 0, 0]);
+    });
+
     it('carries on past a 503 for one report, which may be specific to its route', async () => {
       vi.spyOn(console, 'warn').mockImplementation(() => {});
       relayAdmin.fetch.mockImplementation(async (url, init) => (

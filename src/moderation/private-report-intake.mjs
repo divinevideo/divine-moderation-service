@@ -29,7 +29,11 @@ const CANONICAL_PRIVATE_REPORT_TYPES = new Set([
 ]);
 
 const DEFAULT_DELIVERY_BATCH_LIMIT = 20;
-const DELIVERY_TIMEOUT_MS = 15000;
+// Comfortably above relay-manager's worst case for one handoff, about 13s.
+const DELIVERY_TIMEOUT_MS = 30000;
+// One timeout is treated as that report's route being slow; this many in a
+// row as relay-manager being unreachable, which ends the run.
+const CONSECUTIVE_TIMEOUTS_TO_STOP = 2;
 const RETRY_BASE_DELAY_MS = 5 * 60 * 1000;
 const RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
 
@@ -238,9 +242,10 @@ function handoffBody(row) {
  * POST one report to relay-manager and classify the answer.
  *
  * @returns {Promise<{kind: 'delivered'|'rejected'|'retry', outcome?: string|null,
- *   duplicate?: boolean, error?: string, stopRun?: boolean}>} `stopRun` marks a
- *   failure every other call in this run would hit too: bad credentials or an
- *   unreachable relay-manager.
+ *   duplicate?: boolean, error?: string, stopRun?: boolean, timedOut?: boolean}>}
+ *   `stopRun` marks a failure every other call in this run would hit too: bad
+ *   credentials, an Access bounce, or a connection that failed outright.
+ *   `timedOut` is left to the caller, which stops only on consecutive ones.
  */
 async function postHandoff(transport, row, timeoutMs) {
   const controller = new AbortController();
@@ -263,10 +268,10 @@ async function postHandoff(transport, row, timeoutMs) {
       : await fetch(transport.url, init);
     text = await response.text();
   } catch (err) {
-    const error = err?.name === 'AbortError'
-      ? `timed out after ${timeoutMs / 1000}s`
-      : (err?.message || 'request failed');
-    return { kind: 'retry', error, stopRun: true };
+    if (err?.name === 'AbortError') {
+      return { kind: 'retry', error: `timed out after ${timeoutMs / 1000}s`, timedOut: true };
+    }
+    return { kind: 'retry', error: err?.message || 'request failed', stopRun: true };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -386,11 +391,13 @@ export async function deliverPendingPrivateReports(env, {
     if (!results?.length) return summary;
 
     const transport = await resolveTransport(env);
+    let consecutiveTimeouts = 0;
 
     for (const row of results) {
       summary.attempted++;
       const result = await postHandoff(transport, row, timeoutMs);
       const attempts = (row.attempts ?? 0) + 1;
+      consecutiveTimeouts = result.timedOut ? consecutiveTimeouts + 1 : 0;
 
       // Every settle is guarded on status = 'pending': if an overlapping run
       // settled the row while this call was in flight, its answer stands.
@@ -420,7 +427,7 @@ export async function deliverPendingPrivateReports(env, {
           summary.retrying++;
           console.warn(`[PRIVATE-REPORTS] Handoff of report ${row.report_id} (${row.report_type}) failed, attempt ${attempts}, retrying after ${nextAttemptAt}: ${result.error}`);
         }
-        if (result.stopRun) {
+        if (result.stopRun || consecutiveTimeouts >= CONSECUTIVE_TIMEOUTS_TO_STOP) {
           summary.stoppedEarly = true;
           break;
         }
