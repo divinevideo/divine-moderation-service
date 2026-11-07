@@ -646,6 +646,17 @@ describe('private report intake', () => {
         .resolves.toMatchObject({ attempted: 0 });
       expect(relayAdmin.fetch).not.toHaveBeenCalled();
     });
+
+    // The cron delivers even on a tick where syncInbox, which also creates the
+    // table, did not run (no NOSTR_PRIVATE_KEY), and CI never applies migrations.
+    it('creates its table on a database that does not have it yet', async () => {
+      await db.prepare('DROP TABLE IF EXISTS private_report_intake').run();
+
+      const summary = await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS });
+
+      expect(summary).toEqual({ attempted: 0, delivered: 0, rejected: 0, retrying: 0, stoppedEarly: false });
+      expect(await rows()).toEqual([]);
+    });
   });
 
   describe('prunePrivateReportIntake', () => {
@@ -667,6 +678,13 @@ describe('private report intake', () => {
       expect(await prunePrivateReportIntake(db)).toEqual({ deleted: 2 });
 
       expect((await rows()).map((row) => row.id)).toEqual([oldPending.id, recentDelivered.id]);
+    });
+
+    it('creates its table on a database that does not have it yet', async () => {
+      await db.prepare('DROP TABLE IF EXISTS private_report_intake').run();
+
+      expect(await prunePrivateReportIntake(db)).toEqual({ deleted: 0 });
+      expect(await rows()).toEqual([]);
     });
   });
 });
