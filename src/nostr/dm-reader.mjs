@@ -445,7 +445,9 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
         reportedPubkey: reported.pubkey,
         reportType: canonicalPrivateReportType(reportType),
         giftWrapId,
-        hasExcerpt: claimsExcerpt,
+        // What dm_log actually stores, not what the tag claims: a tagged DM
+        // with no excerpt section is stored whole, with no excerpt field.
+        hasExcerpt: Boolean(excerptSplit),
         reportedAt: resolveReportedAt(createdAt),
       };
     } else if (reported.present && !alreadyLogged) {

@@ -700,6 +700,27 @@ describe('DM Reader - processRumor private report intake', () => {
     }
   }
 
+  // hasExcerpt tells relay-manager whether a message is stored beside the
+  // report. A DM tagged as including one but missing the excerpt section is
+  // stored whole, with no unverified_excerpt, so it must say false.
+  it('says no message was included when the tagged DM has no excerpt section', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await processRumor(
+        rumor({ tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity', includesMessage: true }), content: MESSAGE_NOTE }),
+        GIFT_WRAP,
+        MODERATOR,
+        { BLOSSOM_DB: db },
+      );
+    } finally {
+      warn.mockRestore();
+    }
+
+    const dm = await db.prepare('SELECT * FROM dm_log').first();
+    expect(dm.unverified_excerpt).toBeNull();
+    expect((await intakeRows())[0].has_excerpt).toBe(0);
+  });
+
   it('lowercases an uppercase reported_pubkey', async () => {
     await processRumor(
       rumor({ tags: privateReportTags({ label: 'NS-spam', nip56Type: 'spam', reportedPubkey: REPORTED.toUpperCase() }), content: ACCOUNT_NOTE }),
