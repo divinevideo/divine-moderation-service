@@ -433,9 +433,9 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // message stay in dm_log.
   //
   // Unlike the report write above, this needs no lookup to skip a re-poll: it
-  // stores no timestamp that moves, so INSERT OR IGNORE on (reporter, report
-  // id) makes a re-poll, or a resend of the same report in a new gift wrap, a
-  // no-op, while a write that failed is simply tried again.
+  // stores no timestamp that moves, so ON CONFLICT DO NOTHING on (reporter,
+  // report id) makes a re-poll, or a resend of the same report in a new gift
+  // wrap, a no-op, while a write that failed is simply tried again.
   if (!isOutgoing && isReport && !relatedSha256 && env.BLOSSOM_DB) {
     const reported = parseReportedPubkeyTag(rumorTags);
     if (reported.pubkey) {

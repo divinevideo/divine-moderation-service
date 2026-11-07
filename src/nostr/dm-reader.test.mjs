@@ -823,7 +823,7 @@ describe('DM Reader - processRumor private report intake', () => {
     let failIntakeWrite = true;
     const flakyDb = {
       prepare(sql) {
-        if (failIntakeWrite && sql.includes('INSERT OR IGNORE INTO private_report_intake')) {
+        if (failIntakeWrite && sql.includes('INSERT INTO private_report_intake')) {
           throw new Error('D1_ERROR: Network connection lost');
         }
         return db.prepare(sql);

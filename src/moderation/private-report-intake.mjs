@@ -154,10 +154,12 @@ export function canonicalPrivateReportType(reportType) {
 /**
  * Record a private report for delivery, once.
  *
- * INSERT OR IGNORE on (reporter_pubkey, report_id), so the reader's re-poll of
- * the same gift wrap and a second gift wrap carrying the same report id from
- * the same reporter both leave the first row alone. The caller wraps this in
- * warn-and-continue; a failed insert is simply tried again on the next poll.
+ * ON CONFLICT(reporter_pubkey, report_id) DO NOTHING, so the reader's re-poll
+ * of the same gift wrap and a second gift wrap carrying the same report id
+ * from the same reporter both leave the first row alone. Only that conflict is
+ * ignored: unlike INSERT OR IGNORE, a NOT NULL or CHECK violation throws, so
+ * a malformed row is logged by the caller rather than dropped without a
+ * trace.
  *
  * @param {D1Database} db
  * @param {{reportId: string, reporterPubkey: string, reportedPubkey: string,
@@ -175,10 +177,11 @@ export async function recordPrivateReportIntake(db, {
   reportedAt,
 }) {
   const result = await db.prepare(`
-    INSERT OR IGNORE INTO private_report_intake (
+    INSERT INTO private_report_intake (
       report_id, reporter_pubkey, reported_pubkey, report_type,
       gift_wrap_id, has_excerpt, reported_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(reporter_pubkey, report_id) DO NOTHING
   `).bind(
     reportId,
     reporterPubkey,

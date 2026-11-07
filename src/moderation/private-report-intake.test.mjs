@@ -166,6 +166,15 @@ describe('private report intake', () => {
       expect(all[0].gift_wrap_id).toBe(GIFT_WRAP);
     });
 
+    // Only the (reporter, report id) conflict is ignored. A row that breaks
+    // another constraint is a bug that would otherwise drop the report
+    // without a trace, so it has to throw for the caller to log.
+    it('throws on a constraint violation instead of silently dropping the report', async () => {
+      await expect(recordPrivateReportIntake(db, intakeRow({ reportedPubkey: null })))
+        .rejects.toThrow(/NOT NULL/i);
+      expect(await rows()).toHaveLength(0);
+    });
+
     it('keeps the same report id from two different reporters apart', async () => {
       await recordPrivateReportIntake(db, intakeRow());
       await recordPrivateReportIntake(db, intakeRow({ reporterPubkey: SECOND_REPORTER, giftWrapId: giftWrapId(2) }));
