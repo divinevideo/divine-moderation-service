@@ -1,0 +1,409 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// ABOUTME: Durable intake for private DM reports of a message or an account
+// ABOUTME: Records each report once and hands it to relay-manager for human review
+
+import { isAiReportType, isNsfwReportType } from '../reports.mjs';
+import { getRelayAdminHeaders, getRelayAdminUrl, resolveSecret } from '../relay-admin-transport.mjs';
+
+// relay-manager's internal route for private reports. It queues the reported
+// account in Coop, or opens an age-review case for an under-16 report. It does
+// no enforcement: everything it creates is a review item for a human.
+export const PRIVATE_REPORT_INTAKE_PATH = '/api/internal/private-reports';
+
+// The vocabulary extractReportType resolves a report DM's NS- label to, and the
+// only values the handoff sends.
+const CANONICAL_PRIVATE_REPORT_TYPES = new Set([
+  'spam',
+  'harassment',
+  'violence',
+  'sexual_content',
+  'copyright',
+  'false_information',
+  'child_safety',
+  'csam',
+  'underage_user',
+  'ai_generated',
+  'other',
+]);
+
+const DEFAULT_DELIVERY_BATCH_LIMIT = 20;
+const DELIVERY_TIMEOUT_MS = 15000;
+const RETRY_BASE_DELAY_MS = 5 * 60 * 1000;
+const RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
+
+const HEX_64 = /^[0-9a-f]{64}$/i;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Create private_report_intake if it doesn't exist.
+ *
+ * One row per private report: a DM report of a message or an account, which
+ * carries a `reported_pubkey` tag and no video sha256, so it has no
+ * user_reports row to land in. The row is both the idempotency ledger for the
+ * DM reader's two-day re-poll and the outbox the cron delivers to
+ * relay-manager from.
+ *
+ * It holds identifiers only -- who reported whom, for what, and where the DM
+ * is -- never the reporter's note or the message they included, which stay in
+ * dm_log. Created in code rather than in migrations/ for the reason
+ * initReportsTable gives: CI deploys the worker without running
+ * `wrangler d1 migrations apply`.
+ *
+ * Retention: a row pairs a reporter with the account they reported, the same
+ * pairing the report's dm_log row already holds, so it follows dm_log's
+ * Trust & Safety-decided one-year retention. prunePrivateReportIntake deletes
+ * delivered and rejected rows a year after they were recorded, in the cron
+ * sweep gated by DM_LOG_RETENTION_ENABLED. A row still pending is kept: it is
+ * a report that has not reached a moderator yet, and deleting it would lose
+ * the report. See docs/trust-safety-report.md.
+ *
+ * @param {D1Database} db
+ */
+export async function initPrivateReportIntakeTable(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS private_report_intake (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      report_id TEXT NOT NULL,
+      reporter_pubkey TEXT NOT NULL,
+      reported_pubkey TEXT NOT NULL,
+      report_type TEXT NOT NULL,
+      gift_wrap_id TEXT NOT NULL,
+      conversation_id TEXT,
+      has_excerpt INTEGER NOT NULL DEFAULT 0,
+      reported_at TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'delivered', 'rejected')),
+      outcome TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT,
+      next_attempt_at TEXT,
+      last_error TEXT,
+      delivered_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(reporter_pubkey, report_id)
+    )
+  `).run();
+  await db.prepare(
+    'CREATE INDEX IF NOT EXISTS idx_private_report_intake_pending ON private_report_intake(status, next_attempt_at)'
+  ).run();
+}
+
+/**
+ * The idempotency key for a private report.
+ *
+ * divine-mobile mints one id per report and reuses it on every resend of that
+ * report's DM, as the rumor's `batch` tag, so a resend from the retry worker
+ * maps onto the row the first send created. Only a UUID or a 64-hex token is
+ * taken as one; anything else falls back to the gift wrap id, which still
+ * dedups the reader's re-poll of the same gift wrap.
+ *
+ * @param {Array} tags - rumor tags
+ * @param {string} giftWrapId
+ * @returns {string}
+ */
+export function resolvePrivateReportId(tags, giftWrapId) {
+  const value = (Array.isArray(tags) ? tags : [])
+    .find((tag) => Array.isArray(tag) && tag[0] === 'batch')?.[1];
+  if (typeof value === 'string' && (UUID.test(value) || HEX_64.test(value))) {
+    return value.toLowerCase();
+  }
+  return giftWrapId;
+}
+
+/**
+ * Read a private report's `reported_pubkey` tag.
+ *
+ * It is the reporter's claim about who they are reporting -- the rumor is
+ * unsigned and the reported person's own seal is not forwarded -- so it opens
+ * a review item and nothing else.
+ *
+ * @param {Array} tags - rumor tags
+ * @returns {{present: boolean, pubkey: string|null}} `present` with a null
+ *   `pubkey` means the tag is there but is not 64 hex
+ */
+export function parseReportedPubkeyTag(tags) {
+  const tag = (Array.isArray(tags) ? tags : [])
+    .find((entry) => Array.isArray(entry) && entry[0] === 'reported_pubkey');
+  if (!tag) return { present: false, pubkey: null };
+  const value = tag[1];
+  if (typeof value !== 'string' || !HEX_64.test(value)) {
+    return { present: true, pubkey: null };
+  }
+  return { present: true, pubkey: value.toLowerCase() };
+}
+
+/**
+ * Clamp a resolved report type to the handoff's vocabulary.
+ *
+ * extractReportType returns any normalized string when a DM carries no NS-
+ * label, so a value outside the set is mapped by meaning where the shared
+ * predicates know it, and to 'other' otherwise, which relay-manager queues for
+ * general review.
+ *
+ * @param {string|null|undefined} reportType
+ * @returns {string}
+ */
+export function canonicalPrivateReportType(reportType) {
+  if (CANONICAL_PRIVATE_REPORT_TYPES.has(reportType)) return reportType;
+  if (isNsfwReportType(reportType)) return 'sexual_content';
+  if (isAiReportType(reportType)) return 'ai_generated';
+  return 'other';
+}
+
+/**
+ * Record a private report for delivery, once.
+ *
+ * INSERT OR IGNORE on (reporter_pubkey, report_id), so the reader's re-poll of
+ * the same gift wrap and a second gift wrap carrying the same report id from
+ * the same reporter both leave the first row alone. The caller wraps this in
+ * warn-and-continue; a failed insert is simply tried again on the next poll.
+ *
+ * @param {D1Database} db
+ * @param {{reportId: string, reporterPubkey: string, reportedPubkey: string,
+ *   reportType: string, giftWrapId: string, conversationId: string,
+ *   hasExcerpt: boolean, reportedAt: string}} report
+ * @returns {Promise<{inserted: boolean}>}
+ */
+export async function recordPrivateReportIntake(db, {
+  reportId,
+  reporterPubkey,
+  reportedPubkey,
+  reportType,
+  giftWrapId,
+  conversationId,
+  hasExcerpt,
+  reportedAt,
+}) {
+  const result = await db.prepare(`
+    INSERT OR IGNORE INTO private_report_intake (
+      report_id, reporter_pubkey, reported_pubkey, report_type,
+      gift_wrap_id, conversation_id, has_excerpt, reported_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    reportId,
+    reporterPubkey,
+    reportedPubkey,
+    reportType,
+    giftWrapId,
+    conversationId ?? null,
+    hasExcerpt ? 1 : 0,
+    reportedAt,
+  ).run();
+  return { inserted: (result?.meta?.changes ?? 0) > 0 };
+}
+
+/**
+ * Delay before retrying a report whose handoff failed: five minutes, doubling
+ * per attempt, capped at an hour so a stuck child-safety report is never more
+ * than an hour from its next try once the cause is fixed.
+ *
+ * @param {number} attempts - attempts made so far, including the failed one
+ * @returns {number} milliseconds
+ */
+export function privateReportRetryDelayMs(attempts) {
+  const exponent = Math.max(0, Math.min(attempts - 1, 16));
+  return Math.min(RETRY_BASE_DELAY_MS * 2 ** exponent, RETRY_MAX_DELAY_MS);
+}
+
+function handoffBody(row) {
+  // Identifiers only. The reporter's note and any message they included stay
+  // in dm_log; nothing outside this service receives them.
+  return {
+    reportId: row.report_id,
+    reportedPubkey: row.reported_pubkey,
+    reporterPubkey: row.reporter_pubkey,
+    reportType: row.report_type,
+    reportedAt: row.reported_at,
+    hasExcerpt: row.has_excerpt === 1,
+    giftWrapId: row.gift_wrap_id,
+  };
+}
+
+/**
+ * POST one report to relay-manager and classify the answer.
+ *
+ * @returns {Promise<{kind: 'delivered'|'rejected'|'retry', outcome?: string|null,
+ *   duplicate?: boolean, error?: string, stopRun?: boolean}>} `stopRun` marks a
+ *   failure every other call in this run would hit too: bad credentials or an
+ *   unreachable relay-manager.
+ */
+async function postHandoff(transport, row) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
+  const init = {
+    method: 'POST',
+    headers: transport.headers,
+    body: JSON.stringify(handoffBody(row)),
+    redirect: 'manual',
+    signal: controller.signal,
+  };
+
+  let response;
+  try {
+    response = transport.binding
+      ? await transport.binding.fetch(transport.url, init)
+      : await fetch(transport.url, init);
+  } catch (err) {
+    const error = err?.name === 'AbortError'
+      ? `timed out after ${DELIVERY_TIMEOUT_MS / 1000}s`
+      : (err?.message || 'request failed');
+    return { kind: 'retry', error, stopRun: true };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const data = await response.json().catch(() => null);
+  const detail = typeof data?.error === 'string' && data.error ? `: ${data.error}` : '';
+
+  if (response.status === 200 && data?.success === true) {
+    return {
+      kind: 'delivered',
+      outcome: typeof data.outcome === 'string' ? data.outcome : null,
+      duplicate: data.duplicate === true,
+    };
+  }
+  if (response.status === 400) {
+    return { kind: 'rejected', error: `HTTP 400${detail}` };
+  }
+
+  let error = `HTTP ${response.status}${detail}`;
+  if (response.status === 302 && /cloudflareaccess\.com/i.test(response.headers.get('location') || '')) {
+    error += ' (redirected to Cloudflare Access login)';
+  }
+  const stopRun = response.status === 401 || response.status === 403 || response.status === 302;
+  return { kind: 'retry', error, stopRun };
+}
+
+async function resolveTransport(env) {
+  const url = `${getRelayAdminUrl(env)}${PRIVATE_REPORT_INTAKE_PATH}`;
+  // Same transport callRelayAdminAction uses: the service binding with the
+  // shared X-Admin-Key when bound, else the public edge through Cloudflare
+  // Access. The shared key is never sent across the public edge.
+  const binding = env.RELAY_ADMIN || null;
+  if (!binding) {
+    return { url, binding: null, headers: getRelayAdminHeaders(env) };
+  }
+  const adminKey = await resolveSecret(env.RELAY_ADMIN_API_KEY);
+  if (!adminKey) {
+    console.warn('[PRIVATE-REPORTS] RELAY_ADMIN service binding is present but RELAY_ADMIN_API_KEY is not set; relay-manager will reject the handoff as unauthorized');
+  }
+  return {
+    url,
+    binding,
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey || '' },
+  };
+}
+
+/**
+ * Hand pending private reports to relay-manager. Runs from the cron.
+ *
+ * Takes a bounded batch of pending rows whose backoff has expired, CSAM, child
+ * safety and under-16 reports first and oldest first within each, and POSTs
+ * each one. A 200 (including `duplicate: true`, an earlier attempt that
+ * already landed) marks the row delivered; a 400 marks it rejected, which no
+ * retry can fix; anything else keeps it pending with its error and a growing
+ * backoff. relay-manager dedups on the report id, so a row delivered twice --
+ * an update lost after a successful call, two overlapping runs -- comes back
+ * `duplicate: true` rather than as a second review item.
+ *
+ * Never throws: a delivery failure must not fail the cron step that follows.
+ *
+ * @param {Object} env - BLOSSOM_DB, RELAY_ADMIN / RELAY_ADMIN_URL, RELAY_ADMIN_API_KEY
+ * @param {{nowMs?: number, limit?: number}} [options]
+ * @returns {Promise<{attempted: number, delivered: number, rejected: number,
+ *   retrying: number, stoppedEarly: boolean, error?: string}>}
+ */
+export async function deliverPendingPrivateReports(env, {
+  nowMs = Date.now(),
+  limit = DEFAULT_DELIVERY_BATCH_LIMIT,
+} = {}) {
+  const summary = { attempted: 0, delivered: 0, rejected: 0, retrying: 0, stoppedEarly: false };
+  const db = env?.BLOSSOM_DB;
+  if (!db) return summary;
+
+  try {
+    await initPrivateReportIntakeTable(db);
+    const now = new Date(nowMs).toISOString();
+    const { results } = await db.prepare(`
+      SELECT * FROM private_report_intake
+      WHERE status = 'pending'
+        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+      ORDER BY
+        CASE report_type
+          WHEN 'csam' THEN 0
+          WHEN 'child_safety' THEN 1
+          WHEN 'underage_user' THEN 2
+          ELSE 3
+        END,
+        reported_at ASC,
+        id ASC
+      LIMIT ?
+    `).bind(now, limit).all();
+    if (!results?.length) return summary;
+
+    const transport = await resolveTransport(env);
+
+    for (const row of results) {
+      summary.attempted++;
+      const result = await postHandoff(transport, row);
+      const attempts = (row.attempts ?? 0) + 1;
+
+      if (result.kind === 'delivered') {
+        await db.prepare(`
+          UPDATE private_report_intake
+          SET status = 'delivered', outcome = ?, attempts = ?, last_attempt_at = ?,
+              delivered_at = ?, last_error = NULL, next_attempt_at = NULL
+          WHERE id = ?
+        `).bind(result.outcome, attempts, now, now, row.id).run();
+        summary.delivered++;
+        console.log(`[PRIVATE-REPORTS] Delivered report ${row.report_id} (${row.report_type}) from gift wrap ${row.gift_wrap_id}: ${result.outcome ?? 'no outcome'}${result.duplicate ? ' (already delivered)' : ''}`);
+      } else if (result.kind === 'rejected') {
+        await db.prepare(`
+          UPDATE private_report_intake
+          SET status = 'rejected', attempts = ?, last_attempt_at = ?,
+              last_error = ?, next_attempt_at = NULL
+          WHERE id = ?
+        `).bind(attempts, now, result.error, row.id).run();
+        summary.rejected++;
+        console.error(`[PRIVATE-REPORTS] relay-manager rejected report ${row.report_id} (${row.report_type}) from gift wrap ${row.gift_wrap_id}; it will not be retried and needs a person to look at it: ${result.error}`);
+      } else {
+        const nextAttemptAt = new Date(nowMs + privateReportRetryDelayMs(attempts)).toISOString();
+        await db.prepare(`
+          UPDATE private_report_intake
+          SET attempts = ?, last_attempt_at = ?, last_error = ?, next_attempt_at = ?
+          WHERE id = ?
+        `).bind(attempts, now, result.error, nextAttemptAt, row.id).run();
+        summary.retrying++;
+        console.warn(`[PRIVATE-REPORTS] Handoff of report ${row.report_id} (${row.report_type}) failed, attempt ${attempts}, retrying after ${nextAttemptAt}: ${result.error}`);
+        if (result.stopRun) {
+          summary.stoppedEarly = true;
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    summary.error = err?.message || String(err);
+    console.error('[PRIVATE-REPORTS] Delivery run failed:', summary.error);
+  }
+
+  return summary;
+}
+
+/**
+ * Delete delivered and rejected rows recorded more than a year ago, the
+ * retention initPrivateReportIntakeTable documents. Pending rows are kept.
+ *
+ * @param {D1Database} db
+ * @returns {Promise<{deleted: number}>}
+ */
+export async function prunePrivateReportIntake(db) {
+  await initPrivateReportIntakeTable(db);
+  const result = await db.prepare(`
+    DELETE FROM private_report_intake
+    WHERE status IN ('delivered', 'rejected')
+      AND created_at < datetime('now', '-1 years')
+  `).run();
+  return { deleted: result.meta.changes };
+}
