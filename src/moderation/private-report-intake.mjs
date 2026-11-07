@@ -29,7 +29,10 @@ const CANONICAL_PRIVATE_REPORT_TYPES = new Set([
 ]);
 
 const DEFAULT_DELIVERY_BATCH_LIMIT = 20;
-// Comfortably above relay-manager's worst case for one handoff, about 13s.
+// Comfortably above relay-manager's bound on a Coop handoff, whose Coop call
+// times out at 10s. An under-16 report's handoff has no fixed bound there,
+// because its keycast read has no timeout, so one can run past this and is
+// then retried like any other timeout.
 const DELIVERY_TIMEOUT_MS = 30000;
 // One timeout is treated as that report's route being slow; this many in a
 // row as relay-manager being unreachable, which ends the run.
