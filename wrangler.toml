@@ -286,7 +286,7 @@ crons = ["* * * * *", "*/5 * * * *"]
 # SIGHTENGINE_API_SECRET - (optional, for fallback)
 # HIVE_* secrets are intentionally unused by upload moderation and classification entry points.
 # Do not set them for production unless re-enabling an explicit, reviewed Hive integration.
-# RELAY_ADMIN_URL - relay-admin API host. Default in src/index.mjs is api-relay-prod.divine.video
+# RELAY_ADMIN_URL - relay-admin API host. Default in src/relay-admin-transport.mjs is api-relay-prod.divine.video
 # (divine-relay-admin-api-prod worker, has NOSTR_NSEC binding). Override to
 # api-relay-staging.divine.video or relay.admin.divine.video only when needed.
 # Only used for the public-edge fallback; the RELAY_ADMIN service binding is preferred.

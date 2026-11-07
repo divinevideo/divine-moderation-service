@@ -435,6 +435,14 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // its review row above, and a public report's kind-1984 already reaches the
   // same queue. Only identifiers are recorded; the note and any included
   // message stay in dm_log.
+  //
+  // The intake insert dedups on its unique key, (reporter, report id), and
+  // needs no "already recorded" lookup, unlike the user_reports write above.
+  // The key leaves out the two fields that change between deliveries of
+  // the same report: reported_at, which falls back to receipt time and so can
+  // differ from one poll to the next, and the gift wrap id, which differs on
+  // a resend. ON CONFLICT DO NOTHING therefore makes a re-poll or a resend a
+  // no-op.
   let privateReport = null;
   if (!isOutgoing && isReport && !relatedSha256 && env.BLOSSOM_DB) {
     const reported = parseReportedPubkeyTag(rumorTags);
@@ -462,11 +470,10 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // 'synced'.
   if (alreadyLogged) {
     // A private report already in dm_log was logged before the intake
-    // existed: add its intake row now. The insert is ON CONFLICT DO NOTHING
-    // on (reporter, report id), so a re-poll of a recorded report, or a
-    // resend of it in a new gift wrap, adds nothing. A failure here is
-    // retried on the next poll only while the gift wrap is still inside the
-    // reader's re-poll window, hence an error rather than a warning.
+    // existed: add its intake row now. For a report already recorded this is
+    // a no-op (see above). A failure here is retried on the next poll only
+    // while the gift wrap is still inside the reader's re-poll window, hence
+    // an error rather than a warning.
     if (privateReport) {
       try {
         await recordPrivateReportIntake(env.BLOSSOM_DB, privateReport);

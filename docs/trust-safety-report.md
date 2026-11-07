@@ -305,10 +305,11 @@ no `user_reports` row; until this table it reached only the Messages inbox.
   relay-manager queues the reported account in Coop, whose CSAM and Child
   Safety queues are ordered first, or opens an age-review case for an under-16
   (`underage_user`) report. The cron sends CSAM, child-safety and under-16
-  reports first, in arrival order within each. A `200` marks a row `delivered`
-  (also when relay-manager answers `duplicate: true`), a `400` marks it
-  `rejected`, which no retry can fix, and anything else keeps it `pending`
-  with its error and a backoff of five minutes, doubling to at most an hour.
+  reports first, in arrival order within each. A `200` with `success: true`
+  marks a row `delivered` (also when relay-manager answers
+  `duplicate: true`), a `400` marks it `rejected`, which no retry can fix,
+  and anything else keeps it `pending` with its error and a backoff of five
+  minutes, doubling to at most an hour.
   Nothing here, or in relay-manager's handling, hides, bans or restricts
   anyone: every outcome is a review item for a moderator.
 - **Privacy.** The row and the handoff hold identifiers only: reporter,
