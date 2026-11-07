@@ -28,6 +28,7 @@ import { classifyModerationResult, getKVThresholds, kvThresholdsToEnv, setKVThre
 import { shouldForceAIDetection } from './moderation/ai-detection-policy.mjs';
 import { buildAIOutcomeEvent, buildAIPolicyDecisionEvent, getAIDetectionStats, initAIDetectionEventsTable, recordAIDetectionEvent } from './moderation/ai-detection-events.mjs';
 import { recordReportForReview } from './moderation/report-review.mjs';
+import { deliverPendingPrivateReports, prunePrivateReportIntake } from './moderation/private-report-intake.mjs';
 import { isValidSha256, isValidLookupIdentifier, isValidPubkey, parseMaybeJson, getEventTagValue, parseImetaParams, extractShaFromUrl, extractMediaShaFromEvent } from './validation.mjs';
 import { parseRetryAfterSeconds } from './http-utils.mjs';
 import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
@@ -5335,9 +5336,27 @@ async function runMigration() {
         }
       }
 
+      // Hand private DM reports of a message or an account to relay-manager,
+      // which queues each one for a moderator in Coop (CSAM and child safety
+      // first) or opens an age-review case for an under-16 report. Runs right
+      // after the sync so a report recorded this tick is delivered this tick.
+      // Not gated on NOSTR_PRIVATE_KEY: rows recorded earlier still need
+      // delivering if the sync itself is down. deliverPendingPrivateReports
+      // catches its own failures; the try is so nothing here can stop the
+      // steps below.
+      try {
+        const delivery = await deliverPendingPrivateReports(env);
+        if (delivery.attempted || delivery.error) {
+          console.log(`[PRIVATE-REPORTS] Delivery: ${delivery.delivered} delivered, ${delivery.rejected} rejected, ${delivery.retrying} retrying${delivery.stoppedEarly ? ' (run stopped early)' : ''}${delivery.error ? `, failed: ${delivery.error}` : ''}`);
+        }
+      } catch (err) {
+        console.error('[PRIVATE-REPORTS] Delivery step failed:', err);
+      }
+
       // Prune dm_log rows past the Trust & Safety-decided one-year retention
-      // (PR #219, decided 2026-09-14) and any dm_conversation_read_state row
-      // left orphaned by that. Flag-gated and off by default: nobody has run
+      // (PR #219, decided 2026-09-14), any dm_conversation_read_state row
+      // left orphaned by that, and settled private_report_intake rows of the
+      // same age. Flag-gated and off by default: nobody has run
       // the production sizing query yet (divine-mobile#7850), so activation
       // is a deliberate operational decision, not this deploy. KV-throttled
       // to ~daily since the delete is a full retention sweep, not a
@@ -5354,6 +5373,17 @@ async function runMigration() {
             const { pruneExpiredDmLog } = await import('./nostr/dm-store.mjs');
             const { deletedMessages, deletedReadStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
             console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s)`);
+            // private_report_intake follows the same one-year decision: it pairs
+            // a reporter with the account they reported, as the report's
+            // dm_log row does. Only delivered and rejected rows go; a pending
+            // row is a report that has not reached a moderator yet. Its own
+            // try, so a failure here does not hold back the throttle below.
+            try {
+              const { deleted } = await prunePrivateReportIntake(env.BLOSSOM_DB);
+              console.log(`[DM-RETENTION] Pruned ${deleted} settled private_report_intake row(s)`);
+            } catch (intakeErr) {
+              console.error('[DM-RETENTION] private_report_intake prune failed:', intakeErr);
+            }
             if (env.MODERATION_KV) {
               await env.MODERATION_KV.put('dm-log-retention:last-pruned', String(Date.now()));
             }
