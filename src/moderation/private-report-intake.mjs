@@ -304,9 +304,10 @@ async function resolveTransport(env) {
  * each one. A 200 (including `duplicate: true`, an earlier attempt that
  * already landed) marks the row delivered; a 400 marks it rejected, which no
  * retry can fix; anything else keeps it pending with its error and a growing
- * backoff. relay-manager dedups on the report id, so a row delivered twice --
- * an update lost after a successful call, two overlapping runs -- comes back
- * `duplicate: true` rather than as a second review item.
+ * backoff. relay-manager dedups on (reporter, report id), the same key as this
+ * table, so a row delivered twice -- an update lost after a successful call,
+ * two overlapping runs -- comes back `duplicate: true` rather than as a second
+ * review item.
  *
  * Never throws: a delivery failure must not fail the cron step that follows.
  *
