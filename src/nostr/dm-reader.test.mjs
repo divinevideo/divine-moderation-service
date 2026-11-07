@@ -10,9 +10,10 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { wrapEvent } from 'nostr-tools/nip59';
 import { bytesToHex } from '@noble/hashes/utils';
 import { fetchGiftWraps, getModeratorPubkey, processRumor, resolveReportedAt, syncInbox } from './dm-reader.mjs';
-import { initDmLogTable } from './dm-store.mjs';
+import { computeConversationId, initDmLogTable } from './dm-store.mjs';
 import { UNVERIFIED_EXCERPT_HEADING } from './dm-evidence.mjs';
 import { initReportsTable } from '../reports.mjs';
+import { initPrivateReportIntakeTable } from '../moderation/private-report-intake.mjs';
 
 // Generate a stable test key in hex format (matching production usage)
 const testSecretKey = generateSecretKey();
@@ -595,6 +596,262 @@ describe('DM Reader - processRumor reporter-included message', () => {
   });
 });
 
+// divine-mobile#10718: a private report of a message or an account sends no
+// kind-1984 and files no ticket, so this DM is the only copy of it. It names
+// the reported account in a ['reported_pubkey', <hex>] tag (not a 'p' tag,
+// which would add that person to the moderation conversation) and must become
+// exactly one private_report_intake row, which the cron hands to relay-manager.
+describe('DM Reader - processRumor private report intake', () => {
+  const db = env.BLOSSOM_DB;
+  const MODERATOR = 'f'.repeat(63) + '1';
+  const REPORTER = 'a'.repeat(63) + '1';
+  const REPORTED = 'b'.repeat(63) + '1';
+  const SHA256 = 'c'.repeat(63) + '1';
+  const GIFT_WRAP = 'd'.repeat(63) + '1';
+  const SECOND_GIFT_WRAP = 'd'.repeat(63) + '2';
+  const REPORT_ID = '3f2b8c1e-4a5d-4e6f-9a7b-1c2d3e4f5a6b';
+  const MESSAGE_NOTE = 'DM Message Report\nReason: Harassment\nMessage ID: ' + 'e'.repeat(64)
+    + '\nSender Pubkey: ' + REPORTED + '\nDetails: keeps messaging me';
+  const ACCOUNT_NOTE = 'User Report\nReason: Underage User\nUser Pubkey: ' + REPORTED;
+  const EXCERPT = 'you will regret this';
+  const EVIDENCE_TAG = ['evidence', 'unverified_excerpt'];
+
+  // The private report tags in the order divine-mobile sends them:
+  // ContentReportingService.moderationDmTags, then reported_pubkey, then the
+  // evidence tag when the message is included, then the batch tag
+  // DmRepository appends with the report id.
+  function privateReportTags({ label, nip56Type, reportedPubkey = REPORTED, includesMessage = false, batch = REPORT_ID }) {
+    return [
+      ['p', MODERATOR],
+      ['L', 'social.nos.ontology'],
+      ['l', label, 'social.nos.ontology'],
+      ['report_type', nip56Type],
+      ...(reportedPubkey === null ? [] : [['reported_pubkey', reportedPubkey]]),
+      ...(includesMessage ? [EVIDENCE_TAG] : []),
+      ...(batch === null ? [] : [['batch', batch]]),
+    ];
+  }
+
+  function rumor({ tags, content, pubkey = REPORTER }) {
+    return { pubkey, tags, content, created_at: Math.floor(Date.now() / 1000) };
+  }
+
+  async function intakeRows() {
+    return (await db.prepare('SELECT * FROM private_report_intake ORDER BY id').all()).results;
+  }
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await initReportsTable(db);
+    await initPrivateReportIntakeTable(db);
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS moderation_results (
+        sha256 TEXT PRIMARY KEY, action TEXT, provider TEXT, scores TEXT,
+        categories TEXT, raw_response TEXT, moderated_at TEXT,
+        reviewed_by TEXT, reviewed_at TEXT, review_notes TEXT, uploaded_by TEXT
+      )`).run();
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM user_reports').run();
+    await db.prepare('DELETE FROM moderation_results').run();
+    await db.prepare('DELETE FROM private_report_intake').run();
+  });
+
+  for (const { name, label, nip56Type, note, reportType } of [
+    { name: 'message', label: 'NS-harassment', nip56Type: 'profanity', note: MESSAGE_NOTE, reportType: 'harassment' },
+    { name: 'account', label: 'NS-underageUser', nip56Type: 'other', note: ACCOUNT_NOTE, reportType: 'underage_user' },
+  ]) {
+    for (const includesMessage of [false, true]) {
+      it(`a private ${name} report ${includesMessage ? 'with' : 'without'} an included message creates one intake row`, async () => {
+        const content = includesMessage
+          ? `${note}\n\n${UNVERIFIED_EXCERPT_HEADING}\n${EXCERPT}`
+          : note;
+        const outcome = await processRumor(
+          rumor({ tags: privateReportTags({ label, nip56Type, includesMessage }), content }),
+          GIFT_WRAP,
+          MODERATOR,
+          { BLOSSOM_DB: db },
+        );
+        expect(outcome).toBe('synced');
+
+        const rows = await intakeRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          report_id: REPORT_ID,
+          reporter_pubkey: REPORTER,
+          reported_pubkey: REPORTED,
+          report_type: reportType,
+          gift_wrap_id: GIFT_WRAP,
+          conversation_id: computeConversationId(MODERATOR, REPORTER),
+          has_excerpt: includesMessage ? 1 : 0,
+          status: 'pending',
+          attempts: 0,
+        });
+        expect(Date.parse(rows[0].reported_at)).toBeGreaterThan(Date.now() - 60_000);
+        // Identifiers only: neither the note nor the message is copied here.
+        expect(JSON.stringify(rows[0])).not.toContain('keeps messaging me');
+        expect(JSON.stringify(rows[0])).not.toContain(EXCERPT);
+
+        // The inbox side is unchanged.
+        const dm = await db.prepare('SELECT * FROM dm_log').first();
+        expect(dm.message_type).toBe('conversation_report');
+        expect(dm.content).toBe(note);
+        expect(dm.unverified_excerpt).toBe(includesMessage ? EXCERPT : null);
+        expect(await db.prepare('SELECT * FROM user_reports').first()).toBeNull();
+      });
+    }
+  }
+
+  it('lowercases an uppercase reported_pubkey', async () => {
+    await processRumor(
+      rumor({ tags: privateReportTags({ label: 'NS-spam', nip56Type: 'spam', reportedPubkey: REPORTED.toUpperCase() }), content: ACCOUNT_NOTE }),
+      GIFT_WRAP,
+      MODERATOR,
+      { BLOSSOM_DB: db },
+    );
+
+    expect((await intakeRows())[0].reported_pubkey).toBe(REPORTED);
+  });
+
+  it('keys a report without a batch tag on its gift wrap id', async () => {
+    await processRumor(
+      rumor({ tags: privateReportTags({ label: 'NS-spam', nip56Type: 'spam', batch: null }), content: ACCOUNT_NOTE }),
+      GIFT_WRAP,
+      MODERATOR,
+      { BLOSSOM_DB: db },
+    );
+
+    expect((await intakeRows())[0].report_id).toBe(GIFT_WRAP);
+  });
+
+  // A public report's kind-1984 already reaches Coop through Osprey, and a
+  // content report has its own review row: queueing either again would
+  // double-queue it.
+  it('a content report that names a blob creates no intake row, and its review path is unchanged', async () => {
+    const tags = [
+      ...privateReportTags({ label: 'NS-sexualContent', nip56Type: 'nudity' }),
+      ['sha256', SHA256],
+    ];
+    await processRumor(rumor({ tags, content: 'Content Report\nReason: Sexual Content' }), GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+
+    expect(await intakeRows()).toHaveLength(0);
+    const report = await db.prepare('SELECT * FROM user_reports').first();
+    expect(report).toMatchObject({ sha256: SHA256, reporter_pubkey: REPORTER, source: 'dm-report' });
+    expect((await db.prepare('SELECT * FROM moderation_results').first()).action).toBe('REVIEW');
+  });
+
+  it('a report DM without a reported_pubkey creates no intake row', async () => {
+    const outcome = await processRumor(
+      rumor({ tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity', reportedPubkey: null }), content: MESSAGE_NOTE }),
+      GIFT_WRAP,
+      MODERATOR,
+      { BLOSSOM_DB: db },
+    );
+
+    expect(outcome).toBe('synced');
+    expect(await intakeRows()).toHaveLength(0);
+    expect((await db.prepare('SELECT * FROM dm_log').first()).message_type).toBe('conversation_report');
+  });
+
+  it('an ordinary reply that carries a reported_pubkey tag is not a report', async () => {
+    await processRumor(
+      rumor({ tags: [['p', MODERATOR], ['reported_pubkey', REPORTED]], content: 'thanks for looking' }),
+      GIFT_WRAP,
+      MODERATOR,
+      { BLOSSOM_DB: db },
+    );
+
+    expect(await intakeRows()).toHaveLength(0);
+    expect((await db.prepare('SELECT * FROM dm_log').first()).message_type).toBe('creator_reply');
+  });
+
+  it('the moderator\'s own outgoing copy creates nothing', async () => {
+    const tags = privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity' })
+      .map((tag) => (tag[0] === 'p' ? ['p', REPORTER] : tag));
+    await processRumor(rumor({ pubkey: MODERATOR, tags, content: MESSAGE_NOTE }), GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+
+    expect(await intakeRows()).toHaveLength(0);
+  });
+
+  it('ignores a malformed reported_pubkey, warning once rather than on every re-poll', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const malformed = rumor({
+        tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity', reportedPubkey: 'npub1notahexkey' }),
+        content: MESSAGE_NOTE,
+      });
+
+      await processRumor(malformed, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+      await processRumor(malformed, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+
+      expect(await intakeRows()).toHaveLength(0);
+      const pubkeyWarnings = warn.mock.calls.filter(([message]) => String(message).includes('reported_pubkey'));
+      expect(pubkeyWarnings).toHaveLength(1);
+      expect(pubkeyWarnings[0][0]).toContain(GIFT_WRAP);
+      // The DM itself is still in the inbox for a moderator to read.
+      expect((await db.prepare('SELECT * FROM dm_log').first()).message_type).toBe('conversation_report');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a re-poll of the same gift wrap creates no second row', async () => {
+    const report = rumor({ tags: privateReportTags({ label: 'NS-csam', nip56Type: 'illegal' }), content: MESSAGE_NOTE });
+
+    expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db })).toBe('synced');
+    expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db })).toBe('skipped');
+
+    expect(await intakeRows()).toHaveLength(1);
+  });
+
+  // divine-mobile's retry worker re-drives an undelivered report, which sends
+  // a new gift wrap around the same report id.
+  it('a resend of the same report in a new gift wrap creates no second row', async () => {
+    const report = rumor({ tags: privateReportTags({ label: 'NS-childSafety', nip56Type: 'illegal' }), content: MESSAGE_NOTE });
+
+    await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+    await processRumor(report, SECOND_GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+
+    const rows = await intakeRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ report_id: REPORT_ID, gift_wrap_id: GIFT_WRAP, report_type: 'child_safety' });
+    // Both copies stay in the inbox, as before.
+    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(2);
+  });
+
+  // Same reasoning as the user_reports retry above: the DM is logged whether
+  // or not the intake write succeeded, so a re-poll must still try the write.
+  it('retries an intake write that failed, on the next pass over the same gift wrap', async () => {
+    let failIntakeWrite = true;
+    const flakyDb = {
+      prepare(sql) {
+        if (failIntakeWrite && sql.includes('INSERT OR IGNORE INTO private_report_intake')) {
+          throw new Error('D1_ERROR: Network connection lost');
+        }
+        return db.prepare(sql);
+      },
+      batch: (...args) => db.batch(...args),
+      exec: (...args) => db.exec(...args),
+    };
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const report = rumor({ tags: privateReportTags({ label: 'NS-harassment', nip56Type: 'profanity' }), content: MESSAGE_NOTE });
+
+      expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('synced');
+      expect(await intakeRows()).toHaveLength(0);
+      expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('private report'), expect.stringContaining('Network connection lost'));
+
+      failIntakeWrite = false;
+      expect(await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: flakyDb })).toBe('skipped');
+
+      expect(await intakeRows()).toHaveLength(1);
+      expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
 describe('DM Reader - resolveReportedAt', () => {
   const NOW_MS = Date.parse('2026-08-09T12:00:00.000Z');
   const NOW_SECONDS = Math.floor(NOW_MS / 1000);
@@ -1022,5 +1279,55 @@ describe('DM Reader - syncInbox checkpoint guard', () => {
     const dm = await db.prepare('SELECT * FROM dm_log').first();
     expect(dm.content).toBe('DM Message Report\nReason: Harassment');
     expect(dm.unverified_excerpt).toBe('you will regret this');
+  });
+
+  // Same as the excerpt column: the first cron tick after a deploy reaches a
+  // database that has no private_report_intake table yet.
+  it('creates the private report intake table before recording a private report', async () => {
+    const db = env.BLOSSOM_DB;
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DROP TABLE IF EXISTS private_report_intake').run();
+
+    const reporterSk = generateSecretKey();
+    const reportedPubkey = 'b'.repeat(63) + '1';
+    const reportId = '3f2b8c1e-4a5d-4e6f-9a7b-1c2d3e4f5a6b';
+    const giftWrap = wrapEvent({
+      kind: 14,
+      content: 'User Report\nReason: Child Safety\nUser Pubkey: ' + reportedPubkey,
+      tags: [
+        ['p', testPubkey],
+        ['L', 'social.nos.ontology'],
+        ['l', 'NS-childSafety', 'social.nos.ontology'],
+        ['report_type', 'illegal'],
+        ['reported_pubkey', reportedPubkey],
+        ['batch', reportId],
+      ],
+      created_at: Math.floor(Date.now() / 1000),
+    }, reporterSk, testPubkey);
+
+    const { restore } = installRelayMock((msg, ctx) => {
+      if (msg[0] === 'REQ') {
+        ctx.reply(['EVENT', msg[1], giftWrap]);
+        ctx.reply(['EOSE', msg[1]]);
+      }
+    });
+
+    try {
+      const result = await syncInbox({ NOSTR_PRIVATE_KEY: testHex, BLOSSOM_DB: db });
+      expect(result).toEqual({ synced: 1, skipped: 0, errors: 0 });
+    } finally {
+      restore();
+    }
+
+    const row = await db.prepare('SELECT * FROM private_report_intake').first();
+    expect(row).toMatchObject({
+      report_id: reportId,
+      reporter_pubkey: getPublicKey(reporterSk),
+      reported_pubkey: reportedPubkey,
+      report_type: 'child_safety',
+      gift_wrap_id: giftWrap.id,
+      status: 'pending',
+    });
   });
 });

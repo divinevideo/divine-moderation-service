@@ -13,6 +13,13 @@ import { hasUnverifiedExcerptTag, splitUnverifiedExcerpt } from './dm-evidence.m
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
 import { findReportByReporter, initReportsTable } from '../reports.mjs';
+import {
+  canonicalPrivateReportType,
+  initPrivateReportIntakeTable,
+  parseReportedPubkeyTag,
+  recordPrivateReportIntake,
+  resolvePrivateReportId,
+} from '../moderation/private-report-intake.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
 // How far back a first sync looks for gift wraps. Also the plausibility floor
@@ -154,10 +161,12 @@ export async function syncInbox(env) {
   // `source` column yet and drop every report it decrypted -- processRumor
   // catches the write failure and moves on. The same goes for dm_log's
   // unverified_excerpt column: without it, a report that includes a message
-  // would fail to log at all.
+  // would fail to log at all. Likewise private_report_intake, which a private
+  // report DM is recorded into below.
   if (env.BLOSSOM_DB) {
     await initReportsTable(env.BLOSSOM_DB);
     await ensureDmLogExcerptColumn(env.BLOSSOM_DB);
+    await initPrivateReportIntakeTable(env.BLOSSOM_DB);
   }
 
   // Get last sync timestamp from KV
@@ -410,6 +419,42 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
       } catch (reportErr) {
         console.warn(`[DM-READER] Failed to record report for review:`, reportErr.message);
       }
+    }
+  }
+
+  // A private report (divine-mobile#10718) of a message or an account sends
+  // no kind-1984 and files no ticket, so this DM is its only copy, and with no
+  // sha256 it has no user_reports row either. It names the reported account in
+  // a ['reported_pubkey', <hex>] tag -- the reporter's claim, for human review
+  // -- and is recorded once in private_report_intake, which the cron hands to
+  // relay-manager for a review item. A content report never qualifies: it has
+  // its review row above, and a public report's kind-1984 already reaches the
+  // same queue. Only identifiers are recorded; the note and any included
+  // message stay in dm_log.
+  //
+  // Unlike the report write above, this needs no lookup to skip a re-poll: it
+  // stores no timestamp that moves, so INSERT OR IGNORE on (reporter, report
+  // id) makes a re-poll, or a resend of the same report in a new gift wrap, a
+  // no-op, while a write that failed is simply tried again.
+  if (!isOutgoing && isReport && !relatedSha256 && env.BLOSSOM_DB) {
+    const reported = parseReportedPubkeyTag(rumorTags);
+    if (reported.pubkey) {
+      try {
+        await recordPrivateReportIntake(env.BLOSSOM_DB, {
+          reportId: resolvePrivateReportId(rumorTags, giftWrapId),
+          reporterPubkey: senderPubkey,
+          reportedPubkey: reported.pubkey,
+          reportType: canonicalPrivateReportType(reportType),
+          giftWrapId,
+          conversationId,
+          hasExcerpt: claimsExcerpt,
+          reportedAt: resolveReportedAt(createdAt),
+        });
+      } catch (intakeErr) {
+        console.warn(`[DM-READER] Failed to record private report from gift wrap ${giftWrapId} for review:`, intakeErr.message);
+      }
+    } else if (reported.present && !alreadyLogged) {
+      console.warn(`[DM-READER] Ignoring malformed reported_pubkey tag on report DM ${giftWrapId}; it stays in the inbox but is not queued for review`);
     }
   }
 
