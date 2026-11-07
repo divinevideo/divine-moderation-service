@@ -10,28 +10,43 @@
 // rows the real classify path writes -- so a change on either side of the
 // producer/consumer contract fails here rather than in production.
 
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { env } from 'cloudflare:test';
 import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { wrapEvent, unwrapEvent } from 'nostr-tools/nip59';
 import { processRumor } from './dm-reader.mjs';
 import { initDmLogTable } from './dm-store.mjs';
 import { initReportsTable } from '../reports.mjs';
+import {
+  deliverPendingPrivateReports,
+  initPrivateReportIntakeTable,
+} from '../moderation/private-report-intake.mjs';
 
 const SHA256 = 'b'.repeat(64);
 
 // Byte-for-byte what ContentReportingService.moderationDmTags() produces,
 // after dm_repository.sendMessage -> nip17_message_service.buildRumor
-// prepends the ['p', recipient] tag. reportContent appends
-// unverifiedExcerptTag last when the reporter includes the reported message
-// (divine-mobile#7340).
-function mobileReportDmTags({ nip32Label, nip56Type, sha256, includesMessage = false }) {
+// prepends the ['p', recipient] tag. A private report (divine-mobile#10718)
+// adds ['reported_pubkey', <hex>] after them. reportContent then appends
+// unverifiedExcerptTag when the reporter includes the reported message
+// (divine-mobile#7340), and DmRepository appends ['batch', <reportId>] last,
+// the report id the retry worker reuses on every resend.
+function mobileReportDmTags({
+  nip32Label,
+  nip56Type,
+  sha256,
+  reportedPubkey = null,
+  includesMessage = false,
+  batch = null,
+}) {
   return [
     ['L', 'social.nos.ontology'],
     ['l', nip32Label, 'social.nos.ontology'],
     ['report_type', nip56Type],
     ...(sha256 ? [['sha256', sha256]] : []),
+    ...(reportedPubkey ? [['reported_pubkey', reportedPubkey]] : []),
     ...(includesMessage ? [['evidence', 'unverified_excerpt']] : []),
+    ...(batch ? [['batch', batch]] : []),
   ];
 }
 
@@ -52,8 +67,10 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     await db.prepare('DROP TABLE IF EXISTS dm_log').run();
     await db.prepare('DROP TABLE IF EXISTS user_reports').run();
     await db.prepare('DROP TABLE IF EXISTS moderation_results').run();
+    await db.prepare('DROP TABLE IF EXISTS private_report_intake').run();
     await initDmLogTable(db);
     await initReportsTable(db);
+    await initPrivateReportIntakeTable(db);
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS moderation_results (
         sha256 TEXT PRIMARY KEY, action TEXT, provider TEXT, scores TEXT,
@@ -88,7 +105,7 @@ describe('divine-mobile#6593 cross-repo contract', () => {
     const outcome = await processRumor(rumor, giftWrapId, moderatorPubkey, {
       BLOSSOM_DB: db,
     });
-    return { rumor, outcome };
+    return { rumor, outcome, giftWrap };
   }
 
   it('an aiGenerated content report survives the wire as ai_generated', async () => {
@@ -372,5 +389,145 @@ describe('divine-mobile#6593 cross-repo contract', () => {
 
     expect(extractReportType(rumor)).toBe(extractReportType(kind1984));
     expect(extractReportType(rumor)).toBe('ai_generated');
+  });
+
+  // divine-mobile#10718: a private report of a message or an account has no
+  // public kind-1984 and no ticket, so this DM is the only way it reaches a
+  // moderator queue. It must become one review handoff naming the reported
+  // account, and the message the reporter included must not leave this
+  // service.
+  describe('private reports', () => {
+    const REPORTED = 'f'.repeat(63) + '1';
+    const REPORT_ID = '0d6f3c2a-8b1e-4f7a-9c3d-5e6f7a8b9c0d';
+
+    async function deliverAndCapture() {
+      const posted = [];
+      const summary = await deliverPendingPrivateReports({
+        BLOSSOM_DB: db,
+        RELAY_ADMIN_API_KEY: 'test-relay-admin-key',
+        RELAY_ADMIN: {
+          fetch: vi.fn(async (url, init) => {
+            posted.push({ url, body: JSON.parse(init.body) });
+            return new Response(JSON.stringify({ success: true, outcome: 'queued_in_coop', duplicate: false }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }),
+        },
+      });
+      return { summary, posted };
+    }
+
+    it('a private message report that includes the message hands off identifiers only', async () => {
+      const note = 'DM Message Report\nReason: Harassment\nMessage ID: ' + 'd'.repeat(64)
+        + '\nSender Pubkey: ' + REPORTED
+        + '\nDetails: keeps messaging me';
+      const message = 'you will regret this';
+
+      const { rumor, outcome, giftWrap } = await roundTrip(
+        mobileReportDmTags({
+          nip32Label: 'NS-harassment',
+          nip56Type: 'profanity',
+          sha256: null,
+          reportedPubkey: REPORTED,
+          includesMessage: true,
+          batch: REPORT_ID,
+        }),
+        mobileDmContentWithMessage(note, message),
+        'e'.repeat(63) + '1',
+      );
+
+      // The tag order divine-mobile sends for a private report, pinned.
+      expect(rumor.tags).toEqual([
+        ['p', moderatorPubkey],
+        ['L', 'social.nos.ontology'],
+        ['l', 'NS-harassment', 'social.nos.ontology'],
+        ['report_type', 'profanity'],
+        ['reported_pubkey', REPORTED],
+        ['evidence', 'unverified_excerpt'],
+        ['batch', REPORT_ID],
+      ]);
+      expect(giftWrap.kind).toBe(1059);
+      expect(outcome).toBe('synced');
+
+      // The inbox keeps the report and its labelled excerpt, as before.
+      const dm = await db.prepare('SELECT * FROM dm_log').first();
+      expect(dm.message_type).toBe('conversation_report');
+      expect(dm.content).toBe(note);
+      expect(dm.unverified_excerpt).toBe(message);
+
+      const { summary, posted } = await deliverAndCapture();
+      expect(summary.delivered).toBe(1);
+      expect(posted).toHaveLength(1);
+      expect(new URL(posted[0].url).pathname).toBe('/api/internal/private-reports');
+      expect(posted[0].body).toEqual({
+        reportId: REPORT_ID,
+        reportedPubkey: REPORTED,
+        reporterPubkey: getPublicKey(reporterSk),
+        reportType: 'harassment',
+        reportedAt: expect.any(String),
+        hasExcerpt: true,
+        giftWrapId: 'e'.repeat(63) + '1',
+      });
+      expect(JSON.stringify(posted[0].body)).not.toContain(message);
+      expect(JSON.stringify(posted[0].body)).not.toContain('keeps messaging me');
+    });
+
+    it('a private under-16 account report hands off as underage_user', async () => {
+      await roundTrip(
+        mobileReportDmTags({
+          nip32Label: 'NS-underageUser',
+          nip56Type: 'other',
+          sha256: null,
+          reportedPubkey: REPORTED,
+          batch: REPORT_ID,
+        }),
+        'User Report\nReason: Underage User\nUser Pubkey: ' + REPORTED,
+        'e'.repeat(63) + '2',
+      );
+
+      const { posted } = await deliverAndCapture();
+      expect(posted.map(({ body }) => [body.reportType, body.reportedPubkey, body.hasExcerpt]))
+        .toEqual([['underage_user', REPORTED, false]]);
+    });
+
+    // A resend from divine-mobile's retry worker is a new gift wrap with new
+    // random keys around the same report id: one review item, not two.
+    it('a resend of the same report is handed off once', async () => {
+      const tags = mobileReportDmTags({
+        nip32Label: 'NS-childSafety',
+        nip56Type: 'illegal',
+        sha256: null,
+        reportedPubkey: REPORTED,
+        batch: REPORT_ID,
+      });
+      const content = 'User Report\nReason: Child Safety\nUser Pubkey: ' + REPORTED;
+
+      const first = await roundTrip(tags, content, 'e'.repeat(63) + '3');
+      const second = await roundTrip(tags, content, 'e'.repeat(63) + '4');
+      expect(first.giftWrap.id).not.toBe(second.giftWrap.id);
+
+      const { posted } = await deliverAndCapture();
+      expect(posted).toHaveLength(1);
+      expect(posted[0].body.reportType).toBe('child_safety');
+    });
+
+    // A public report keeps its kind-1984 path into the queue, so its DM must
+    // not add a second handoff -- it carries no reported_pubkey.
+    it('a public report DM, which carries no reported_pubkey, hands off nothing', async () => {
+      await roundTrip(
+        mobileReportDmTags({
+          nip32Label: 'NS-harassment',
+          nip56Type: 'profanity',
+          sha256: null,
+          batch: REPORT_ID,
+        }),
+        'User Report\nReason: Harassment\nUser Pubkey: ' + REPORTED,
+        'e'.repeat(63) + '5',
+      );
+
+      const { posted } = await deliverAndCapture();
+      expect(posted).toHaveLength(0);
+    });
   });
 });
