@@ -203,6 +203,41 @@ export function preparePrivateReportIntakeInsert(db, {
 }
 
 /**
+ * Log a report whose insert changed nothing because its (reporter, report id)
+ * is already recorded, when it is not the same report: it names a different
+ * account or reason. The recorded row is left as it is, so the conflicting
+ * DM is never queued; this makes sure someone hears about it. A faithful
+ * resend, the usual reason for a conflict, logs nothing.
+ *
+ * Logs report and gift wrap ids only, never a pubkey. Never throws: the
+ * report's writes have already landed and a failed check must not undo that.
+ *
+ * @param {D1Database} db
+ * @param {Object} report - as for preparePrivateReportIntakeInsert
+ * @returns {Promise<boolean>} true when a conflict was logged
+ */
+export async function logConflictingPrivateReport(db, report) {
+  try {
+    const stored = await db.prepare(`
+      SELECT reported_pubkey, report_type, gift_wrap_id
+      FROM private_report_intake
+      WHERE reporter_pubkey = ? AND report_id = ?
+    `).bind(report.reporterPubkey, report.reportId).first();
+    if (!stored) return false;
+    const differs = [
+      stored.reported_pubkey !== report.reportedPubkey && 'reported account',
+      stored.report_type !== report.reportType && 'reason',
+    ].filter(Boolean);
+    if (!differs.length) return false;
+    console.error(`[PRIVATE-REPORTS] Report ${report.reportId} in gift wrap ${report.giftWrapId} names a different ${differs.join(' and ')} than the report recorded under that id from gift wrap ${stored.gift_wrap_id}. The recorded report is kept and this one is not queued for review; read both DMs in the Messages inbox.`);
+    return true;
+  } catch (err) {
+    console.error(`[PRIVATE-REPORTS] Could not check report ${report.reportId} in gift wrap ${report.giftWrapId} against the report already recorded under that id:`, err?.message || String(err));
+    return false;
+  }
+}
+
+/**
  * Record a private report on its own, once: the DM reader's path for a report
  * whose dm_log row already exists. See preparePrivateReportIntakeInsert.
  *

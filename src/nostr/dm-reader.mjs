@@ -16,6 +16,7 @@ import { findReportByReporter, initReportsTable } from '../reports.mjs';
 import {
   canonicalPrivateReportType,
   initPrivateReportIntakeTable,
+  logConflictingPrivateReport,
   parseReportedPubkeyTag,
   preparePrivateReportIntakeInsert,
   recordPrivateReportIntake,
@@ -513,16 +514,24 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   // while the gift wrap is still inside the reader's re-poll window. The
   // throw reaches syncInbox, which counts it as an error.
   if (privateReport) {
+    let dmResult;
+    let intakeResult;
     try {
-      const [dmResult] = await env.BLOSSOM_DB.batch([
+      [dmResult, intakeResult] = await env.BLOSSOM_DB.batch([
         prepareDmLogInsert(env.BLOSSOM_DB, dmEntry),
         preparePrivateReportIntakeInsert(env.BLOSSOM_DB, privateReport),
       ]);
-      return dmResult?.meta?.last_row_id ? 'synced' : 'skipped';
     } catch (writeErr) {
       console.error(`[DM-READER] Failed to store private report from gift wrap ${giftWrapId}; neither its inbox copy nor its review intake was written, and the next poll retries both while the gift wrap is still re-polled:`, writeErr.message);
       throw writeErr;
     }
+    // The intake insert changed nothing: this (reporter, report id) is
+    // already recorded, from an earlier gift wrap. Checked here, on the
+    // gift wrap's first sight, so its re-polls do not repeat the log.
+    if ((intakeResult?.meta?.changes ?? 0) === 0) {
+      await logConflictingPrivateReport(env.BLOSSOM_DB, privateReport);
+    }
+    return dmResult?.meta?.last_row_id ? 'synced' : 'skipped';
   }
 
   const result = await logDm(env.BLOSSOM_DB, dmEntry);

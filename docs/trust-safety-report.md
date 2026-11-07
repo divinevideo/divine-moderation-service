@@ -296,7 +296,12 @@ no `user_reports` row; until this table it reached only the Messages inbox.
   row and its intake row are written in one D1 batch, so a failure leaves
   neither and the next poll retries both, as for any DM whose write failed —
   but only while the gift wrap is still inside the reader's two-day re-poll
-  window.
+  window. A resend that reuses a report id but names a different account or
+  reason is not queued: the recorded report is kept, and the reader logs the
+  conflict as an error on that DM's first sight, with the report id and both
+  gift wrap ids (`dm_log.nostr_event_id` is a row's `gift_wrap_id`), so a
+  moderator can read both DMs in the Messages inbox and handle the second by
+  hand.
   A private report already in `dm_log` before the intake shipped gets only
   its intake row, on the next poll that sees its gift wrap; a failure there
   is logged as an error and retried only while the gift wrap is still
@@ -352,10 +357,13 @@ the cause first, using `last_error`:
 - `invalid_body`: the row's data and relay-manager's validation disagree.
   Correct whichever side is wrong — the row, or relay-manager's validation in
   a deploy — before re-driving.
-- `report_id_conflict`: this reporter already sent a different report under
-  the same report id, naming another account or reason. Read both DMs in the
-  Messages inbox (`dm_log.nostr_event_id` is the row's `gift_wrap_id`) and
-  decide by hand; re-driving the same row only conflicts again.
+- `report_id_conflict`: relay-manager holds a different report under this
+  row's (reporter, report id). This service never sends one: it delivers
+  each row with the values it first recorded, and a later DM that reuses a
+  report id with a different account or reason is never queued (see
+  **Intake** above). So this answer means relay-manager's stored report and
+  this row disagree. Compare the two before re-driving, which otherwise only
+  conflicts again.
 
 Then put the row back in the queue. The next five-minute cron delivers it,
 in priority order, as if it were new:

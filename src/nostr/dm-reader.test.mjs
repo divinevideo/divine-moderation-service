@@ -826,17 +826,70 @@ describe('DM Reader - processRumor private report intake', () => {
   // divine-mobile's retry worker re-drives an undelivered report, which sends
   // a new gift wrap around the same report id.
   it('a resend of the same report in a new gift wrap creates no second row', async () => {
-    const report = rumor({ tags: privateReportTags({ label: 'NS-childSafety', nip56Type: 'illegal' }), content: MESSAGE_NOTE });
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const report = rumor({ tags: privateReportTags({ label: 'NS-childSafety', nip56Type: 'illegal' }), content: MESSAGE_NOTE });
 
-    await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
-    await processRumor(report, SECOND_GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+      await processRumor(report, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+      await processRumor(report, SECOND_GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
 
-    const rows = await intakeRows();
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ report_id: REPORT_ID, gift_wrap_id: GIFT_WRAP, report_type: 'child_safety' });
-    // Both copies stay in the inbox, as before.
-    expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(2);
+      const rows = await intakeRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ report_id: REPORT_ID, gift_wrap_id: GIFT_WRAP, report_type: 'child_safety' });
+      // Both copies stay in the inbox, as before.
+      expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(2);
+      // A faithful resend is not a conflict.
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
+
+  // A resend under the same report id that names another account or reason
+  // is not the report already recorded, and keeping the first one silently
+  // would hide that. It is logged once, by ids only, and the recorded report
+  // is left as it is; a moderator reads both DMs in the inbox.
+  for (const [what, changed] of [
+    ['account', { reportedPubkey: 'b'.repeat(63) + '2' }],
+    ['reason', { label: 'NS-spam', nip56Type: 'spam' }],
+  ]) {
+    it(`logs a resend under the same report id that names a different ${what}, once, and keeps the recorded report`, async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const first = rumor({ tags: privateReportTags({ label: 'NS-childSafety', nip56Type: 'illegal' }), content: MESSAGE_NOTE });
+        const conflicting = rumor({
+          tags: privateReportTags({ label: 'NS-childSafety', nip56Type: 'illegal', ...changed }),
+          content: MESSAGE_NOTE,
+        });
+
+        await processRumor(first, GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+        expect(await processRumor(conflicting, SECOND_GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db })).toBe('synced');
+        // A re-poll of the conflicting gift wrap does not repeat the log.
+        await processRumor(conflicting, SECOND_GIFT_WRAP, MODERATOR, { BLOSSOM_DB: db });
+
+        const rows = await intakeRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          gift_wrap_id: GIFT_WRAP,
+          reported_pubkey: REPORTED,
+          report_type: 'child_safety',
+        });
+        // The conflicting DM is still in the inbox for a moderator.
+        expect((await db.prepare('SELECT * FROM dm_log').all()).results).toHaveLength(2);
+
+        expect(error).toHaveBeenCalledTimes(1);
+        const [message] = error.mock.calls[0];
+        expect(message).toContain(REPORT_ID);
+        expect(message).toContain(SECOND_GIFT_WRAP);
+        expect(message).toContain(GIFT_WRAP);
+        for (const pubkey of [REPORTER, REPORTED, 'b'.repeat(63) + '2']) {
+          expect(JSON.stringify(error.mock.calls)).not.toContain(pubkey);
+        }
+      } finally {
+        error.mockRestore();
+      }
+    });
+  }
 
   // The inbox copy and the review intake are one write. If the intake insert
   // failed on its own, the DM would sit in dm_log looking handled while the
