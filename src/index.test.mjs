@@ -54,6 +54,22 @@ vi.mock('./nostr/publisher.mjs', async (importOriginal) => {
   };
 });
 
+const privateReportMocks = vi.hoisted(() => ({
+  deliverPendingPrivateReports: vi.fn().mockResolvedValue({
+    attempted: 0, delivered: 0, rejected: 0, retrying: 0, stoppedEarly: false
+  }),
+  prunePrivateReportIntake: vi.fn().mockResolvedValue({ deleted: 0 })
+}));
+
+vi.mock('./moderation/private-report-intake.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    deliverPendingPrivateReports: privateReportMocks.deliverPendingPrivateReports,
+    prunePrivateReportIntake: privateReportMocks.prunePrivateReportIntake
+  };
+});
+
 import worker from './index.mjs';
 
 const SHA256 = 'a'.repeat(64);
@@ -753,6 +769,114 @@ describe('HTTP hostname routing', () => {
       action: 'PERMANENT_BAN',
       blocked: true
     });
+  });
+});
+
+describe('scheduled private report delivery', () => {
+  function createCronEnv(overrides = {}) {
+    return createEnv({ RELAY_POLLING_ENABLED: 'false', ...overrides });
+  }
+
+  async function runFiveMinuteCron(env) {
+    await worker.scheduled(
+      { cron: '*/5 * * * *', scheduledTime: Date.now() },
+      env,
+      { waitUntil: () => {} }
+    );
+  }
+
+  it('hands pending private reports to relay-manager on the five-minute cron', async () => {
+    privateReportMocks.deliverPendingPrivateReports.mockClear();
+    const env = createCronEnv();
+
+    await runFiveMinuteCron(env);
+
+    expect(privateReportMocks.deliverPendingPrivateReports).toHaveBeenCalledTimes(1);
+    expect(privateReportMocks.deliverPendingPrivateReports).toHaveBeenCalledWith(env);
+  });
+
+  it('does not deliver from the every-minute cron', async () => {
+    privateReportMocks.deliverPendingPrivateReports.mockClear();
+
+    await worker.scheduled(
+      { cron: '* * * * *', scheduledTime: Date.now() },
+      createCronEnv(),
+      { waitUntil: () => {} }
+    );
+
+    expect(privateReportMocks.deliverPendingPrivateReports).not.toHaveBeenCalled();
+  });
+
+  it('keeps going when delivery throws, so the steps after it still run', async () => {
+    privateReportMocks.deliverPendingPrivateReports.mockClear();
+    privateReportMocks.deliverPendingPrivateReports.mockRejectedValueOnce(new Error('relay-manager down'));
+    publisherMocks.publishDmInboxRelayList.mockReset();
+    publisherMocks.publishDmInboxRelayList.mockResolvedValue({
+      published: true, homeRelayPublished: true, relays: ['wss://relay.divine.video'], failed: []
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await expect(runFiveMinuteCron(createCronEnv({ DM_INBOX_PUBLISH_ENABLED: 'true' }))).resolves.toBeUndefined();
+
+      expect(publisherMocks.publishDmInboxRelayList).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[PRIVATE-REPORTS]'),
+        expect.any(Error)
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('prunes settled intake rows in the gated dm_log retention sweep', async () => {
+    privateReportMocks.prunePrivateReportIntake.mockClear();
+    const db = {
+      ...createDbMock(),
+      async batch() {
+        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }];
+      }
+    };
+
+    await runFiveMinuteCron(createCronEnv({ DM_LOG_RETENTION_ENABLED: 'true', BLOSSOM_DB: db }));
+
+    expect(privateReportMocks.prunePrivateReportIntake).toHaveBeenCalledWith(db);
+  });
+
+  it('still records the retention sweep when the intake prune fails', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    privateReportMocks.prunePrivateReportIntake.mockRejectedValueOnce(new Error('D1_ERROR: prune failed'));
+    const kvPuts = [];
+    const db = {
+      ...createDbMock(),
+      async batch() {
+        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }];
+      }
+    };
+
+    try {
+      await runFiveMinuteCron(createCronEnv({
+        DM_LOG_RETENTION_ENABLED: 'true',
+        BLOSSOM_DB: db,
+        MODERATION_KV: {
+          ...createEnv().MODERATION_KV,
+          async put(key, value) { kvPuts.push([key, value]); },
+        },
+      }));
+
+      expect(errorSpy).toHaveBeenCalledWith('[DM-RETENTION] private_report_intake prune failed:', expect.any(Error));
+      expect(kvPuts.map(([key]) => key)).toContain('dm-log-retention:last-pruned');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('does not prune intake rows while dm_log retention is off', async () => {
+    privateReportMocks.prunePrivateReportIntake.mockClear();
+
+    await runFiveMinuteCron(createCronEnv({ DM_LOG_RETENTION_ENABLED: 'false' }));
+
+    expect(privateReportMocks.prunePrivateReportIntake).not.toHaveBeenCalled();
   });
 });
 
