@@ -282,7 +282,10 @@ async function postHandoff(transport, row, timeoutMs) {
   } catch {
     // Not JSON: classified by status alone below.
   }
-  const detail = typeof data?.error === 'string' && data.error ? `: ${data.error}` : '';
+  // relay-manager's `code` (report_id_conflict, coop_not_configured, ...) is
+  // what an operator acts on, so it leads the stored error, ahead of the text.
+  const code = typeof data?.code === 'string' && data.code ? ` ${data.code}` : '';
+  const detail = `${code}${typeof data?.error === 'string' && data.error ? `: ${data.error}` : ''}`;
 
   if (response.status === 200 && data?.success === true) {
     return {

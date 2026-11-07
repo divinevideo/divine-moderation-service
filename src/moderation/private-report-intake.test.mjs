@@ -367,6 +367,26 @@ describe('private report intake', () => {
     // a lease while one attempt is in flight and answers the other with 503
     // attempt_in_progress; when the first run then marks the row delivered,
     // the second run's answer must not overwrite it.
+    // The re-drive runbook in docs/trust-safety-report.md tells an operator
+    // what to do from relay-manager's code, so last_error has to carry it.
+    it('keeps relay-manager\'s error code in last_error', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      relayAdmin.fetch.mockImplementation(async (url, init) => (
+        JSON.parse(init.body).reportId === reportId(1)
+          ? statusResponse(400, { success: false, code: 'report_id_conflict', error: 'report id already used' })
+          : statusResponse(503, { success: false, code: 'coop_not_configured' })
+      ));
+      await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(1), giftWrapId: giftWrapId(1) }));
+      await recordPrivateReportIntake(db, intakeRow({ reportId: reportId(2), giftWrapId: giftWrapId(2) }));
+
+      await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS });
+
+      const [rejected, retrying] = await rows();
+      expect(rejected.last_error).toBe('HTTP 400 report_id_conflict: report id already used');
+      expect(retrying.last_error).toBe('HTTP 503 coop_not_configured');
+    });
+
     for (const [label, answer] of [
       ['503 attempt_in_progress', () => statusResponse(503, { success: false, code: 'attempt_in_progress' })],
       ['400', () => statusResponse(400, { success: false, code: 'invalid_body' })],
