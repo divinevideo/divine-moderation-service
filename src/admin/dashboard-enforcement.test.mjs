@@ -356,18 +356,20 @@ const LOOKUP_ACTION_SRC = extractFunction(dashboardHTML, 'lookupModerationAction
 const QUICK_ACTION_SRC = extractFunction(dashboardHTML, 'quickAction', 'Quick action:');
 const UNDO_SRC = extractFunction(dashboardHTML, 'undoLastAction', 'Undo: reverted to');
 const SAVE_EDITS_SRC = extractFunction(dashboardHTML, 'saveEdits', 'Manual score override by moderator');
+const CLOSE_EDIT_SRC = extractFunction(dashboardHTML, 'closeEditModal', 'currentEditingVideo = null');
 
 const mintDecisionFns = new Function('ctx', `
   const {
     document, window, fetch, setTimeout, console, alert, setLookupStatus,
     getVideoBySha, refreshLookupResultIfMatches, removeLookupResultIfMatches,
     isFocusedLookupResult, loadRealStats, showHeaderUndo, clearUndo, applyFilters,
-    closeEditModal, loadVideos, lookupVideo, allVideos, paginationState
+    loadVideos, lookupVideo, allVideos, paginationState
   } = ctx;
   let currentToast = null;
   let lastAction = ctx.lastAction;
   let currentEditingSha256 = ctx.currentEditingSha256;
-  let currentLookupSha = null;
+  let currentEditingVideo = null;
+  let currentLookupSha = ctx.currentLookupSha ?? null;
   ${SHOW_TOAST_SRC}
   ${HIDE_TOAST_SRC}
   ${REFUSAL_SRC}
@@ -377,21 +379,25 @@ const mintDecisionFns = new Function('ctx', `
   ${QUICK_ACTION_SRC}
   ${UNDO_SRC}
   ${SAVE_EDITS_SRC}
+  ${CLOSE_EDIT_SRC}
   return { markAsSafe, lookupModerationAction, quickAction, undoLastAction, saveEdits };
 `);
 
 const SHA = 'ab'.repeat(32);
 const LIFT_BLOCK = 'The account that owns this file has an open age review.';
 
-// `focused` puts the decided file in the lookup panel.
-function createDecisionHarness(response, { focused = false } = {}) {
+// `focused` puts the decided file in the lookup panel. `lookupSha` is the
+// hash the lookup panel shows, if any.
+function createDecisionHarness(response, { focused = false, lookupSha = null } = {}) {
   const harness = createHarness({ response });
   const alerts = [];
+  const lookups = [];
   const video = { sha256: SHA, action: 'AGE_RESTRICTED', cdnUrl: 'https://media.test/v.mp4', uploaded_by: PUBKEY };
   const elements = {
     'edit-action': { value: 'SAFE' },
     'edit-reason': { value: '' },
-    'filter-action': { value: 'TRIAGE' }
+    'filter-action': { value: 'TRIAGE' },
+    'edit-modal': { classList: { remove: () => {} } }
   };
   const ctx = {
     document: {
@@ -413,13 +419,13 @@ function createDecisionHarness(response, { focused = false } = {}) {
     showHeaderUndo: () => {},
     clearUndo: () => {},
     applyFilters: () => {},
-    closeEditModal: () => {},
     loadVideos: async () => {},
-    lookupVideo: async () => {},
+    lookupVideo: async (id) => { lookups.push(id); },
     allVideos: [video],
     paginationState: { currentCursor: null },
     lastAction: { sha256: SHA, previousAction: 'SAFE', previousData: video },
     currentEditingSha256: SHA,
+    currentLookupSha: lookupSha,
     fetch: async (url, init) => {
       harness.fetchCalls.push({ url, init });
       return {
@@ -429,7 +435,7 @@ function createDecisionHarness(response, { focused = false } = {}) {
       };
     }
   };
-  return { ...harness, ...mintDecisionFns(ctx), alerts };
+  return { ...harness, ...mintDecisionFns(ctx), alerts, lookups };
 }
 
 function button() {
@@ -515,5 +521,29 @@ describe('dashboard media decisions refused by the lift check', () => {
     expect(said.some((text) => text?.includes('Could not confirm with relay manager'))).toBe(true);
     expect(harness.opened).toEqual([]);
     expect(harness.toasts.map(toastAction).filter(Boolean)).toEqual([]);
+  });
+});
+
+// Edit Scores closes its modal, which forgets the hash being edited, before it
+// refreshes the lookup panel.
+describe('dashboard Edit Scores after a save', () => {
+  const SAVED = { status: 200, body: { success: true } };
+
+  it('refreshes the lookup panel when it shows the edited file', async () => {
+    const harness = createDecisionHarness(SAVED, { lookupSha: SHA });
+
+    await harness.saveEdits();
+
+    expect(harness.lookups).toEqual([SHA]);
+    expect(harness.alerts).toEqual(['Successfully updated scores and action']);
+  });
+
+  it('leaves an empty lookup panel alone', async () => {
+    const harness = createDecisionHarness(SAVED);
+
+    await harness.saveEdits();
+
+    expect(harness.lookups).toEqual([]);
+    expect(harness.alerts).toEqual(['Successfully updated scores and action']);
   });
 });

@@ -5342,6 +5342,8 @@
 
     async function saveEdits() {
       if (!currentEditingSha256) return;
+      // closeEditModal() clears currentEditingSha256, so keep the hash being saved.
+      const sha256 = currentEditingSha256;
 
       // Get all slider values
       const categories = ['nudity', 'violence', 'gore', 'offensive', 'weapon', 'self_harm',
@@ -5361,7 +5363,7 @@
       const reason = document.getElementById('edit-reason').value || 'Manual score override by moderator';
 
       try {
-        const response = await fetch(`/admin/api/moderate/${currentEditingSha256}`, {
+        const response = await fetch(`/admin/api/moderate/${sha256}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -5382,13 +5384,13 @@
         if (document.getElementById('filter-action').value !== 'TRIAGE') {
           await loadVideos(paginationState.currentCursor);
         }
-        if (currentLookupSha === currentEditingSha256) {
-          await lookupVideo(currentEditingSha256);
+        if (currentLookupSha === sha256) {
+          await lookupVideo(sha256);
         }
         alert('Successfully updated scores and action');
       } catch (error) {
         console.error('Failed to update:', error);
-        if (!offerRefusalCase(error, isFocusedLookupResult(currentEditingSha256))) {
+        if (!offerRefusalCase(error, isFocusedLookupResult(sha256))) {
           alert('Failed to update: ' + error.message);
         }
       }
