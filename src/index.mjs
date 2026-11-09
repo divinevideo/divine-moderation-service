@@ -2781,12 +2781,13 @@ export default {
       let autoApproveRefused;
       if (status === 'rejected' && majorFlags.includes(category) && existing.action !== 'SAFE') {
         // Check if there are any remaining unrejected major flags with high scores
-        const remainingMajorFlags = majorFlags.filter(flag => {
-          const score = existing.scores?.[flag] || 0;
-          const verification = existing.categoryVerifications[flag];
+        const remainingMajorFlagsOf = (record) => majorFlags.filter(flag => {
+          const score = record.scores?.[flag] || 0;
+          const verification = record.categoryVerifications?.[flag];
           // Flag is still active if: score >= 0.6 AND NOT rejected
           return score >= 0.6 && verification !== 'rejected';
         });
+        const remainingMajorFlags = remainingMajorFlagsOf(existing);
 
         console.log(`[${requestId}] Remaining major flags after rejecting ${category}:`, remainingMajorFlags);
 
@@ -2799,15 +2800,22 @@ export default {
 
         // The check can take seconds. Save the rejection onto the record as it
         // is now, so a decision saved meanwhile is kept, and approve only if
-        // the action is still the one this rejection was made against.
+        // that record still has the action this rejection was made against
+        // and no major flag left standing. A record removed meanwhile stays
+        // removed.
         let changedWhileChecking = false;
         if (lift !== null) {
           const current = await loadModerationRecord();
-          if (current) {
-            recordVerification(current);
-            existing = current;
+          if (!current) {
+            return new Response(JSON.stringify({ error: 'Moderation result not found for this video' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' }
+            });
           }
-          changedWhileChecking = !current || current.action !== previousAction;
+          recordVerification(current);
+          existing = current;
+          changedWhileChecking = current.action !== previousAction
+            || remainingMajorFlagsOf(current).length > 0;
         }
 
         if (lift instanceof Response) {

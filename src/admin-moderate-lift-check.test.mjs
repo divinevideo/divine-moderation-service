@@ -411,6 +411,51 @@ describe('POST /admin/api/verify-category/:sha256 asks relay manager before auto
     });
   });
 
+  it('does not approve when another flag was confirmed while the lift was checked', async () => {
+    kvStore.set(`moderation:${SHA}`, JSON.stringify({
+      action: 'AGE_RESTRICTED',
+      scores: { nudity: 0.9, violence: 0.9 },
+      categoryVerifications: { violence: 'rejected' }
+    }));
+    liftAnswer = (body) => {
+      kvStore.set(`moderation:${SHA}`, JSON.stringify({
+        action: 'AGE_RESTRICTED',
+        scores: { nudity: 0.9, violence: 0.9 },
+        categoryVerifications: { violence: 'confirmed' }
+      }));
+      return allowed(body);
+    };
+
+    const response = await verify('nudity', 'rejected');
+
+    const body = await response.json();
+    expect(body.autoApproved).toBe(false);
+    expect(body.autoApproveRefused).toMatchObject({ status: 409, code: 'moderation_changed' });
+    expect(stored()).toMatchObject({
+      action: 'AGE_RESTRICTED',
+      categoryVerifications: { violence: 'confirmed', nudity: 'rejected' }
+    });
+    expect(kvDeletes).toEqual([]);
+  });
+
+  it.each([
+    ['an allowed', allowed],
+    ['a refused', () => Response.json({ success: false, error: LIFT_BLOCK, code: 'age_review_active', caseId: CASE_ID }, { status: 409 })]
+  ])('does not bring back a record removed while %s lift was checked', async (_name, answer) => {
+    onlyNudity();
+    liftAnswer = (body) => {
+      kvStore.delete(`moderation:${SHA}`);
+      return answer(body);
+    };
+
+    const response = await verify('nudity', 'rejected');
+
+    expect(response.status).toBe(404);
+    expect(kvStore.has(`moderation:${SHA}`)).toBe(false);
+    expect(kvPuts).toEqual([]);
+    expect(kvDeletes).toEqual([]);
+  });
+
   it('does not ask while another major flag still stands', async () => {
     const response = await verify('nudity', 'rejected');
 
