@@ -226,6 +226,73 @@ describe('swipe review answers that arrive after the moderator moved on', () => 
   });
 });
 
+// The page's real drag handlers, with the drag state they share.
+const mintSwipeHandlers = new Function('ctx', `
+  const { document, swipeAction } = ctx;
+  let isDragging = false;
+  let startX = 0;
+  let startY = 0;
+  let currentX = 0;
+  let currentY = 0;
+  let swipeDirection = null;
+  let detachSwipeHandlers = null;
+  ${extractFunction(swipeReviewHTML, 'setupSwipeHandlers', "swipeAction(card, 'right', sha256, 'SAFE')")}
+  return { setupSwipeHandlers };
+`);
+
+describe('swipe review drag handlers', () => {
+  // A document that keeps its listeners in the order they were added, as a
+  // browser does, and a card that keeps its own.
+  function dragHarness() {
+    const listeners = [];
+    const document = {
+      addEventListener: (type, fn) => { listeners.push({ type, fn }); },
+      removeEventListener: (type, fn) => {
+        const at = listeners.findIndex((l) => l.type === type && l.fn === fn);
+        if (at >= 0) listeners.splice(at, 1);
+      }
+    };
+    const swipes = [];
+    const { setupSwipeHandlers } = mintSwipeHandlers({
+      document,
+      swipeAction: (_card, _direction, sha256, action) => { swipes.push({ sha256, action }); }
+    });
+    const card = (sha256) => {
+      const own = {};
+      return {
+        style: {},
+        classList: { add: () => {}, remove: () => {} },
+        getAttribute: (name) => (name === 'data-sha256' ? sha256 : null),
+        querySelector: () => ({ classList: { toggle: () => {} } }),
+        querySelectorAll: () => [],
+        addEventListener: (type, fn) => { own[type] = fn; },
+        press: (x) => own.mousedown({ clientX: x, clientY: 0 })
+      };
+    };
+    const dispatch = (type, event) => listeners.filter((l) => l.type === type).forEach((l) => l.fn(event));
+    const dragRight = (onCard) => {
+      onCard.press(0);
+      dispatch('mousemove', { clientX: 200, clientY: 0, preventDefault: () => {} });
+      dispatch('mouseup', {});
+    };
+    return { setupSwipeHandlers, card, dragRight, swipes, listeners };
+  }
+
+  it('sends a swipe on a later card for that card, not the first one shown', () => {
+    const h = dragHarness();
+    const first = h.card('1'.repeat(64));
+    const second = h.card('2'.repeat(64));
+
+    h.setupSwipeHandlers(first);
+    h.setupSwipeHandlers(second);
+    h.dragRight(second);
+
+    expect(h.swipes).toEqual([{ sha256: '2'.repeat(64), action: 'SAFE' }]);
+    // One card's worth of document listeners, however many cards were shown.
+    expect(h.listeners).toHaveLength(4);
+  });
+});
+
 describe('swipe review provenance UI hooks', () => {
   it('contains creator info modal and provenance helpers', () => {
     expect(swipeReviewHTML).toContain('Creator Info');

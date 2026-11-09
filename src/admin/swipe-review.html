@@ -880,6 +880,7 @@
     let currentX = 0;
     let currentY = 0;
     let swipeDirection = null; // 'horizontal' or 'vertical'
+    let detachSwipeHandlers = null; // takes the on-screen card's document listeners off
 
     function applySinceFilter() {
       // Reset queue and reload with new filter
@@ -1565,6 +1566,14 @@
     }
 
     function setupSwipeHandlers(card) {
+      // Only the card on screen may answer a drag. Every card adds listeners
+      // to the document, and the drag state is shared, so a previous card's
+      // handleEnd left in place runs first on each mouseup and sends the
+      // decision for that old card's hash.
+      if (detachSwipeHandlers) {
+        detachSwipeHandlers();
+      }
+
       // Mouse/touch start
       const handleStart = (e) => {
         isDragging = true;
@@ -1648,6 +1657,13 @@
 
       document.addEventListener('mouseup', handleEnd);
       document.addEventListener('touchend', handleEnd);
+
+      detachSwipeHandlers = () => {
+        document.removeEventListener('mousemove', handleMove);
+        document.removeEventListener('touchmove', handleMove);
+        document.removeEventListener('mouseup', handleEnd);
+        document.removeEventListener('touchend', handleEnd);
+      };
     }
 
     function swipeAction(card, direction, sha256, action) {
