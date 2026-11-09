@@ -1673,6 +1673,15 @@
           reviewedSha256s.add(sha256);
         }
       };
+      // A swipe fades the card out before the decision is sent; a key press
+      // leaves it where it is.
+      const swipedAway = () => {
+        const card = document.querySelector('.video-card-swipe');
+        return !!card && ['swipe-left', 'swipe-right', 'swipe-up'].some((name) => card.classList.contains(name));
+      };
+      // Set once the server has taken the decision, so a failure after that
+      // point (drawing the next card) is not reported as a failed decision.
+      let decided = false;
 
       try {
         // For untriaged videos, queue for moderation instead of setting action directly
@@ -1687,6 +1696,7 @@
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
           }
+          decided = true;
 
           countReviewed();
           showToast('Queued for AI moderation', null, 2000);
@@ -1712,6 +1722,7 @@
         if (!response.ok) {
           throw await moderationRefusal(response);
         }
+        decided = true;
 
         countReviewed();
 
@@ -1758,10 +1769,14 @@
         }
 
       } catch (error) {
+        if (decided) {
+          console.error('Decision saved, but the next video failed to show:', error);
+          return;
+        }
         console.error('Failed to update action:', error);
-        // A swipe fades the card out before the decision is sent. It did not
-        // happen, so draw the same card again, unless the moderator has moved on.
-        if (stillShowing()) {
+        // The decision did not happen. If a swipe faded the card out, draw it
+        // again, unless the moderator has moved on.
+        if (stillShowing() && swipedAway()) {
           showCurrentVideo();
         }
         if (!offerRefusalCase(error)) {

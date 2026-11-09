@@ -30,7 +30,7 @@ function node(tag) {
   const classes = new Set();
   const el = {
     tagName: tag, className: '', textContent: '', children: [], removed: false, onclick: null,
-    classList: { add: (c) => classes.add(c), remove: (c) => classes.delete(c) },
+    classList: { add: (c) => classes.add(c), remove: (c) => classes.delete(c), contains: (c) => classes.has(c) },
     appendChild(child) { el.children.push(child); return child; },
     remove() { el.removed = true; }
   };
@@ -39,22 +39,27 @@ function node(tag) {
 
 // `responses` are what /admin/api/moderate answers, in order; a promise of one
 // holds that answer back until the test settles it. `queue` is the cards in
-// review order.
-function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA]) {
+// review order. `renderFails` makes drawing a card throw.
+function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA], { renderFails = false } = {}) {
   const toasts = [];
   const opened = [];
   const fetches = [];
   let renders = 0;
   const body = node('body');
   body.appendChild = (child) => { toasts.push(child); return child; };
+  // The card on screen. A swipe adds its swipe-<direction> class.
+  const card = node('div');
   const fns = mintSwipeFns({
-    document: { createElement: node, body },
+    document: { createElement: node, body, querySelector: (selector) => (selector === '.video-card-swipe' ? card : null) },
     window: { open: (...args) => opened.push(args) },
     setTimeout: () => 0,
     console: { error: () => {}, log: () => {} },
     reviewQueue: queue.map((sha256) => ({ sha256, action: previousAction, isUntriaged: false })),
     reviewedSha256s: new Set(),
-    showCurrentVideo: () => { renders += 1; },
+    showCurrentVideo: () => {
+      renders += 1;
+      if (renderFails) throw new Error('could not draw the card');
+    },
     updateProgress: () => {},
     fetch: async (url, init) => {
       fetches.push({ url, body: JSON.parse(init.body) });
@@ -69,7 +74,7 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA
   const latest = () => toasts[toasts.length - 1];
   const text = (toast) => toast.children.find((c) => c.className === 'toast-message')?.textContent;
   const button = (toast) => toast.children.find((c) => c.className === 'toast-undo') ?? null;
-  return { ...fns, toasts, opened, fetches, latest, text, button, renders: () => renders };
+  return { ...fns, card, toasts, opened, fetches, latest, text, button, renders: () => renders };
 }
 
 const REFUSED = {
@@ -80,6 +85,7 @@ const REFUSED = {
 describe('swipe review media decisions refused by the lift check', () => {
   it('offers the case when an approve is refused, and does not move on', async () => {
     const h = swipeHarness([REFUSED]);
+    h.card.classList.add('swipe-right');
 
     await h.handleAction(SHA, 'SAFE');
 
@@ -92,6 +98,26 @@ describe('swipe review media decisions refused by the lift check', () => {
     expect(h.state()).toEqual({ currentIndex: 0, reviewedCount: 0 });
     // The swipe left the card faded out; drawing it again brings it back.
     expect(h.renders()).toBe(1);
+  });
+
+  it('leaves the card as it is when a key-press approve is refused', async () => {
+    const h = swipeHarness([REFUSED]);
+
+    await h.handleAction(SHA, 'SAFE');
+
+    expect(h.text(h.latest())).toBe(`${LIFT_BLOCK} (case ${CASE_ID})`);
+    // Nothing faded it, so redrawing would only restart the video.
+    expect(h.renders()).toBe(0);
+  });
+
+  it('does not report a saved decision as failed when the next card cannot be drawn', async () => {
+    const h = swipeHarness([{ status: 200, body: { success: true } }], 'AGE_RESTRICTED', [SHA], { renderFails: true });
+
+    await h.handleAction(SHA, 'SAFE');
+
+    expect(h.state()).toEqual({ currentIndex: 1, reviewedCount: 1 });
+    expect(h.renders()).toBe(1);
+    expect(h.text(h.latest())).toBe('Video approved');
   });
 
   it('offers the case when an Undo back to a lift is refused', async () => {
@@ -150,6 +176,7 @@ describe('swipe review answers that arrive after the moderator moved on', () => 
   it('leaves the card the moderator skipped to alone when the lift is refused', async () => {
     const first = held();
     const h = swipeHarness([first.answer], 'AGE_RESTRICTED', [SHA, NEXT]);
+    h.card.classList.add('swipe-right');
 
     const pending = h.handleAction(SHA, 'SAFE');
     h.skipVideo();
