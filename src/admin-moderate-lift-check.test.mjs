@@ -369,6 +369,48 @@ describe('POST /admin/api/verify-category/:sha256 asks relay manager before auto
     expect(kvDeletes).toEqual([]);
   });
 
+  // The lift check can take seconds. A decision saved meanwhile, here a ban,
+  // must survive the rejection being saved.
+  const banWhileChecking = (answer) => (body) => {
+    kvStore.set(`moderation:${SHA}`, JSON.stringify({
+      action: 'PERMANENT_BAN', scores: { nudity: 0.9 }, reviewedBy: 'another-moderator'
+    }));
+    return answer(body);
+  };
+
+  it('does not approve over a decision saved while the lift was checked', async () => {
+    onlyNudity();
+    liftAnswer = banWhileChecking(allowed);
+
+    const response = await verify('nudity', 'rejected');
+
+    const body = await response.json();
+    expect(body.autoApproved).toBe(false);
+    expect(body.autoApproveRefused).toMatchObject({ status: 409, code: 'moderation_changed' });
+    expect(stored()).toMatchObject({
+      action: 'PERMANENT_BAN',
+      reviewedBy: 'another-moderator',
+      categoryVerifications: { nudity: 'rejected' }
+    });
+    expect(kvDeletes).toEqual([]);
+  });
+
+  it('keeps a decision saved while a refused lift was checked', async () => {
+    onlyNudity();
+    liftAnswer = banWhileChecking(() => Response.json({
+      success: false, error: LIFT_BLOCK, code: 'age_review_active', caseId: CASE_ID, state: 'open_reported'
+    }, { status: 409 }));
+
+    const response = await verify('nudity', 'rejected');
+
+    expect((await response.json()).autoApproveRefused.code).toBe('age_review_active');
+    expect(stored()).toMatchObject({
+      action: 'PERMANENT_BAN',
+      reviewedBy: 'another-moderator',
+      categoryVerifications: { nudity: 'rejected' }
+    });
+  });
+
   it('does not ask while another major flag still stands', async () => {
     const response = await verify('nudity', 'rejected');
 

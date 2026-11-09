@@ -2725,26 +2725,47 @@ export default {
       }
 
       // Get existing moderation result — check KV first, fall back to D1
-      let existing = null;
-      const existingData = await env.MODERATION_KV.get(`moderation:${sha256}`);
-      if (existingData) {
-        existing = JSON.parse(existingData);
-      } else {
+      const loadModerationRecord = async () => {
+        const existingData = await env.MODERATION_KV.get(`moderation:${sha256}`);
+        if (existingData) {
+          return JSON.parse(existingData);
+        }
         // Fall back to D1
         const d1Row = await env.BLOSSOM_DB.prepare(
           'SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, event_id FROM moderation_results WHERE sha256 = ?'
         ).bind(sha256).first();
-        if (d1Row) {
-          existing = {
-            action: d1Row.action,
-            scores: d1Row.scores ? JSON.parse(d1Row.scores) : {},
-            provider: d1Row.provider,
-            categories: d1Row.categories ? JSON.parse(d1Row.categories) : [],
-            moderated_at: d1Row.moderated_at
-          };
+        if (!d1Row) {
+          return null;
         }
-      }
+        return {
+          action: d1Row.action,
+          scores: d1Row.scores ? JSON.parse(d1Row.scores) : {},
+          provider: d1Row.provider,
+          categories: d1Row.categories ? JSON.parse(d1Row.categories) : [],
+          moderated_at: d1Row.moderated_at
+        };
+      };
 
+      const recordVerification = (record) => {
+        if (!record.categoryVerifications) {
+          record.categoryVerifications = {};
+        }
+
+        if (status === null) {
+          delete record.categoryVerifications[category];
+        } else {
+          record.categoryVerifications[category] = status;
+        }
+
+        // Generate NIP-85 tags based on verifications
+        record.nip85Tags = generateNIP85Tags(record.scores, record.categoryVerifications);
+
+        // Track who verified and when
+        record.lastVerifiedAt = Date.now();
+        record.lastVerifiedBy = 'admin';
+      };
+
+      let existing = await loadModerationRecord();
       if (!existing) {
         return new Response(JSON.stringify({ error: 'Moderation result not found for this video' }), {
           status: 404,
@@ -2753,23 +2774,7 @@ export default {
       }
       const previousAction = existing.action;
 
-      // Update category verifications
-      if (!existing.categoryVerifications) {
-        existing.categoryVerifications = {};
-      }
-
-      if (status === null) {
-        delete existing.categoryVerifications[category];
-      } else {
-        existing.categoryVerifications[category] = status;
-      }
-
-      // Generate NIP-85 tags based on verifications
-      existing.nip85Tags = generateNIP85Tags(existing.scores, existing.categoryVerifications);
-
-      // Track who verified and when
-      existing.lastVerifiedAt = Date.now();
-      existing.lastVerifiedBy = 'admin';
+      recordVerification(existing);
 
       // AUTO-APPROVE LOGIC: Check if rejecting a major flag should auto-approve
       let autoApproved = false;
@@ -2791,10 +2796,31 @@ export default {
         const lift = remainingMajorFlags.length === 0
           ? await checkMediaLift(env, sha256, 'SAFE')
           : null;
+
+        // The check can take seconds. Save the rejection onto the record as it
+        // is now, so a decision saved meanwhile is kept, and approve only if
+        // the action is still the one this rejection was made against.
+        let changedWhileChecking = false;
+        if (lift !== null) {
+          const current = await loadModerationRecord();
+          if (current) {
+            recordVerification(current);
+            existing = current;
+          }
+          changedWhileChecking = !current || current.action !== previousAction;
+        }
+
         if (lift instanceof Response) {
           autoApproveRefused = { status: lift.status, ...(await lift.json()) };
           delete autoApproveRefused.success;
           console.log(`[${requestId}] Not auto-approving ${sha256}: lift check refused (${autoApproveRefused.code})`);
+        } else if (lift && changedWhileChecking) {
+          autoApproveRefused = {
+            status: 409,
+            error: 'This file\'s moderation changed while relay manager was asked; not approved',
+            code: 'moderation_changed'
+          };
+          console.log(`[${requestId}] Not auto-approving ${sha256}: moderation changed during the lift check`);
         } else if (lift) {
           // No more major flags - auto-approve!
           console.log(`[${requestId}] Auto-approving ${sha256.substring(0, 16)}... - all major flags rejected`);
