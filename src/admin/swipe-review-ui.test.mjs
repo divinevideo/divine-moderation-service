@@ -50,12 +50,13 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA
   body.appendChild = (child) => { toasts.push(child); return child; };
   // The card on screen. A swipe adds its swipe-<direction> class.
   const card = node('div');
+  const reviewQueue = queue.map((sha256) => ({ sha256, action: previousAction, isUntriaged: false }));
   const fns = mintSwipeFns({
     document: { createElement: node, body, querySelector: (selector) => (selector === '.video-card-swipe' ? card : null) },
     window: { open: (...args) => opened.push(args) },
     setTimeout: () => 0,
     console: { error: () => {}, log: () => {} },
-    reviewQueue: queue.map((sha256) => ({ sha256, action: previousAction, isUntriaged: false })),
+    reviewQueue,
     reviewedSha256s: new Set(reviewed),
     showCurrentVideo: () => {
       renders += 1;
@@ -75,7 +76,7 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA
   const latest = () => toasts[toasts.length - 1];
   const text = (toast) => toast.children.find((c) => c.className === 'toast-message')?.textContent;
   const button = (toast) => toast.children.find((c) => c.className === 'toast-undo') ?? null;
-  return { ...fns, card, toasts, opened, fetches, latest, text, button, renders: () => renders };
+  return { ...fns, card, reviewQueue, toasts, opened, fetches, latest, text, button, renders: () => renders };
 }
 
 const REFUSED = {
@@ -215,6 +216,38 @@ describe('swipe review answers that arrive after the moderator moved on', () => 
     expect(h.state().currentIndex).toBe(1);
   });
 
+  it('brings back the decided card on Undo when its answer came after two skips', async () => {
+    const first = held();
+    const h = swipeHarness([first.answer, OK], 'AGE_RESTRICTED', [SHA, NEXT, LAST]);
+
+    const pending = h.handleAction(SHA, 'SAFE');
+    h.skipVideo();
+    h.skipVideo();
+    first.settle(OK);
+    await pending;
+    h.button(h.latest()).onclick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(h.text(h.latest())).toBe('Action undone');
+    expect(h.state().currentIndex).toBe(0);
+  });
+
+  it('keeps the review where it is on Undo when the decided card left the queue', async () => {
+    const first = held();
+    const h = swipeHarness([first.answer, OK], 'AGE_RESTRICTED', [SHA, NEXT]);
+
+    const pending = h.handleAction(SHA, 'SAFE');
+    // A reload drops the card while its answer is still out.
+    h.reviewQueue.splice(0, 1);
+    first.settle(OK);
+    await pending;
+    h.button(h.latest()).onclick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(h.text(h.latest())).toBe('Action undone');
+    expect(h.state().currentIndex).toBe(0);
+  });
+
   it('counts a card reviewed before the queue was reloaded', async () => {
     // Changing the Since filter zeroes the count and reloads the queue, but
     // keeps the hashes reviewed so far, so a card can come back and be decided again.
@@ -237,11 +270,15 @@ const mintSwipeHandlers = new Function('ctx', `
   let swipeDirection = null;
   let detachSwipeHandlers = null;
   // An empty queue, so showCurrentVideo takes its "finished" branch.
-  const reviewQueue = [];
-  const currentIndex = 0;
+  let reviewQueue = [];
+  let currentIndex = 0;
+  let reviewedCount = 0;
+  // The Since filter's reload, which the test does not run.
+  const loadReviewQueue = () => {};
   ${extractFunction(swipeReviewHTML, 'setupSwipeHandlers', "swipeAction(card, 'right', sha256, 'SAFE')")}
   ${extractFunction(swipeReviewHTML, 'showCurrentVideo', '// Finished all reviews')}
-  return { setupSwipeHandlers, showCurrentVideo };
+  ${extractFunction(swipeReviewHTML, 'applySinceFilter', 'Reset queue and reload with new filter')}
+  return { setupSwipeHandlers, showCurrentVideo, applySinceFilter };
 `);
 
 describe('swipe review drag handlers', () => {
@@ -258,7 +295,7 @@ describe('swipe review drag handlers', () => {
       }
     };
     const swipes = [];
-    const { setupSwipeHandlers, showCurrentVideo } = mintSwipeHandlers({
+    const { setupSwipeHandlers, showCurrentVideo, applySinceFilter } = mintSwipeHandlers({
       document,
       swipeAction: (_card, _direction, sha256, action) => { swipes.push({ sha256, action }); }
     });
@@ -282,7 +319,7 @@ describe('swipe review drag handlers', () => {
       moveRight();
       release();
     };
-    return { setupSwipeHandlers, showCurrentVideo, card, dragRight, moveRight, release, swipes, listeners };
+    return { setupSwipeHandlers, showCurrentVideo, applySinceFilter, card, dragRight, moveRight, release, swipes, listeners };
   }
 
   it('sends a swipe on a later card for that card, not the first one shown', () => {
@@ -325,6 +362,21 @@ describe('swipe review drag handlers', () => {
     h.moveRight();
     // A late answer for the last card ends the queue while the button is down.
     h.showCurrentVideo();
+    h.release();
+
+    expect(h.swipes).toEqual([]);
+    expect(h.listeners).toHaveLength(0);
+  });
+
+  it('decides nothing when the queue is reloaded while a card is held', () => {
+    const h = dragHarness();
+    const held = h.card('4'.repeat(64));
+
+    h.setupSwipeHandlers(held);
+    held.press(0);
+    h.moveRight();
+    // Changing the Since filter or queue order empties the queue and reloads it.
+    h.applySinceFilter();
     h.release();
 
     expect(h.swipes).toEqual([]);

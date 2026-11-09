@@ -883,7 +883,12 @@
     let detachSwipeHandlers = null; // takes the on-screen card's document listeners off
 
     function applySinceFilter() {
-      // Reset queue and reload with new filter
+      // Reset queue and reload with new filter. The card on screen goes with
+      // it, so its listeners come off and a drag held on it ends here.
+      if (detachSwipeHandlers) {
+        detachSwipeHandlers();
+        detachSwipeHandlers = null;
+      }
       reviewQueue = [];
       currentIndex = 0;
       reviewedCount = 0;
@@ -1766,7 +1771,13 @@
             });
 
             if (undoResponse.ok) {
-              currentIndex--;
+              // Back to the card this decision was for. Its answer may have
+              // come after a skip or a reload, when it did not move the review
+              // on, so stepping back one card can land on the wrong one.
+              const decidedAt = reviewQueue.findIndex((v) => v.sha256 === sha256);
+              if (decidedAt >= 0) {
+                currentIndex = decidedAt;
+              }
               reviewedCount--;
               reviewedSha256s.delete(sha256);
               showCurrentVideo();
