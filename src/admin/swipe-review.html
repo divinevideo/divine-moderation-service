@@ -1666,13 +1666,6 @@
       // only moves the review along, or brings the card back, while this card
       // is still the one on screen.
       const stillShowing = () => reviewQueue[currentIndex]?.sha256 === sha256;
-      // A second decision on the same card counts once.
-      const countReviewed = () => {
-        if (!reviewedSha256s.has(sha256)) {
-          reviewedCount++;
-          reviewedSha256s.add(sha256);
-        }
-      };
       // A swipe fades the card out before the decision is sent; a key press
       // leaves it where it is.
       const swipedAway = () => {
@@ -1698,7 +1691,8 @@
           }
           decided = true;
 
-          countReviewed();
+          reviewedCount++;
+          reviewedSha256s.add(sha256);
           showToast('Queued for AI moderation', null, 2000);
 
           // Move to next video
@@ -1724,7 +1718,8 @@
         }
         decided = true;
 
-        countReviewed();
+        reviewedCount++;
+        reviewedSha256s.add(sha256);
 
         const actionName = action === 'SAFE' ? 'approved' :
                           action === 'AGE_RESTRICTED' ? 'age-restricted' :

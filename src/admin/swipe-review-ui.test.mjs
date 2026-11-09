@@ -39,8 +39,9 @@ function node(tag) {
 
 // `responses` are what /admin/api/moderate answers, in order; a promise of one
 // holds that answer back until the test settles it. `queue` is the cards in
-// review order. `renderFails` makes drawing a card throw.
-function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA], { renderFails = false } = {}) {
+// review order. `renderFails` makes drawing a card throw. `reviewed` is what
+// this page load has already reviewed.
+function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA], { renderFails = false, reviewed = [] } = {}) {
   const toasts = [];
   const opened = [];
   const fetches = [];
@@ -55,7 +56,7 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA
     setTimeout: () => 0,
     console: { error: () => {}, log: () => {} },
     reviewQueue: queue.map((sha256) => ({ sha256, action: previousAction, isUntriaged: false })),
-    reviewedSha256s: new Set(),
+    reviewedSha256s: new Set(reviewed),
     showCurrentVideo: () => {
       renders += 1;
       if (renderFails) throw new Error('could not draw the card');
@@ -210,6 +211,16 @@ describe('swipe review answers that arrive after the moderator moved on', () => 
     first.settle(OK);
     second.settle(OK);
     await Promise.all(pending);
+
+    expect(h.state().currentIndex).toBe(1);
+  });
+
+  it('counts a card reviewed before the queue was reloaded', async () => {
+    // Changing the Since filter zeroes the count and reloads the queue, but
+    // keeps the hashes reviewed so far, so a card can come back and be decided again.
+    const h = swipeHarness([OK], 'AGE_RESTRICTED', [SHA, NEXT], { reviewed: [SHA] });
+
+    await h.handleAction(SHA, 'SAFE');
 
     expect(h.state()).toEqual({ currentIndex: 1, reviewedCount: 1 });
   });
