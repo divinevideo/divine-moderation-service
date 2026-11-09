@@ -571,3 +571,85 @@ describe('dashboard Edit Scores after a save', () => {
     expect(harness.alerts).toEqual(['Successfully updated scores and action']);
   });
 });
+
+// Rejecting a category can auto-approve the file, which the server only does
+// once relay manager's lift check allows it (#231).
+const VERIFY_CATEGORY_SRC = extractFunction(dashboardHTML, 'verifyCategory', 'verify-category');
+const FORMAT_CATEGORY_SRC = extractFunction(dashboardHTML, 'formatCategoryName', "'nudity': 'Nudity'");
+
+const mintVerifyFns = new Function('ctx', `
+  const { document, window, fetch, setTimeout, console, setLookupStatus, getVideoBySha } = ctx;
+  let currentToast = null;
+  ${SHOW_TOAST_SRC}
+  ${HIDE_TOAST_SRC}
+  ${OFFER_CASE_SRC}
+  ${FORMAT_CATEGORY_SRC}
+  ${VERIFY_CATEGORY_SRC}
+  return { verifyCategory };
+`);
+
+function createVerifyHarness(result) {
+  const harness = createHarness({ response: { status: 200, body: result } });
+  const video = { sha256: SHA, action: 'AGE_RESTRICTED', categoryVerifications: {} };
+  const fns = mintVerifyFns({
+    document: { createElement: createNode, body: harness.body, querySelector: () => null },
+    window: { open: (...args) => { harness.opened.push(args); } },
+    console: { error: () => {}, log: () => {} },
+    setTimeout: (fn, delay) => { harness.timers.push({ fn, delay }); return harness.timers.length; },
+    setLookupStatus: (message, isError = false) => { harness.statusLines.push({ message, isError }); },
+    getVideoBySha: () => video,
+    fetch: async () => ({ ok: true, status: 200, json: async () => result })
+  });
+  return { ...harness, ...fns, video };
+}
+
+describe('dashboard category rejection that the lift check keeps from auto-approving', () => {
+  const saved = {
+    success: true,
+    sha256: SHA,
+    category: 'nudity',
+    status: 'rejected',
+    categoryVerifications: { nudity: 'rejected' },
+    autoApproved: false
+  };
+
+  it('says the file was not approved and offers the case', async () => {
+    const harness = createVerifyHarness({
+      ...saved,
+      autoApproveRefused: {
+        status: 409,
+        error: LIFT_BLOCK,
+        code: 'age_review_active',
+        caseId: CASE_ID,
+        state: 'open_reported',
+        caseUrl: CASE_URL
+      }
+    });
+
+    await harness.verifyCategory(SHA, 'nudity', 'rejected');
+
+    const toast = latestToast(harness);
+    expect(toastText(toast)).toBe(`✗ Rejected: NOT Nudity. Not approved: ${LIFT_BLOCK} (case ${CASE_ID})`);
+    toastAction(toast).onclick();
+    expect(harness.opened).toEqual([[CASE_URL, '_blank', 'noopener']]);
+    expect(harness.video.action).toBe('AGE_RESTRICTED');
+  });
+
+  it('says why when the refusal names no case', async () => {
+    const harness = createVerifyHarness({
+      ...saved,
+      autoApproveRefused: {
+        status: 502,
+        error: 'Could not confirm with relay manager that this file may be made more visible; refusing',
+        code: 'lift_check_unavailable'
+      }
+    });
+
+    await harness.verifyCategory(SHA, 'nudity', 'rejected');
+
+    expect(toastText(latestToast(harness))).toBe(
+      '✗ Rejected: NOT Nudity. Not approved: Could not confirm with relay manager that this file may be made more visible; refusing'
+    );
+    expect(harness.video.action).toBe('AGE_RESTRICTED');
+  });
+});

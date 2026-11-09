@@ -4820,6 +4820,20 @@
           }
         }
 
+        // The rejection was saved, but relay manager's lift check kept the
+        // auto-approve from going ahead (#231). Say so, with the case to open.
+        if (result.autoApproveRefused) {
+          const refusal = new Error(
+            `${message}. Not approved: ${result.autoApproveRefused.error || 'the lift check refused'}`
+          );
+          refusal.caseId = result.autoApproveRefused.caseId || null;
+          refusal.caseUrl = result.autoApproveRefused.caseUrl || null;
+          if (!offerRefusalCase(refusal)) {
+            showToast(refusal.message, null, 6000);
+          }
+          return;
+        }
+
         // Show label event status
         if (result.labelEvent?.published) {
           message += ` 📡 Label published to Nostr`;

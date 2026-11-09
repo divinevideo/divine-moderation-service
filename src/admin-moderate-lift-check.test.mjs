@@ -277,3 +277,112 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
     expect(blossomCalls[0].sha256).toBe(SHA);
   });
 });
+
+// Rejecting the last high-scoring major flag on the dashboard sets the file to
+// SAFE in KV, which is a lift like any other: the admin lookup then reports
+// SAFE, and the KV-to-D1 migration would copy it to the public record.
+describe('POST /admin/api/verify-category/:sha256 asks relay manager before auto-approving', () => {
+  const LIFT_BLOCK = 'The account that owns this file has an open age review.';
+  let kvStore;
+
+  function verify(category, status) {
+    const store = kvStore;
+    return worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/verify-category/${SHA}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'cf-access-jwt-assertion': 'test-access-token' },
+        body: JSON.stringify({ category, status })
+      }),
+      env({
+        MODERATION_KV: {
+          async get(key) { return store.get(key) ?? null; },
+          async put(key, value) { kvPuts.push(key); store.set(key, value); },
+          async delete(key) { kvDeletes.push(key); store.delete(key); },
+          async list() { return { keys: [], list_complete: true, cursor: null }; }
+        }
+      })
+    );
+  }
+
+  const stored = () => JSON.parse(kvStore.get(`moderation:${SHA}`));
+  const onlyNudity = () => kvStore.set(
+    `moderation:${SHA}`,
+    JSON.stringify({ action: 'AGE_RESTRICTED', scores: { nudity: 0.9 } })
+  );
+
+  beforeEach(() => {
+    kvStore = new Map([
+      [`moderation:${SHA}`, JSON.stringify({ action: 'AGE_RESTRICTED', scores: { nudity: 0.9, violence: 0.7 } })],
+      [`age-restricted:${SHA}`, '1']
+    ]);
+  });
+
+  it('asks before auto-approving, and approves once it is allowed', async () => {
+    onlyNudity();
+
+    const response = await verify('nudity', 'rejected');
+
+    expect(response.status).toBe(200);
+    expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'SAFE' }]);
+    expect((await response.json()).autoApproved).toBe(true);
+    expect(stored().action).toBe('SAFE');
+    expect(kvDeletes).toContain(`age-restricted:${SHA}`);
+  });
+
+  it('saves the rejection but leaves the action alone while the owner has an open age review', async () => {
+    onlyNudity();
+    liftAnswer = () => Response.json({
+      success: false, error: LIFT_BLOCK, code: 'age_review_active', caseId: CASE_ID, state: 'open_reported'
+    }, { status: 409 });
+
+    const response = await verify('nudity', 'rejected');
+
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.success).toBe(true);
+    expect(body.autoApproved).toBe(false);
+    expect(body.newAction).toBeUndefined();
+    expect(body.autoApproveRefused).toEqual({
+      status: 409,
+      error: LIFT_BLOCK,
+      code: 'age_review_active',
+      caseId: CASE_ID,
+      state: 'open_reported',
+      caseUrl: `https://relay.admin.test/age-review?case=${CASE_ID}`
+    });
+    expect(stored().action).toBe('AGE_RESTRICTED');
+    expect(stored().categoryVerifications).toEqual({ nudity: 'rejected' });
+    expect(kvDeletes).toEqual([]);
+    expect(kvStore.has(`age-restricted:${SHA}`)).toBe(true);
+  });
+
+  it('leaves the action alone when relay manager cannot be asked', async () => {
+    onlyNudity();
+    liftAnswer = () => { throw new Error('connection refused'); };
+
+    const response = await verify('nudity', 'rejected');
+
+    const body = await response.json();
+    expect(body.autoApproved).toBe(false);
+    expect(body.autoApproveRefused).toMatchObject({ status: 502, code: 'lift_check_unavailable' });
+    expect(stored().action).toBe('AGE_RESTRICTED');
+    expect(kvDeletes).toEqual([]);
+  });
+
+  it('does not ask while another major flag still stands', async () => {
+    const response = await verify('nudity', 'rejected');
+
+    const body = await response.json();
+    expect(body.autoApproved).toBe(false);
+    expect(body.autoApproveRefused).toBeUndefined();
+    expect(liftCalls).toEqual([]);
+    expect(stored().action).toBe('AGE_RESTRICTED');
+  });
+
+  it('does not ask when a flag is confirmed', async () => {
+    const response = await verify('nudity', 'confirmed');
+
+    expect((await response.json()).autoApproved).toBe(false);
+    expect(liftCalls).toEqual([]);
+  });
+});

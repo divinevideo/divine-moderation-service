@@ -2773,6 +2773,7 @@ export default {
 
       // AUTO-APPROVE LOGIC: Check if rejecting a major flag should auto-approve
       let autoApproved = false;
+      let autoApproveRefused;
       if (status === 'rejected' && majorFlags.includes(category) && existing.action !== 'SAFE') {
         // Check if there are any remaining unrejected major flags with high scores
         const remainingMajorFlags = majorFlags.filter(flag => {
@@ -2784,7 +2785,17 @@ export default {
 
         console.log(`[${requestId}] Remaining major flags after rejecting ${category}:`, remainingMajorFlags);
 
-        if (remainingMajorFlags.length === 0) {
+        // Setting SAFE is a lift, so it asks relay manager first, as
+        // /admin/api/moderate does (#231). A refusal, or no answer, keeps the
+        // current action; the rejection itself is still saved below.
+        const lift = remainingMajorFlags.length === 0
+          ? await checkMediaLift(env, sha256, 'SAFE')
+          : null;
+        if (lift instanceof Response) {
+          autoApproveRefused = { status: lift.status, ...(await lift.json()) };
+          delete autoApproveRefused.success;
+          console.log(`[${requestId}] Not auto-approving ${sha256}: lift check refused (${autoApproveRefused.code})`);
+        } else if (lift) {
           // No more major flags - auto-approve!
           console.log(`[${requestId}] Auto-approving ${sha256.substring(0, 16)}... - all major flags rejected`);
           existing.action = 'SAFE';
@@ -2836,6 +2847,7 @@ export default {
         autoApproved,
         previousAction: autoApproved ? previousAction : undefined,
         newAction: autoApproved ? 'SAFE' : undefined,
+        autoApproveRefused,
         labelEvent: labelResult
       }), {
         headers: { 'Content-Type': 'application/json' }
