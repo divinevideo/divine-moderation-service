@@ -236,8 +236,12 @@ const mintSwipeHandlers = new Function('ctx', `
   let currentY = 0;
   let swipeDirection = null;
   let detachSwipeHandlers = null;
+  // An empty queue, so showCurrentVideo takes its "finished" branch.
+  const reviewQueue = [];
+  const currentIndex = 0;
   ${extractFunction(swipeReviewHTML, 'setupSwipeHandlers', "swipeAction(card, 'right', sha256, 'SAFE')")}
-  return { setupSwipeHandlers };
+  ${extractFunction(swipeReviewHTML, 'showCurrentVideo', '// Finished all reviews')}
+  return { setupSwipeHandlers, showCurrentVideo };
 `);
 
 describe('swipe review drag handlers', () => {
@@ -246,6 +250,7 @@ describe('swipe review drag handlers', () => {
   function dragHarness() {
     const listeners = [];
     const document = {
+      getElementById: () => ({ style: {}, innerHTML: '' }),
       addEventListener: (type, fn) => { listeners.push({ type, fn }); },
       removeEventListener: (type, fn) => {
         const at = listeners.findIndex((l) => l.type === type && l.fn === fn);
@@ -253,7 +258,7 @@ describe('swipe review drag handlers', () => {
       }
     };
     const swipes = [];
-    const { setupSwipeHandlers } = mintSwipeHandlers({
+    const { setupSwipeHandlers, showCurrentVideo } = mintSwipeHandlers({
       document,
       swipeAction: (_card, _direction, sha256, action) => { swipes.push({ sha256, action }); }
     });
@@ -277,7 +282,7 @@ describe('swipe review drag handlers', () => {
       moveRight();
       release();
     };
-    return { setupSwipeHandlers, card, dragRight, moveRight, release, swipes, listeners };
+    return { setupSwipeHandlers, showCurrentVideo, card, dragRight, moveRight, release, swipes, listeners };
   }
 
   it('sends a swipe on a later card for that card, not the first one shown', () => {
@@ -307,6 +312,21 @@ describe('swipe review drag handlers', () => {
     h.release();
 
     expect(h.swipes).toEqual([]);
+  });
+
+  it('decides nothing when the queue finishes while the last card is held', () => {
+    const h = dragHarness();
+    const last = h.card('3'.repeat(64));
+
+    h.setupSwipeHandlers(last);
+    last.press(0);
+    h.moveRight();
+    // A late answer for the last card ends the queue while the button is down.
+    h.showCurrentVideo();
+    h.release();
+
+    expect(h.swipes).toEqual([]);
+    expect(h.listeners).toHaveLength(0);
   });
 });
 

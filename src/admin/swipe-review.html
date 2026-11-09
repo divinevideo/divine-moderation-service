@@ -991,7 +991,12 @@
 
     function showCurrentVideo() {
       if (currentIndex >= reviewQueue.length) {
-        // Finished all reviews
+        // Finished all reviews. No card is left to drag, so take the last
+        // one's listeners off and end any drag still held on it.
+        if (detachSwipeHandlers) {
+          detachSwipeHandlers();
+          detachSwipeHandlers = null;
+        }
         document.getElementById('review-container').innerHTML = '';
         document.getElementById('empty').style.display = 'block';
         document.getElementById('progress').style.display = 'none';
