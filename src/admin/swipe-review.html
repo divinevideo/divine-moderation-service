@@ -1663,6 +1663,13 @@
         document.removeEventListener('touchmove', handleMove);
         document.removeEventListener('mouseup', handleEnd);
         document.removeEventListener('touchend', handleEnd);
+        // A drag still held when its card is replaced (a late answer moved the
+        // review on) ends with it, or releasing it would decide the new card.
+        isDragging = false;
+        swipeDirection = null;
+        currentX = 0;
+        currentY = 0;
+        card.classList.remove('swiping');
       };
     }
 

@@ -270,12 +270,14 @@ describe('swipe review drag handlers', () => {
       };
     };
     const dispatch = (type, event) => listeners.filter((l) => l.type === type).forEach((l) => l.fn(event));
+    const moveRight = () => dispatch('mousemove', { clientX: 200, clientY: 0, preventDefault: () => {} });
+    const release = () => dispatch('mouseup', {});
     const dragRight = (onCard) => {
       onCard.press(0);
-      dispatch('mousemove', { clientX: 200, clientY: 0, preventDefault: () => {} });
-      dispatch('mouseup', {});
+      moveRight();
+      release();
     };
-    return { setupSwipeHandlers, card, dragRight, swipes, listeners };
+    return { setupSwipeHandlers, card, dragRight, moveRight, release, swipes, listeners };
   }
 
   it('sends a swipe on a later card for that card, not the first one shown', () => {
@@ -290,6 +292,21 @@ describe('swipe review drag handlers', () => {
     expect(h.swipes).toEqual([{ sha256: '2'.repeat(64), action: 'SAFE' }]);
     // One card's worth of document listeners, however many cards were shown.
     expect(h.listeners).toHaveLength(4);
+  });
+
+  it('decides nothing when a drag is released after its card was replaced', () => {
+    const h = dragHarness();
+    const first = h.card('1'.repeat(64));
+    const second = h.card('2'.repeat(64));
+
+    h.setupSwipeHandlers(first);
+    first.press(0);
+    h.moveRight();
+    // A late answer moves the review on while the button is still down.
+    h.setupSwipeHandlers(second);
+    h.release();
+
+    expect(h.swipes).toEqual([]);
   });
 });
 
