@@ -307,8 +307,10 @@ describe('swipe review drag handlers', () => {
     h.setupSwipeHandlers(first);
     first.press(0);
     h.moveRight();
-    // A late answer moves the review on while the button is still down.
+    // A late answer moves the review on while the button is still down, and
+    // the moderator keeps dragging before letting go.
     h.setupSwipeHandlers(second);
+    h.moveRight();
     h.release();
 
     expect(h.swipes).toEqual([]);
