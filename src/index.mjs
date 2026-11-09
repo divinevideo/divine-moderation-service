@@ -2876,6 +2876,9 @@ export default {
         sha256,
         category,
         status,
+        // The action now stored, which a decision saved during the lift check
+        // may have changed, so the dashboard can show it.
+        action: existing.action,
         categoryVerifications: existing.categoryVerifications,
         nip85Tags: existing.nip85Tags,
         autoApproved,

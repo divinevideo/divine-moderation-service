@@ -387,6 +387,8 @@ describe('POST /admin/api/verify-category/:sha256 asks relay manager before auto
     const body = await response.json();
     expect(body.autoApproved).toBe(false);
     expect(body.autoApproveRefused).toMatchObject({ status: 409, code: 'moderation_changed' });
+    // The action now stored, so the dashboard can show it.
+    expect(body.action).toBe('PERMANENT_BAN');
     expect(stored()).toMatchObject({
       action: 'PERMANENT_BAN',
       reviewedBy: 'another-moderator',

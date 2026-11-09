@@ -578,7 +578,7 @@ const VERIFY_CATEGORY_SRC = extractFunction(dashboardHTML, 'verifyCategory', 've
 const FORMAT_CATEGORY_SRC = extractFunction(dashboardHTML, 'formatCategoryName', "'nudity': 'Nudity'");
 
 const mintVerifyFns = new Function('ctx', `
-  const { document, window, fetch, setTimeout, console, setLookupStatus, getVideoBySha } = ctx;
+  const { document, window, fetch, setTimeout, console, setLookupStatus, getVideoBySha, updateVideoCardInPlace } = ctx;
   let currentToast = null;
   ${SHOW_TOAST_SRC}
   ${HIDE_TOAST_SRC}
@@ -588,19 +588,43 @@ const mintVerifyFns = new Function('ctx', `
   return { verifyCategory };
 `);
 
-function createVerifyHarness(result) {
-  const harness = createHarness({ response: { status: 200, body: result } });
-  const video = { sha256: SHA, action: 'AGE_RESTRICTED', categoryVerifications: {} };
+// The category's Confirm and Reject buttons, as the card renders them.
+function verifyButtons() {
+  const button = () => {
+    const classes = new Set();
+    return {
+      classes,
+      classList: { toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)) }
+    };
+  };
+  const confirm = button();
+  const reject = button();
+  const container = {
+    querySelector: (selector) => (selector === '.verify-btn.confirm' ? confirm : selector === '.verify-btn.reject' ? reject : null)
+  };
+  return { confirm, reject, container };
+}
+
+function createVerifyHarness(result, { status = 200, verifications = {} } = {}) {
+  const harness = createHarness({ response: { status, body: result } });
+  const video = { sha256: SHA, action: 'AGE_RESTRICTED', categoryVerifications: { ...verifications } };
+  const buttons = verifyButtons();
+  const cardUpdates = [];
   const fns = mintVerifyFns({
-    document: { createElement: createNode, body: harness.body, querySelector: () => null },
+    document: {
+      createElement: createNode,
+      body: harness.body,
+      querySelector: (selector) => (selector.includes('data-category') ? buttons.container : null)
+    },
     window: { open: (...args) => { harness.opened.push(args); } },
     console: { error: () => {}, log: () => {} },
     setTimeout: (fn, delay) => { harness.timers.push({ fn, delay }); return harness.timers.length; },
     setLookupStatus: (message, isError = false) => { harness.statusLines.push({ message, isError }); },
     getVideoBySha: () => video,
-    fetch: async () => ({ ok: true, status: 200, json: async () => result })
+    updateVideoCardInPlace: (sha256, updated) => { cardUpdates.push({ sha256, action: updated.action }); },
+    fetch: async () => ({ ok: status >= 200 && status < 300, status, json: async () => result })
   });
-  return { ...harness, ...fns, video };
+  return { ...harness, ...fns, video, buttons, cardUpdates };
 }
 
 describe('dashboard category rejection that the lift check keeps from auto-approving', () => {
@@ -651,5 +675,37 @@ describe('dashboard category rejection that the lift check keeps from auto-appro
       '✗ Rejected: NOT Nudity. Not approved: Could not confirm with relay manager that this file may be made more visible; refusing'
     );
     expect(harness.video.action).toBe('AGE_RESTRICTED');
+  });
+
+  it('shows the action another moderator saved while the lift was checked', async () => {
+    const harness = createVerifyHarness({
+      ...saved,
+      action: 'PERMANENT_BAN',
+      autoApproveRefused: {
+        status: 409,
+        error: "This file's moderation changed while relay manager was asked; not approved",
+        code: 'moderation_changed'
+      }
+    });
+
+    await harness.verifyCategory(SHA, 'nudity', 'rejected');
+
+    expect(harness.video.action).toBe('PERMANENT_BAN');
+    expect(harness.cardUpdates).toEqual([{ sha256: SHA, action: 'PERMANENT_BAN' }]);
+  });
+
+  it('puts back the earlier verification and its buttons when the save fails', async () => {
+    // The record was removed while the lift was checked, so nothing was saved.
+    const harness = createVerifyHarness(
+      { error: 'Moderation result not found for this video' },
+      { status: 404, verifications: { nudity: 'confirmed' } }
+    );
+
+    await harness.verifyCategory(SHA, 'nudity', 'rejected');
+
+    expect(harness.video.categoryVerifications).toEqual({ nudity: 'confirmed' });
+    expect([...harness.buttons.confirm.classes]).toEqual(['confirmed']);
+    expect([...harness.buttons.reject.classes]).toEqual([]);
+    expect(toastText(latestToast(harness))).toBe('Failed to save verification: HTTP 404');
   });
 });

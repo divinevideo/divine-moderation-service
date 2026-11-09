@@ -4762,24 +4762,31 @@
       if (!video.categoryVerifications) {
         video.categoryVerifications = {};
       }
+      // Kept so a failed save puts back exactly what was there.
+      const previousVerification = video.categoryVerifications[category];
+      const setVerification = (value) => {
+        if (value === null || value === undefined) {
+          delete video.categoryVerifications[category];
+        } else {
+          video.categoryVerifications[category] = value;
+        }
+        const container = document.querySelector(`[data-sha256="${sha256}"][data-category="${category}"]`);
+        if (container) {
+          const confirmBtn = container.querySelector('.verify-btn.confirm');
+          const rejectBtn = container.querySelector('.verify-btn.reject');
+
+          confirmBtn.classList.toggle('confirmed', value === 'confirmed');
+          rejectBtn.classList.toggle('rejected', value === 'rejected');
+        }
+      };
 
       // Toggle: if already this status, clear it
-      if (video.categoryVerifications[category] === status) {
-        delete video.categoryVerifications[category];
+      if (previousVerification === status) {
         status = null;
-      } else {
-        video.categoryVerifications[category] = status;
       }
 
       // Update UI immediately
-      const container = document.querySelector(`[data-sha256="${sha256}"][data-category="${category}"]`);
-      if (container) {
-        const confirmBtn = container.querySelector('.verify-btn.confirm');
-        const rejectBtn = container.querySelector('.verify-btn.reject');
-
-        confirmBtn.classList.toggle('confirmed', status === 'confirmed');
-        rejectBtn.classList.toggle('rejected', status === 'rejected');
-      }
+      setVerification(status);
 
       try {
         const response = await fetch(`/admin/api/verify-category/${sha256}`, {
@@ -4823,6 +4830,12 @@
         // The rejection was saved, but relay manager's lift check kept the
         // auto-approve from going ahead (#231). Say so, with the case to open.
         if (result.autoApproveRefused) {
+          // Another moderator's decision may have landed while the lift was
+          // checked; show the action the server kept.
+          if (result.action && result.action !== video.action) {
+            video.action = result.action;
+            updateVideoCardInPlace(sha256, video);
+          }
           const refusal = new Error(
             `${message}. Not approved: ${result.autoApproveRefused.error || 'the lift check refused'}`
           );
@@ -4845,12 +4858,9 @@
         console.error('Failed to save verification:', error);
         showToast('Failed to save verification: ' + error.message, null, 3000);
 
-        // Revert optimistic update on error
-        if (status === null) {
-          video.categoryVerifications[category] = status === 'confirmed' ? 'rejected' : 'confirmed';
-        } else {
-          delete video.categoryVerifications[category];
-        }
+        // Revert optimistic update on error: the verification and its buttons
+        // go back to what they were before the click.
+        setVerification(previousVerification);
       }
     }
 
