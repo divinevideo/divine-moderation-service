@@ -11,7 +11,7 @@ It is a single [Cloudflare Worker](https://developers.cloudflare.com/workers/) (
 
 The service runs in **reactive mode** (`REACTIVE_MODERATION_ONLY = "true"`). Rather than machine-scanning every upload, it acts on signals that something needs a human look:
 
-1. **Reports come in** — from authenticated Divine clients (`POST /api/v1/report`), from public NIP-56 (kind `1984`) report events polled off `relay.divine.video`, and from NIP-17 report DMs sent to the moderation@ inbox. Each report is written to D1 as a review row.
+1. **Reports come in** — from authenticated Divine clients (`POST /api/v1/report`), from public NIP-56 (kind `1984`) report events polled off `relay.divine.video`, and from NIP-17 report DMs sent to the moderation@ inbox. Each content report is written to D1 as a review row. A private DM report of a message or an account is handed to `divine-relay-manager`, which queues the account for review in Coop or opens an age-review case (see `docs/trust-safety-report.md`).
 2. **A moderator triages** — the admin dashboard presents a swipe-review queue of untriaged content, with video playback, uploader context, and any available provenance/AI signals.
 3. **A decision is applied** — the moderator picks an action, and the worker fans it out: it records the decision, publishes Nostr labels/reports, notifies the relay (ban/unban/delete via the relay-admin service binding) and Blossom (blob delete), and hands labels to the ATProto labeler webhook.
 
@@ -37,7 +37,7 @@ Everything runs inside one Worker (`src/index.mjs`), which exports three handler
 
 - **`fetch`** — the HTTP API and admin dashboard.
 - **`queue`** — the `video-moderation-queue` consumer (ack-and-skip under reactive mode).
-- **`scheduled`** — cron work. The every-minute trigger runs the creator-delete pipeline and the lookup-column backfill; the every-5-minute trigger polls the relay for new video events and for inbound reports.
+- **`scheduled`** — cron work. The every-minute trigger runs the creator-delete pipeline and the lookup-column backfill; the every-5-minute trigger polls the relay for new video events and for inbound reports, syncs the moderation@ DM inbox, and hands private DM reports to relay-manager.
 
 Storage and integrations, all bound in `wrangler.toml`:
 

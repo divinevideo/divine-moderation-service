@@ -8,11 +8,20 @@ import { getPublicKey, finalizeEvent, verifyEvent } from 'nostr-tools/pure';
 import { hexToBytes } from '@noble/hashes/utils';
 import * as nip44 from 'nostr-tools/nip44';
 import { makeAuthEvent } from 'nostr-tools/nip42';
-import { computeConversationId, ensureDmLogExcerptColumn, findDmByNostrEventId, logDm } from './dm-store.mjs';
+import { computeConversationId, ensureDmLogExcerptColumn, findDmByNostrEventId, logDm, prepareDmLogInsert } from './dm-store.mjs';
 import { hasUnverifiedExcerptTag, splitUnverifiedExcerpt } from './dm-evidence.mjs';
 import { recordReportForReview } from '../moderation/report-review.mjs';
 import { extractReportType } from './report-poller.mjs';
 import { findReportByReporter, initReportsTable } from '../reports.mjs';
+import {
+  canonicalPrivateReportType,
+  initPrivateReportIntakeTable,
+  logConflictingPrivateReport,
+  parseReportedPubkeyTag,
+  preparePrivateReportIntakeInsert,
+  recordPrivateReportIntake,
+  resolvePrivateReportId,
+} from '../moderation/private-report-intake.mjs';
 import { isValidSha256 } from '../validation.mjs';
 
 // How far back a first sync looks for gift wraps. Also the plausibility floor
@@ -154,10 +163,12 @@ export async function syncInbox(env) {
   // `source` column yet and drop every report it decrypted -- processRumor
   // catches the write failure and moves on. The same goes for dm_log's
   // unverified_excerpt column: without it, a report that includes a message
-  // would fail to log at all.
+  // would fail to log at all. Likewise private_report_intake, which a private
+  // report DM is recorded into below.
   if (env.BLOSSOM_DB) {
     await initReportsTable(env.BLOSSOM_DB);
     await ensureDmLogExcerptColumn(env.BLOSSOM_DB);
+    await initPrivateReportIntakeTable(env.BLOSSOM_DB);
   }
 
   // Get last sync timestamp from KV
@@ -261,6 +272,9 @@ export async function syncInbox(env) {
  * @param {Object} env - Environment bindings (BLOSSOM_DB)
  * @returns {Promise<'synced'|'skipped'|null>} null means malformed
  *   (logged internally) and should count as an error, not synced/skipped.
+ * @throws when the dm_log write fails -- for a private report, the batch that
+ *   writes its dm_log and intake rows together -- so syncInbox counts it as an
+ *   error and nothing was stored for the next poll to skip.
  */
 export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const senderPubkey = rumor.pubkey;
@@ -413,12 +427,61 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
     }
   }
 
+  // A private report (divine-mobile#10718) of a message or an account sends
+  // no kind-1984 and files no ticket, so this DM is its only copy, and with no
+  // sha256 it has no user_reports row either. It names the reported account in
+  // a ['reported_pubkey', <hex>] tag -- the reporter's claim, for human review
+  // -- and is recorded once in private_report_intake, which the cron hands to
+  // relay-manager for a review item. A content report never qualifies: it has
+  // its review row above, and a public report's kind-1984 already reaches the
+  // same queue. Only identifiers are recorded; the note and any included
+  // message stay in dm_log.
+  //
+  // The intake insert dedups on its unique key, (reporter, report id), and
+  // needs no "already recorded" lookup, unlike the user_reports write above.
+  // The key leaves out the two fields that change between deliveries of
+  // the same report: reported_at, which falls back to receipt time and so can
+  // differ from one poll to the next, and the gift wrap id, which differs on
+  // a resend. ON CONFLICT DO NOTHING therefore makes a re-poll or a resend a
+  // no-op.
+  let privateReport = null;
+  if (!isOutgoing && isReport && !relatedSha256 && env.BLOSSOM_DB) {
+    const reported = parseReportedPubkeyTag(rumorTags);
+    if (reported.pubkey) {
+      privateReport = {
+        reportId: resolvePrivateReportId(rumorTags, giftWrapId),
+        reporterPubkey: senderPubkey,
+        reportedPubkey: reported.pubkey,
+        reportType: canonicalPrivateReportType(reportType),
+        giftWrapId,
+        // What dm_log actually stores, not what the tag claims: a tagged DM
+        // with no excerpt section is stored whole, with no excerpt field.
+        hasExcerpt: Boolean(excerptSplit),
+        reportedAt: resolveReportedAt(createdAt),
+      };
+    } else if (reported.present && !alreadyLogged) {
+      console.warn(`[DM-READER] Ignoring malformed reported_pubkey tag on report DM ${giftWrapId}; it stays in the inbox but is not queued for review`);
+    }
+  }
+
   // The DM side is settled once dm_log holds this gift wrap. Returning here
   // rather than letting logDm's own dedup decide keeps the outcome honest:
   // logDm hands back the *existing* row on a dedup hit, whose truthy .id is
   // indistinguishable from a fresh insert, so a re-poll used to count as
   // 'synced'.
   if (alreadyLogged) {
+    // A private report already in dm_log was logged before the intake
+    // existed: add its intake row now. For a report already recorded this is
+    // a no-op (see above). A failure here is retried on the next poll only
+    // while the gift wrap is still inside the reader's re-poll window, hence
+    // an error rather than a warning.
+    if (privateReport) {
+      try {
+        await recordPrivateReportIntake(env.BLOSSOM_DB, privateReport);
+      } catch (intakeErr) {
+        console.error(`[DM-READER] Failed to queue private report from gift wrap ${giftWrapId} for review; its DM is in the inbox, and the queue write is retried only while the gift wrap is re-polled:`, intakeErr.message);
+      }
+    }
     return 'skipped';
   }
 
@@ -431,7 +494,7 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
   const messageType = isReport
     ? 'conversation_report'
     : (isOutgoing ? 'moderator_reply' : 'creator_reply');
-  const result = await logDm(env.BLOSSOM_DB, {
+  const dmEntry = {
     conversationId,
     nostrEventId: giftWrapId,
     senderPubkey,
@@ -441,7 +504,37 @@ export async function processRumor(rumor, giftWrapId, moderatorPubkey, env) {
     direction,
     messageType,
     sha256: relatedSha256
-  });
+  };
+
+  // A private report's inbox copy and its intake row are one D1 batch, which
+  // is atomic. Written apart, a failed intake insert would leave the DM in
+  // dm_log looking handled while the re-poll window ran out, and the report
+  // would never reach a moderator. Together, a failure leaves neither, and
+  // the next poll retries both, as for any DM whose write failed -- but only
+  // while the gift wrap is still inside the reader's re-poll window. The
+  // throw reaches syncInbox, which counts it as an error.
+  if (privateReport) {
+    let dmResult;
+    let intakeResult;
+    try {
+      [dmResult, intakeResult] = await env.BLOSSOM_DB.batch([
+        prepareDmLogInsert(env.BLOSSOM_DB, dmEntry),
+        preparePrivateReportIntakeInsert(env.BLOSSOM_DB, privateReport),
+      ]);
+    } catch (writeErr) {
+      console.error(`[DM-READER] Failed to store private report from gift wrap ${giftWrapId}; neither its inbox copy nor its review intake was written, and the next poll retries both while the gift wrap is still re-polled:`, writeErr.message);
+      throw writeErr;
+    }
+    // The intake insert changed nothing: this (reporter, report id) is
+    // already recorded, from an earlier gift wrap. Checked here, on the
+    // gift wrap's first sight, so its re-polls do not repeat the log.
+    if ((intakeResult?.meta?.changes ?? 0) === 0) {
+      await logConflictingPrivateReport(env.BLOSSOM_DB, privateReport);
+    }
+    return dmResult?.meta?.last_row_id ? 'synced' : 'skipped';
+  }
+
+  const result = await logDm(env.BLOSSOM_DB, dmEntry);
 
   return result && result.id ? 'synced' : 'skipped';
 }

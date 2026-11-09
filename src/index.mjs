@@ -28,12 +28,14 @@ import { classifyModerationResult, getKVThresholds, kvThresholdsToEnv, setKVThre
 import { shouldForceAIDetection } from './moderation/ai-detection-policy.mjs';
 import { buildAIOutcomeEvent, buildAIPolicyDecisionEvent, getAIDetectionStats, initAIDetectionEventsTable, recordAIDetectionEvent } from './moderation/ai-detection-events.mjs';
 import { recordReportForReview } from './moderation/report-review.mjs';
+import { deliverPendingPrivateReports, prunePrivateReportIntake } from './moderation/private-report-intake.mjs';
 import { isValidSha256, isValidLookupIdentifier, isValidPubkey, parseMaybeJson, getEventTagValue, parseImetaParams, extractShaFromUrl, extractMediaShaFromEvent } from './validation.mjs';
 import { parseRetryAfterSeconds } from './http-utils.mjs';
 import { classifyText, parseVttText } from './moderation/text-classifier.mjs';
 import { notifyAtprotoLabeler } from './atproto/label-webhook.mjs';
 import { buildDownstreamPublishContext } from './moderation/downstream-publishing.mjs';
 import { notifyRelay } from './relay-notifier.mjs';
+import { getRelayAdminHeaders, getRelayAdminUrl, resolveSecret } from './relay-admin-transport.mjs';
 import { runClassicVineRollback } from './moderation/classic-vine-rollback.mjs';
 import { ADMIN_VIDEO_COLUMNS, buildAdminVideoFromRow } from './admin/lookup-helpers.mjs';
 import { cachedStat } from './admin/cache.mjs';
@@ -78,15 +80,8 @@ const CATEGORY_TO_LABEL = {
 
 const ADMIN_HOSTNAME = 'moderation.admin.divine.video';
 const API_HOSTNAME = 'moderation-api.divine.video';
-// api-relay-prod.divine.video targets divine-relay-admin-api-prod which has the
-// NOSTR_NSEC Secrets Store binding required by handleModerate -> getSecretKey.
-// relay.admin.divine.video routes to a stale divine-relay-admin-api deployment
-// that lacks the binding and crashes with "Cannot read properties of undefined
-// (reading 'get')" / Cloudflare Error 1101 on every moderate call. Override
-// via env.RELAY_ADMIN_URL if needed for staging or rollback.
-const DEFAULT_RELAY_ADMIN_URL = 'https://api-relay-prod.divine.video';
 // Moderator-facing relay-admin UI (Cloudflare Pages), distinct from the API host
-// above. Override via env.RELAY_ADMIN_UI_URL for staging.
+// in relay-admin-transport.mjs. Override via env.RELAY_ADMIN_UI_URL for staging.
 const DEFAULT_RELAY_ADMIN_UI_URL = 'https://relay.admin.divine.video';
 const JSON_HEADERS = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
 const MODERATION_ACTIONS = ['SAFE', 'REVIEW', 'QUARANTINE', 'AGE_RESTRICTED', 'PERMANENT_BAN', 'DELETE'];
@@ -369,10 +364,6 @@ function mergeLookupMetadata(baseVideo, funnelcakeVideo) {
   };
 }
 
-function getRelayAdminUrl(env) {
-  return env.RELAY_ADMIN_URL || DEFAULT_RELAY_ADMIN_URL;
-}
-
 // The relay-admin UI is a different host from the relay-admin API: the worker
 // talks to api-relay-prod.divine.video, but a moderator opens an age-review case
 // in the Pages app at relay.admin.divine.video. Only used to build a link we
@@ -386,19 +377,6 @@ function getRelayAdminUiUrl(env) {
 // is already named, not because the other form is slower.
 function ageReviewCaseUrl(env, caseId) {
   return `${getRelayAdminUiUrl(env)}/age-review?case=${encodeURIComponent(caseId)}`;
-}
-
-function getRelayAdminHeaders(env) {
-  const headers = {
-    'Content-Type': 'application/json'
-  };
-
-  if (env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
-    headers['CF-Access-Client-Id'] = env.CF_ACCESS_CLIENT_ID;
-    headers['CF-Access-Client-Secret'] = env.CF_ACCESS_CLIENT_SECRET;
-  }
-
-  return headers;
 }
 
 
@@ -819,14 +797,6 @@ function relayRpcForAction(payload) {
     default:
       throw new Error(`Unsupported relay admin action: ${payload?.action}`);
   }
-}
-
-// Resolve a secret that may be either a plain string (wrangler secret / [vars])
-// or a Cloudflare Secrets Store binding (async .get()). Mirrors the relay-admin
-// worker's resolveSecret so the shared key works regardless of how it is bound.
-async function resolveSecret(binding) {
-  if (!binding) return null;
-  return typeof binding === 'string' ? binding : await binding.get();
 }
 
 async function callRelayAdminAction(env, payload) {
@@ -5460,9 +5430,27 @@ async function runMigration() {
         }
       }
 
+      // Hand private DM reports of a message or an account to relay-manager,
+      // which queues each one for a moderator in Coop (CSAM and child safety
+      // first) or opens an age-review case for an under-16 report. Runs right
+      // after the sync so a report recorded this tick is delivered this tick.
+      // Not gated on NOSTR_PRIVATE_KEY: rows recorded earlier still need
+      // delivering if the sync itself is down. deliverPendingPrivateReports
+      // catches its own failures; the try is so nothing here can stop the
+      // steps below.
+      try {
+        const delivery = await deliverPendingPrivateReports(env);
+        if (delivery.attempted || delivery.error) {
+          console.log(`[PRIVATE-REPORTS] Delivery: ${delivery.delivered} delivered, ${delivery.rejected} rejected, ${delivery.retrying} retrying${delivery.stoppedEarly ? ' (run stopped early)' : ''}${delivery.error ? `, failed: ${delivery.error}` : ''}`);
+        }
+      } catch (err) {
+        console.error('[PRIVATE-REPORTS] Delivery step failed:', err);
+      }
+
       // Prune dm_log rows past the Trust & Safety-decided one-year retention
-      // (PR #219, decided 2026-09-14) and any dm_conversation_read_state row
-      // left orphaned by that. Flag-gated and off by default: nobody has run
+      // (PR #219, decided 2026-09-14), any dm_conversation_read_state row
+      // left orphaned by that, and settled private_report_intake rows of the
+      // same age. Flag-gated and off by default: nobody has run
       // the production sizing query yet (divine-mobile#7850), so activation
       // is a deliberate operational decision, not this deploy. KV-throttled
       // to ~daily since the delete is a full retention sweep, not a
@@ -5479,6 +5467,17 @@ async function runMigration() {
             const { pruneExpiredDmLog } = await import('./nostr/dm-store.mjs');
             const { deletedMessages, deletedReadStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
             console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s)`);
+            // private_report_intake follows the same one-year decision: it pairs
+            // a reporter with the account they reported, as the report's
+            // dm_log row does. Only delivered and rejected rows go; a pending
+            // row is a report that has not reached a moderator yet. Its own
+            // try, so a failure here does not hold back the throttle below.
+            try {
+              const { deleted } = await prunePrivateReportIntake(env.BLOSSOM_DB);
+              console.log(`[DM-RETENTION] Pruned ${deleted} settled private_report_intake row(s)`);
+            } catch (intakeErr) {
+              console.error('[DM-RETENTION] private_report_intake prune failed:', intakeErr);
+            }
             if (env.MODERATION_KV) {
               await env.MODERATION_KV.put('dm-log-retention:last-pruned', String(Date.now()));
             }
