@@ -21,7 +21,7 @@ const CASE_URL = `https://relay.admin.divine.video/age-review?case=${CASE_ID}`;
 
 const SHOW_TOAST_SRC = extractFunction(dashboardHTML, 'showToast', "actionBtn.className = 'toast-action'");
 const HIDE_TOAST_SRC = extractFunction(dashboardHTML, 'hideToast', "toast.classList.add('hiding')");
-const UPDATE_SRC = extractFunction(dashboardHTML, 'updateUploaderEnforcement', 'offerRefusalCase(error)');
+const UPDATE_SRC = extractFunction(dashboardHTML, 'updateUploaderEnforcement', 'offerRefusalCase(error, true)');
 const REFUSAL_SRC = extractFunction(dashboardHTML, 'moderationRefusal', 'failure.caseUrl');
 const OFFER_CASE_SRC = extractFunction(dashboardHTML, 'offerRefusalCase', "startsWith('https://')");
 
@@ -383,7 +383,8 @@ const mintDecisionFns = new Function('ctx', `
 const SHA = 'ab'.repeat(32);
 const LIFT_BLOCK = 'The account that owns this file has an open age review.';
 
-function createDecisionHarness(response) {
+// `focused` puts the decided file in the lookup panel.
+function createDecisionHarness(response, { focused = false } = {}) {
   const harness = createHarness({ response });
   const alerts = [];
   const video = { sha256: SHA, action: 'AGE_RESTRICTED', cdnUrl: 'https://media.test/v.mp4', uploaded_by: PUBKEY };
@@ -407,7 +408,7 @@ function createDecisionHarness(response) {
     getVideoBySha: () => video,
     refreshLookupResultIfMatches: async () => false,
     removeLookupResultIfMatches: () => {},
-    isFocusedLookupResult: () => false,
+    isFocusedLookupResult: (sha256) => focused && sha256 === SHA,
     loadRealStats: () => {},
     showHeaderUndo: () => {},
     clearUndo: () => {},
@@ -470,6 +471,28 @@ describe('dashboard media decisions refused by the lift check', () => {
     action.onclick();
     expect(harness.opened).toEqual([[CASE_URL, '_blank', 'noopener']]);
     expect(harness.alerts).toEqual([]);
+    // The file is not the one in the lookup panel, so its status line is left alone.
+    expect(harness.statusLines).toEqual([]);
+  });
+
+  it.each(DECISIONS)('%s also says so in the lookup panel when that is the file it shows', async (_name, run) => {
+    const harness = createDecisionHarness({
+      status: 409,
+      body: {
+        success: false,
+        error: LIFT_BLOCK,
+        code: 'age_review_active',
+        caseId: CASE_ID,
+        state: 'open_reported',
+        caseUrl: CASE_URL
+      }
+    }, { focused: true });
+
+    await run(harness);
+
+    expect(harness.statusLines).toEqual([
+      { message: `${LIFT_BLOCK} (case ${CASE_ID})`, isError: true }
+    ]);
   });
 
   it.each(DECISIONS)('%s says why when a refusal names no case', async (_name, run) => {

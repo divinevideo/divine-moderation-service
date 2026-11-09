@@ -3371,7 +3371,7 @@
           }, 500);
         } else {
           const failure = await moderationRefusal(response);
-          if (!offerRefusalCase(failure)) {
+          if (!offerRefusalCase(failure, isFocusedLookupResult(sha256))) {
             showToast(`Approve failed: ${failure.message}`, null, 5000);
           }
           button.innerHTML = '❌ Failed';
@@ -3434,7 +3434,7 @@
       } catch (error) {
         button.innerHTML = originalText;
         button.disabled = false;
-        if (!offerRefusalCase(error)) {
+        if (!offerRefusalCase(error, isFocusedLookupResult(sha256))) {
           setLookupStatus(`Action failed: ${error.message}`, true);
         }
       }
@@ -3457,7 +3457,9 @@
     // did, so the caller can fall back to its own error otherwise.
     // Only follow an https link: this arrives over the wire and is handed
     // to window.open, so a javascript:/data: scheme must never be openable.
-    function offerRefusalCase(error) {
+    // `inLookup` also writes it into the lookup panel's status line, for a
+    // refusal about what that panel shows.
+    function offerRefusalCase(error, inLookup = false) {
       const caseUrl = typeof error?.caseUrl === 'string' && error.caseUrl.startsWith('https://')
         ? error.caseUrl
         : null;
@@ -3472,7 +3474,9 @@
         ? `${error.message} (case ${error.caseId})`
         : error.message;
       showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
-      setLookupStatus(blockedMessage, true);
+      if (inLookup) {
+        setLookupStatus(blockedMessage, true);
+      }
       return true;
     }
 
@@ -3517,7 +3521,7 @@
 
         // Anything but a case to open falls through to the plain toast below,
         // which carries the refusal message but not the case id.
-        if (offerRefusalCase(error)) {
+        if (offerRefusalCase(error, true)) {
           return;
         }
 
@@ -5188,7 +5192,7 @@
           card.style.opacity = '1';
           card.style.pointerEvents = 'auto';
         });
-        if (!offerRefusalCase(error)) {
+        if (!offerRefusalCase(error, isFocusedLookup)) {
           alert('Failed to update: ' + error.message);
         }
       }
@@ -5239,7 +5243,7 @@
         } else {
           // An Undo back to SAFE or AGE_RESTRICTED is a lift, and can be refused.
           const failure = await moderationRefusal(response);
-          if (!offerRefusalCase(failure)) {
+          if (!offerRefusalCase(failure, isFocusedLookupResult(sha256))) {
             alert('Undo failed: ' + failure.message);
           }
         }
@@ -5384,7 +5388,7 @@
         alert('Successfully updated scores and action');
       } catch (error) {
         console.error('Failed to update:', error);
-        if (!offerRefusalCase(error)) {
+        if (!offerRefusalCase(error, isFocusedLookupResult(currentEditingSha256))) {
           alert('Failed to update: ' + error.message);
         }
       }
