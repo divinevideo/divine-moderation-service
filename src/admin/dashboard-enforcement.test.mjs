@@ -386,9 +386,11 @@ const mintDecisionFns = new Function('ctx', `
 const SHA = 'ab'.repeat(32);
 const LIFT_BLOCK = 'The account that owns this file has an open age review.';
 
-// `focused` puts the decided file in the lookup panel. `lookupSha` is the
-// hash the lookup panel shows, if any.
+// `focused` puts the decided file in the lookup panel; a function is asked on
+// each check, so the panel can move on mid-decision. `lookupSha` is the hash
+// the lookup panel shows, if any.
 function createDecisionHarness(response, { focused = false, lookupSha = null } = {}) {
+  const isFocused = typeof focused === 'function' ? focused : () => focused;
   const harness = createHarness({ response });
   const alerts = [];
   const lookups = [];
@@ -414,7 +416,7 @@ function createDecisionHarness(response, { focused = false, lookupSha = null } =
     getVideoBySha: () => video,
     refreshLookupResultIfMatches: async () => false,
     removeLookupResultIfMatches: () => {},
-    isFocusedLookupResult: (sha256) => focused && sha256 === SHA,
+    isFocusedLookupResult: (sha256) => isFocused() && sha256 === SHA,
     loadRealStats: () => {},
     showHeaderUndo: () => {},
     clearUndo: () => {},
@@ -499,6 +501,28 @@ describe('dashboard media decisions refused by the lift check', () => {
     expect(harness.statusLines).toEqual([
       { message: `${LIFT_BLOCK} (case ${CASE_ID})`, isError: true }
     ]);
+  });
+
+  it('leaves the lookup panel alone when it moved to another file while the lift was checked', async () => {
+    // The panel shows the file when Approve is clicked, and something else by
+    // the time relay manager refuses.
+    let checks = 0;
+    const harness = createDecisionHarness({
+      status: 409,
+      body: {
+        success: false,
+        error: LIFT_BLOCK,
+        code: 'age_review_active',
+        caseId: CASE_ID,
+        state: 'open_reported',
+        caseUrl: CASE_URL
+      }
+    }, { focused: () => checks++ === 0 });
+
+    await harness.quickAction(SHA, 'SAFE');
+
+    expect(toastText(latestToast(harness))).toBe(`${LIFT_BLOCK} (case ${CASE_ID})`);
+    expect(harness.statusLines).toEqual([]);
   });
 
   it.each(DECISIONS)('%s says why when a refusal names no case', async (_name, run) => {

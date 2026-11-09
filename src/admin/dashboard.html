@@ -5192,7 +5192,8 @@
           card.style.opacity = '1';
           card.style.pointerEvents = 'auto';
         });
-        if (!offerRefusalCase(error, isFocusedLookup)) {
+        // Asked again: the panel may show another file by the time the answer comes.
+        if (!offerRefusalCase(error, isFocusedLookupResult(sha256))) {
           alert('Failed to update: ' + error.message);
         }
       }
