@@ -13,7 +13,7 @@ const LIFT_BLOCK = 'The account that owns this file has an open age review.';
 // Swipe review writes media decisions too, and a SAFE or AGE_RESTRICTED there is
 // a lift that relay manager can refuse (#231). Run the page's real handler.
 const mintSwipeFns = new Function('ctx', `
-  const { document, window, fetch, setTimeout, console, reviewQueue, reviewedSha256s, showCurrentVideo } = ctx;
+  const { document, window, fetch, setTimeout, console, reviewQueue, reviewedSha256s, showCurrentVideo, updateProgress } = ctx;
   let currentToast = null;
   let currentIndex = 0;
   let reviewedCount = 0;
@@ -22,7 +22,8 @@ const mintSwipeFns = new Function('ctx', `
   ${extractFunction(swipeReviewHTML, 'moderationRefusal', 'failure.caseUrl')}
   ${extractFunction(swipeReviewHTML, 'offerRefusalCase', "startsWith('https://')")}
   ${extractFunction(swipeReviewHTML, 'handleAction', "'Quick review: ' + action")}
-  return { handleAction, state: () => ({ currentIndex, reviewedCount }) };
+  ${extractFunction(swipeReviewHTML, 'skipVideo', 'currentIndex++')}
+  return { handleAction, skipVideo, state: () => ({ currentIndex, reviewedCount }) };
 `);
 
 function node(tag) {
@@ -36,8 +37,10 @@ function node(tag) {
   return el;
 }
 
-// `responses` are what /admin/api/moderate answers, in order.
-function swipeHarness(responses, previousAction = 'AGE_RESTRICTED') {
+// `responses` are what /admin/api/moderate answers, in order; a promise of one
+// holds that answer back until the test settles it. `queue` is the cards in
+// review order.
+function swipeHarness(responses, previousAction = 'AGE_RESTRICTED', queue = [SHA]) {
   const toasts = [];
   const opened = [];
   const fetches = [];
@@ -49,12 +52,13 @@ function swipeHarness(responses, previousAction = 'AGE_RESTRICTED') {
     window: { open: (...args) => opened.push(args) },
     setTimeout: () => 0,
     console: { error: () => {}, log: () => {} },
-    reviewQueue: [{ sha256: SHA, action: previousAction, isUntriaged: false }],
+    reviewQueue: queue.map((sha256) => ({ sha256, action: previousAction, isUntriaged: false })),
     reviewedSha256s: new Set(),
     showCurrentVideo: () => { renders += 1; },
+    updateProgress: () => {},
     fetch: async (url, init) => {
       fetches.push({ url, body: JSON.parse(init.body) });
-      const response = responses.shift();
+      const response = await responses.shift();
       return {
         ok: response.status >= 200 && response.status < 300,
         status: response.status,
@@ -127,6 +131,60 @@ describe('swipe review media decisions refused by the lift check', () => {
 
     expect(h.text(h.latest())).toBe('Failed to update: Could not confirm with relay manager');
     expect(h.button(h.latest())).toBeNull();
+  });
+});
+
+// An answer the moderator is not waiting on: they skipped on, or decided the
+// same card twice, while the lift check was still out.
+describe('swipe review answers that arrive after the moderator moved on', () => {
+  const NEXT = 'cd'.repeat(32);
+  const LAST = 'ef'.repeat(32);
+  const OK = { status: 200, body: { success: true } };
+
+  function held() {
+    let settle;
+    const answer = new Promise((resolve) => { settle = resolve; });
+    return { answer, settle };
+  }
+
+  it('leaves the card the moderator skipped to alone when the lift is refused', async () => {
+    const first = held();
+    const h = swipeHarness([first.answer], 'AGE_RESTRICTED', [SHA, NEXT]);
+
+    const pending = h.handleAction(SHA, 'SAFE');
+    h.skipVideo();
+    first.settle(REFUSED);
+    await pending;
+
+    expect(h.state()).toEqual({ currentIndex: 1, reviewedCount: 0 });
+    // Drawn once, by the skip: the refusal did not redraw the card after it.
+    expect(h.renders()).toBe(1);
+    expect(h.text(h.latest())).toBe(`${LIFT_BLOCK} (case ${CASE_ID})`);
+  });
+
+  it('does not skip a further card when an allowed lift answers after a skip', async () => {
+    const first = held();
+    const h = swipeHarness([first.answer], 'AGE_RESTRICTED', [SHA, NEXT, LAST]);
+
+    const pending = h.handleAction(SHA, 'SAFE');
+    h.skipVideo();
+    first.settle(OK);
+    await pending;
+
+    expect(h.state()).toEqual({ currentIndex: 1, reviewedCount: 1 });
+  });
+
+  it('moves on once when the same card is decided twice before either answers', async () => {
+    const first = held();
+    const second = held();
+    const h = swipeHarness([first.answer, second.answer], 'AGE_RESTRICTED', [SHA, NEXT, LAST]);
+
+    const pending = [h.handleAction(SHA, 'SAFE'), h.handleAction(SHA, 'SAFE')];
+    first.settle(OK);
+    second.settle(OK);
+    await Promise.all(pending);
+
+    expect(h.state()).toEqual({ currentIndex: 1, reviewedCount: 1 });
   });
 });
 
