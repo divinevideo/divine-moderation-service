@@ -1047,6 +1047,19 @@ async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
   return { sha256: data.sha256 };
 }
 
+// checkMediaLift for the endpoints that act on a batch of files and report
+// each file's outcome rather than answer with one refusal: `{ sha256 }` to go
+// ahead with, or `{ refused }` holding the refusal's status, code, error and,
+// for an open age review, its case.
+async function checkMediaLiftForBatch(env, sha256, action) {
+  const lift = await checkMediaLift(env, sha256, action);
+  if (!(lift instanceof Response)) {
+    return lift;
+  }
+  const { success: _success, ...refusal } = await lift.json();
+  return { refused: { status: lift.status, ...refusal } };
+}
+
 async function deleteRelayEventIds(eventIds, env, reason) {
   const uniqueEventIds = [...new Set(
     (eventIds || []).filter((eventId) => typeof eventId === 'string' && isValidSha256(eventId))
@@ -4186,7 +4199,8 @@ async function runMigration() {
       try {
         const body = await request.json();
         const result = await runClassicVineRollback(body, env, {
-          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env)
+          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env),
+          checkMediaLift: (sha256, action) => checkMediaLiftForBatch(env, sha256, action)
         });
         return jsonResponse(200, result);
       } catch (error) {
@@ -4351,7 +4365,8 @@ async function runMigration() {
           shas,
           env,
           fetchBlossomBlobDetail,
-          notifyBlossom
+          notifyBlossom,
+          checkMediaLift: (sha256, action) => checkMediaLiftForBatch(env, sha256, action)
         });
         console.log('[AR-RECONCILE][apply]', JSON.stringify({
           attempted: result.attempted,

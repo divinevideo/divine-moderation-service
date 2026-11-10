@@ -75,7 +75,8 @@ import worker from './index.mjs';
 const SHA256 = 'a'.repeat(64);
 
 // relay manager's lift check, allowing every lift: a SAFE or AGE_RESTRICTED on
-// /admin/api/moderate asks it first (#231). Its refusals are covered in
+// /admin/api/moderate asks it first (#231), as do the age-restricted reconcile
+// and the classic vine rollback (#242). Its refusals are covered in
 // admin-moderate-lift-check.test.mjs.
 const ALLOW_MEDIA_LIFTS = {
   RELAY_ADMIN_API_KEY: 'test-relay-admin-key',
@@ -2880,6 +2881,7 @@ describe('classic vine rollback admin endpoint', () => {
 
   function createRollbackEnv({ rows = new Map(), kvStore = new Map(), blossomPayloads = [], dbWrites = [] } = {}) {
     return {
+      ...ALLOW_MEDIA_LIFTS,
       ALLOW_DEV_ACCESS: 'true',
       SERVICE_API_TOKEN: 'test-service-token',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/classic-vines/rollback',
@@ -6560,6 +6562,22 @@ describe('age restricted reconcile applyAgeRestrictedRepairs stub', () => {
       read_failed: 0
     });
   });
+
+  // A replay is a lift (#242). With no lift check to ask, it refuses.
+  it('replays nothing when no lift check is wired', async () => {
+    const notified = [];
+    const result = await applyAgeRestrictedRepairs({
+      shas: ['a'.repeat(64)],
+      env: {},
+      fetchBlossomBlobDetail: async () => ({ status: 200, body: { status: 'restricted' } }),
+      notifyBlossom: async (...args) => { notified.push(args); return { success: true }; }
+    });
+
+    expect(notified).toEqual([]);
+    expect(result.failures).toEqual([
+      expect.objectContaining({ sha256: 'a'.repeat(64), stage: 'lift', code: 'lift_check_unavailable' })
+    ]);
+  });
 });
 
 describe('admin age restricted reconcile preview endpoint', () => {
@@ -7055,6 +7073,7 @@ describe('admin age restricted reconcile apply endpoint', () => {
 
   function buildApplyEnv({ blossomStatusBySha = new Map(), blossomResponseBySha = new Map(), webhookPayloads = [], webhookResponseStatus = 200 } = {}) {
     return {
+      ...ALLOW_MEDIA_LIFTS,
       ALLOW_DEV_ACCESS: 'false',
       SERVICE_API_TOKEN: 'test-service-token',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
@@ -7240,6 +7259,7 @@ describe('age restricted apply revalidates blossom state', () => {
     const webhookPayloads = [];
     return {
       env: {
+        ...ALLOW_MEDIA_LIFTS,
         ALLOW_DEV_ACCESS: 'false',
         SERVICE_API_TOKEN: 'test-service-token',
         BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
@@ -7471,6 +7491,7 @@ describe('age restricted apply returns exact failed shas', () => {
   it('preserves failed shas with error and stage for retry', async () => {
     const webhookPayloads = [];
     const e = {
+      ...ALLOW_MEDIA_LIFTS,
       ALLOW_DEV_ACCESS: 'false',
       SERVICE_API_TOKEN: 'test-service-token',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',
@@ -7556,6 +7577,7 @@ describe('age restricted reconcile writes AGE_RESTRICTED', () => {
   it('apply always calls notifyBlossom with AGE_RESTRICTED, never RESTRICT', async () => {
     const webhookPayloads = [];
     const e = {
+      ...ALLOW_MEDIA_LIFTS,
       ALLOW_DEV_ACCESS: 'false',
       SERVICE_API_TOKEN: 'test-service-token',
       BLOSSOM_WEBHOOK_URL: 'https://mock-blossom.test/webhook',

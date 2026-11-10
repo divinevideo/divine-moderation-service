@@ -27,6 +27,8 @@ let kvPuts;
 let kvDeletes;
 let d1Writes;
 let blossomCalls;
+// What the media server's admin API says of SHA's state, or null for no record.
+let blobStatus;
 
 // relay manager, reached through the RELAY_ADMIN service binding. `liftAnswer`
 // is what its lift check says; a function so a test can throw instead.
@@ -107,6 +109,7 @@ beforeEach(() => {
   kvDeletes = [];
   d1Writes = [];
   blossomCalls = [];
+  blobStatus = null;
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -115,6 +118,9 @@ beforeEach(() => {
     if (url === BLOSSOM_URL) {
       blossomCalls.push(JSON.parse(init.body));
       return Response.json({ success: true });
+    }
+    if (url === `https://media.divine.video/admin/api/blob/${SHA}` && blobStatus) {
+      return Response.json({ sha256: SHA, status: blobStatus });
     }
     return new Response('not found', { status: 404 });
   });
@@ -607,6 +613,187 @@ describe('POST /admin/api/verify-category/:sha256 asks relay manager before auto
     const response = await verify('nudity', 'confirmed');
 
     expect((await response.json()).autoApproved).toBe(false);
+    expect(liftCalls).toEqual([]);
+  });
+});
+
+function adminPost(path, body, overrides) {
+  return worker.fetch(
+    new Request(`https://moderation.admin.divine.video${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'cf-access-jwt-assertion': 'test-access-token' },
+      body: JSON.stringify(body)
+    }),
+    env(overrides)
+  );
+}
+
+const AGE_REVIEW_REFUSAL = () => Response.json({
+  success: false,
+  error: 'The account that owns this file has an open age review.',
+  code: 'age_review_active',
+  caseId: CASE_ID,
+  state: 'open_reported'
+}, { status: 409 });
+
+// Replaying AGE_RESTRICTED over a file the media server still hides shows it to
+// signed-in adults, so it is a lift like the dashboard's own (#242).
+describe('POST /admin/api/reconcile/age-restricted/apply asks relay manager before a replay', () => {
+  const apply = (shas) => adminPost('/admin/api/reconcile/age-restricted/apply', { shas });
+
+  beforeEach(() => { blobStatus = 'restricted'; });
+
+  it('asks before replaying AGE_RESTRICTED, and replays it once allowed', async () => {
+    const response = await apply([SHA]);
+
+    expect(response.status).toBe(200);
+    expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'AGE_RESTRICTED' }]);
+    expect(blossomCalls).toEqual([expect.objectContaining({ sha256: SHA, action: 'AGE_RESTRICTED' })]);
+    expect(await response.json()).toMatchObject({ success: true, notified: 1, failed: 0 });
+  });
+
+  it('leaves the file hidden while its owner has an open age review, and names the case', async () => {
+    liftAnswer = AGE_REVIEW_REFUSAL;
+
+    const response = await apply([SHA]);
+
+    expect(response.status).toBe(200);
+    expect(blossomCalls).toEqual([]);
+    expect(await response.json()).toMatchObject({
+      success: false,
+      notified: 0,
+      failed: 1,
+      failures: [{
+        sha256: SHA,
+        stage: 'lift',
+        code: 'age_review_active',
+        error: 'The account that owns this file has an open age review.',
+        caseId: CASE_ID,
+        caseUrl: `https://relay.admin.test/age-review?case=${CASE_ID}`
+      }]
+    });
+  });
+
+  it('leaves the file hidden when relay manager cannot be asked', async () => {
+    liftAnswer = () => { throw new Error('connection refused'); };
+
+    const response = await apply([SHA]);
+
+    expect(blossomCalls).toEqual([]);
+    expect((await response.json()).failures).toEqual([
+      expect.objectContaining({ sha256: SHA, stage: 'lift', code: 'lift_check_unavailable' })
+    ]);
+  });
+
+  it('does not ask about a file the media server already shows behind the 18+ gate', async () => {
+    blobStatus = 'age_restricted';
+
+    const response = await apply([SHA]);
+
+    expect((await response.json()).skipped.aligned).toBe(1);
+    expect(liftCalls).toEqual([]);
+  });
+});
+
+// A rollback sets the file SAFE, which is a lift whatever it was before (#242).
+describe('POST /admin/api/classic-vines/rollback asks relay manager before restoring a file', () => {
+  const CLASSIC_VINE = { platform: 'vine', sourceUrl: 'https://vine.co/v/abc123', publishedAt: 1389756506 };
+  let row;
+  let staleKvKeys;
+
+  // A D1 holding `row` for SHA, and a KV holding the `staleKvKeys` a rollback
+  // clears.
+  const rollback = () => adminPost('/admin/api/classic-vines/rollback', {
+    mode: 'execute',
+    source: 'sha-list',
+    videos: [{ sha256: SHA, nostrContext: CLASSIC_VINE }]
+  }, {
+    BLOSSOM_DB: {
+      ...env().BLOSSOM_DB,
+      prepare(sql) {
+        const stmt = env().BLOSSOM_DB.prepare(sql);
+        return {
+          ...stmt,
+          bind(...args) { stmt.bind(...args); return this; },
+          async first() { return /FROM moderation_results/i.test(sql) ? row : null; }
+        };
+      }
+    },
+    MODERATION_KV: {
+      async get(key) { return staleKvKeys.includes(key) ? '{}' : null; },
+      async put(key) { kvPuts.push(key); },
+      async delete(key) { kvDeletes.push(key); },
+      async list() { return { keys: [], list_complete: true, cursor: null }; }
+    }
+  });
+
+  beforeEach(() => {
+    row = {
+      sha256: SHA, action: 'PERMANENT_BAN', provider: 'hiveai', scores: '{}', categories: '[]',
+      moderated_at: '2026-03-12T00:00:00.000Z', uploaded_by: null
+    };
+    staleKvKeys = [`permanent-ban:${SHA}`];
+  });
+
+  it('asks before restoring, and restores once allowed', async () => {
+    const response = await rollback();
+
+    expect(response.status).toBe(200);
+    expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'SAFE' }]);
+    expect(d1Writes.some((w) => /INSERT INTO moderation_results/i.test(w.sql))).toBe(true);
+    expect(kvDeletes).toEqual([`permanent-ban:${SHA}`]);
+    expect(blossomCalls).toEqual([expect.objectContaining({ sha256: SHA, action: 'SAFE' })]);
+    expect(await response.json()).toMatchObject({ restored: 1, failed: 0 });
+  });
+
+  it('writes nothing while the owner has an open age review, and names the case', async () => {
+    liftAnswer = AGE_REVIEW_REFUSAL;
+
+    const response = await rollback();
+
+    expect(response.status).toBe(200);
+    expectNoWrites();
+    expect(await response.json()).toMatchObject({
+      restored: 0,
+      failed: 1,
+      candidates: [{
+        sha256: SHA,
+        reason: 'lift-refused',
+        restored: false,
+        error: 'The account that owns this file has an open age review.',
+        lift_code: 'age_review_active',
+        case_id: CASE_ID,
+        case_url: `https://relay.admin.test/age-review?case=${CASE_ID}`
+      }]
+    });
+  });
+
+  it('asks before clearing what is left of a block on a file already recorded safe', async () => {
+    row = { ...row, action: 'SAFE' };
+    liftAnswer = AGE_REVIEW_REFUSAL;
+
+    const response = await rollback();
+
+    expectNoWrites();
+    expect((await response.json()).candidates[0]).toMatchObject({ reason: 'lift-refused', lift_code: 'age_review_active' });
+  });
+
+  it('writes nothing when relay manager cannot be asked', async () => {
+    liftAnswer = () => { throw new Error('connection refused'); };
+
+    const response = await rollback();
+
+    expectNoWrites();
+    expect((await response.json()).candidates[0]).toMatchObject({ reason: 'lift-refused', lift_code: 'lift_check_unavailable' });
+  });
+
+  it('does not ask about a file that is already safe with nothing left to clear', async () => {
+    row = { ...row, action: 'SAFE' };
+    staleKvKeys = [];
+
+    const response = await rollback();
+
+    expect((await response.json()).candidates[0].reason).toBe('already-safe');
     expect(liftCalls).toEqual([]);
   });
 });
