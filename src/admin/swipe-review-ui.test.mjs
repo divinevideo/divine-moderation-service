@@ -232,6 +232,24 @@ describe('swipe review answers that arrive after the moderator moved on', () => 
     expect(h.state().currentIndex).toBe(0);
   });
 
+  it('decides the swiped card, and undoes to its action, when a skip lands before the swipe is sent', async () => {
+    // A swipe sends its decision 300ms after the card starts to fade. A skip in
+    // that time puts the next card on screen, here one not yet triaged.
+    const h = swipeHarness([OK, OK], 'AGE_RESTRICTED', [SHA, NEXT]);
+    Object.assign(h.reviewQueue[1], { action: 'UNTRIAGED', isUntriaged: true });
+
+    h.skipVideo();
+    await h.handleAction(SHA, 'SAFE');
+
+    expect(h.fetches[0]).toEqual({
+      url: `/admin/api/moderate/${SHA}`,
+      body: { action: 'SAFE', reason: 'Quick review: SAFE' }
+    });
+    h.button(h.latest()).onclick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.fetches[1].body.action).toBe('AGE_RESTRICTED');
+  });
+
   it('keeps the review where it is on Undo when the decided card left the queue', async () => {
     const first = held();
     const h = swipeHarness([first.answer, OK], 'AGE_RESTRICTED', [SHA, NEXT]);
