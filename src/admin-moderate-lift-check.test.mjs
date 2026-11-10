@@ -308,6 +308,90 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
     expect(blossomCalls.every((call) => call.sha256 === SHA)).toBe(true);
   });
 
+  // relay manager reads the owner from the media server. This service records
+  // its own uploader, which can differ, so the check names it too (#242).
+  describe('names the uploader this service records', () => {
+    const UPLOADER = 'cd'.repeat(32);
+    const OTHER = 'ef'.repeat(32);
+
+    // A D1 whose moderation record for SHA names `uploadedBy`; `fail` makes
+    // every read throw.
+    function recordDb(uploadedBy, { fail = false } = {}) {
+      const base = env().BLOSSOM_DB;
+      return {
+        ...base,
+        prepare(sql) {
+          const stmt = base.prepare(sql);
+          return {
+            ...stmt,
+            bind(...args) { stmt.bind(...args); return this; },
+            async first() {
+              if (fail) throw new Error('D1 unavailable');
+              return /FROM moderation_results/i.test(sql) ? { sha256: SHA, uploaded_by: uploadedBy } : null;
+            }
+          };
+        }
+      };
+    }
+
+    function legacyKv(record) {
+      return {
+        async get(key) { return key === `moderation:${SHA}` ? JSON.stringify(record) : null; },
+        async put(key) { kvPuts.push(key); },
+        async delete(key) { kvDeletes.push(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      };
+    }
+
+    it.each(['SAFE', 'AGE_RESTRICTED'])('sends the recorded uploader with a %s, in lowercase', async (action) => {
+      const response = await moderate(SHA, { action }, { BLOSSOM_DB: recordDb(UPLOADER.toUpperCase()) });
+
+      expect(response.status).toBe(200);
+      expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action, uploader: UPLOADER }]);
+    });
+
+    it('prefers the recorded uploader to the one the request names', async () => {
+      await moderate(SHA, { action: 'SAFE', uploadedBy: OTHER }, { BLOSSOM_DB: recordDb(UPLOADER) });
+
+      expect(liftCalls[0].body.uploader).toBe(UPLOADER);
+    });
+
+    it('falls back to the uploader in an older KV-only record', async () => {
+      await moderate(SHA, { action: 'SAFE', uploadedBy: OTHER }, {
+        MODERATION_KV: legacyKv({ action: 'QUARANTINE', uploadedBy: UPLOADER })
+      });
+
+      expect(liftCalls[0].body.uploader).toBe(UPLOADER);
+    });
+
+    it('sends the uploader the request names when the file has no record yet', async () => {
+      await moderate(SHA, { action: 'SAFE', uploadedBy: UPLOADER });
+
+      expect(liftCalls[0].body.uploader).toBe(UPLOADER);
+    });
+
+    it('sends no uploader when none is recorded', async () => {
+      await moderate(SHA, { action: 'SAFE' }, { BLOSSOM_DB: recordDb(null) });
+
+      expect(liftCalls[0].body).toEqual({ sha256: SHA, action: 'SAFE' });
+    });
+
+    it('leaves out a recorded uploader that is not a pubkey', async () => {
+      await moderate(SHA, { action: 'SAFE' }, { BLOSSOM_DB: recordDb('not-a-pubkey') });
+
+      expect(liftCalls[0].body).toEqual({ sha256: SHA, action: 'SAFE' });
+    });
+
+    it('refuses without asking when the record cannot be read', async () => {
+      const response = await moderate(SHA, { action: 'SAFE' }, { BLOSSOM_DB: recordDb(UPLOADER, { fail: true }) });
+
+      expect(response.status).toBe(502);
+      expect(await response.json()).toMatchObject({ success: false, code: 'lift_check_unavailable' });
+      expect(liftCalls).toEqual([]);
+      expectNoWrites();
+    });
+  });
+
   it('asks about, and writes, the lowercase hash', async () => {
     const response = await moderate(SHA.toUpperCase(), { action: 'SAFE' });
 
@@ -369,6 +453,15 @@ describe('POST /admin/api/verify-category/:sha256 asks relay manager before auto
     expect((await response.json()).autoApproved).toBe(true);
     expect(stored().action).toBe('SAFE');
     expect(kvDeletes).toContain(`age-restricted:${SHA}`);
+  });
+
+  it('names the uploader the record carries', async () => {
+    const uploader = 'cd'.repeat(32);
+    kvStore.set(`moderation:${SHA}`, JSON.stringify({ action: 'AGE_RESTRICTED', scores: { nudity: 0.9 }, uploadedBy: uploader }));
+
+    await verify('nudity', 'rejected');
+
+    expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'SAFE', uploader }]);
   });
 
   it('saves the rejection but leaves the action alone while the owner has an open age review', async () => {

@@ -998,13 +998,29 @@ function liftCheckFailureResponse(error, env) {
   return liftCheckUnavailable(error);
 }
 
+// The account this service records as the file's uploader, in lowercase, or
+// null. relay manager reads the owner from the media server, and the two can
+// differ, so the lift check names this one too and relay manager checks its
+// open age review as well (#242). The first pubkey found in the D1 record, the
+// older KV-only record, then `fallback`: the uploader a write would record for
+// a file with no record yet.
+async function recordedUploader(env, sha256, fallback) {
+  const row = await env.BLOSSOM_DB.prepare(
+    'SELECT uploaded_by FROM moderation_results WHERE sha256 = ?'
+  ).bind(sha256).first();
+  const legacy = parseMaybeJson(await env.MODERATION_KV.get(`moderation:${sha256}`), null);
+  const uploader = [row?.uploaded_by, legacy?.uploadedBy, fallback].find(isValidPubkey);
+  return uploader ? uploader.toLowerCase() : null;
+}
+
 // Ask relay manager whether `action` may go ahead on this file. Returns the
 // lowercase hash it checked, which is the one to write, or the Response to send
-// instead. Fails closed: anything short of a 200 checked allow naming this
-// file, within the deadline, is a refusal. Check-then-act, as on relay
-// manager's own route: a case opened between the check and the write is not
-// seen.
-async function checkMediaLift(env, sha256, action) {
+// instead. `fallbackUploader` is what recordedUploader falls back to. Fails
+// closed: anything short of a 200 checked allow naming this file, within the
+// deadline, is a refusal, and so is a record that cannot be read for its
+// uploader. Check-then-act, as on relay manager's own route: a case opened
+// between the check and the write is not seen.
+async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
   if (!isValidSha256(sha256)) {
     return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
   }
@@ -1014,8 +1030,12 @@ async function checkMediaLift(env, sha256, action) {
   let status;
   let data;
   try {
+    const uploader = await recordedUploader(env, sha256, fallbackUploader);
     ({ status, data } = await postToRelayAdmin(
-      env, '/api/moderate-media/lift-check', { sha256, action }, LIFT_CHECK_TIMEOUT_MS
+      env,
+      '/api/moderate-media/lift-check',
+      { sha256, action, ...(uploader ? { uploader } : {}) },
+      LIFT_CHECK_TIMEOUT_MS
     ));
   } catch (error) {
     return liftCheckFailureResponse(error, env);
@@ -2471,7 +2491,7 @@ export default {
       // Before anything is written: a lift must clear relay manager's age-review
       // guard (#231). An Undo or an Edit Scores that sends SAFE is a lift too.
       if (MEDIA_LIFT_ACTIONS.has(action)) {
-        const lift = await checkMediaLift(env, sha256, action);
+        const lift = await checkMediaLift(env, sha256, action, uploadedBy);
         if (lift instanceof Response) {
           return lift;
         }
