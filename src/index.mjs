@@ -962,6 +962,12 @@ function relayAdminFailureResponse(error, env) {
 // relay manager's lift check first (#231) instead of restating the rules.
 const MEDIA_LIFT_ACTIONS = new Set(['SAFE', 'AGE_RESTRICTED']);
 
+// relay manager's lift check can read the media server's record and then this
+// service's, up to 10s each (divine-relay-manager STATUS_READ_TIMEOUT_MS), so
+// its answer can take about 20s. Waiting any less refuses a lift it would have
+// allowed (#242).
+const LIFT_CHECK_TIMEOUT_MS = 25000;
+
 // relay manager's refusals that mean "not this file, not now", each with the
 // status it sends. Passed through so the dashboard can say why. Any other
 // failure, including one with an unexpected status, is "could not ask".
@@ -1008,7 +1014,9 @@ async function checkMediaLift(env, sha256, action) {
   let status;
   let data;
   try {
-    ({ status, data } = await postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action }));
+    ({ status, data } = await postToRelayAdmin(
+      env, '/api/moderate-media/lift-check', { sha256, action }, LIFT_CHECK_TIMEOUT_MS
+    ));
   } catch (error) {
     return liftCheckFailureResponse(error, env);
   }

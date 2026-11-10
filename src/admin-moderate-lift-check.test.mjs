@@ -245,13 +245,34 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
         status: 200, headers: { 'Content-Type': 'application/json' }
       });
 
-      const pending = moderate(SHA, { action: 'SAFE' });
-      await vi.advanceTimersByTimeAsync(15001);
+      let settled = false;
+      const pending = moderate(SHA, { action: 'SAFE' }).finally(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(24999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2);
       const response = await pending;
 
       expect(response.status).toBe(502);
       expect(await response.json()).toMatchObject({ success: false, code: 'lift_check_unavailable' });
       expectNoWrites();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // relay manager's check can read the media server and then this service's
+  // record, up to 10s each, so its answer can take about 20s.
+  it('waits for a lift check that takes as long as relay manager allows itself', async () => {
+    vi.useFakeTimers();
+    try {
+      liftAnswer = (body) => new Promise((resolve) => setTimeout(() => resolve(allowed(body)), 20000));
+
+      const pending = moderate(SHA, { action: 'SAFE' });
+      await vi.advanceTimersByTimeAsync(20001);
+      const response = await pending;
+
+      expect(response.status).toBe(200);
+      expect(blossomCalls).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
