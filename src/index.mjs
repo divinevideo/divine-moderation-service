@@ -1064,17 +1064,36 @@ async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
   return { sha256: data.sha256 };
 }
 
-// checkMediaLift for the endpoints that act on a batch of files and report
-// each file's outcome rather than answer with one refusal: `{ sha256 }` to go
-// ahead with, or `{ refused }` holding the refusal's status, code, error and,
-// for an open age review, its case.
-async function checkMediaLiftForBatch(env, sha256, action) {
-  const lift = await checkMediaLift(env, sha256, action);
-  if (!(lift instanceof Response)) {
-    return lift;
-  }
-  const { success: _success, ...refusal } = await lift.json();
-  return { refused: { status: lift.status, ...refusal } };
+// checkMediaLift for an endpoint that acts on a batch of files and reports
+// each file's outcome rather than answer with one refusal. The checker it
+// returns answers `{ sha256 }` to go ahead with, or `{ refused }` holding the
+// refusal's status, code, error and, for an open age review, its case. Once
+// relay manager cannot be asked about one file, the rest of the batch is
+// refused without asking: it would not answer for the next file either, and
+// each try can wait the full deadline, so a stalled relay manager would
+// otherwise hold the request open for the whole batch.
+function batchLiftChecker(env) {
+  let unavailable = null;
+  return async (sha256, action) => {
+    if (unavailable !== null) {
+      return {
+        refused: {
+          status: 502,
+          code: 'lift_check_unavailable',
+          error: `Not asked: relay manager could not be asked about an earlier file in this batch (${unavailable})`
+        }
+      };
+    }
+    const lift = await checkMediaLift(env, sha256, action);
+    if (!(lift instanceof Response)) {
+      return lift;
+    }
+    const { success: _success, ...refusal } = await lift.json();
+    if (refusal.code === 'lift_check_unavailable') {
+      unavailable = refusal.error;
+    }
+    return { refused: { status: lift.status, ...refusal } };
+  };
 }
 
 async function deleteRelayEventIds(eventIds, env, reason) {
@@ -4217,7 +4236,7 @@ async function runMigration() {
         const body = await request.json();
         const result = await runClassicVineRollback(body, env, {
           notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env),
-          checkMediaLift: (sha256, action) => checkMediaLiftForBatch(env, sha256, action)
+          checkMediaLift: batchLiftChecker(env)
         });
         return jsonResponse(200, result);
       } catch (error) {
@@ -4383,7 +4402,7 @@ async function runMigration() {
           env,
           fetchBlossomBlobDetail,
           notifyBlossom,
-          checkMediaLift: (sha256, action) => checkMediaLiftForBatch(env, sha256, action)
+          checkMediaLift: batchLiftChecker(env)
         });
         console.log('[AR-RECONCILE][apply]', JSON.stringify({
           attempted: result.attempted,

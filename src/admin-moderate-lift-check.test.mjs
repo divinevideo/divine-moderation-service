@@ -27,7 +27,8 @@ let kvPuts;
 let kvDeletes;
 let d1Writes;
 let blossomCalls;
-// What the media server's admin API says of SHA's state, or null for no record.
+// What the media server's admin API says of any file's state, or null for no
+// record.
 let blobStatus;
 
 // relay manager, reached through the RELAY_ADMIN service binding. `liftAnswer`
@@ -119,8 +120,9 @@ beforeEach(() => {
       blossomCalls.push(JSON.parse(init.body));
       return Response.json({ success: true });
     }
-    if (url.toLowerCase() === `https://media.divine.video/admin/api/blob/${SHA}` && blobStatus) {
-      return Response.json({ sha256: SHA, status: blobStatus });
+    const blob = url.match(/^https:\/\/media\.divine\.video\/admin\/api\/blob\/([0-9a-f]{64})$/i);
+    if (blob && blobStatus) {
+      return Response.json({ sha256: blob[1].toLowerCase(), status: blobStatus });
     }
     return new Response('not found', { status: 404 });
   });
@@ -749,6 +751,35 @@ describe('POST /admin/api/reconcile/age-restricted/apply asks relay manager befo
     expect((await response.json()).notified).toBe(1);
   });
 
+  // A relay manager that cannot be asked will not answer for the next file
+  // either, and each try can wait the full deadline.
+  it('stops asking for the rest of the batch once relay manager cannot be asked', async () => {
+    const next = 'cd'.repeat(32);
+    liftAnswer = () => { throw new Error('connection refused'); };
+
+    const response = await apply([SHA, next]);
+
+    expect(liftCalls).toHaveLength(1);
+    expect(blossomCalls).toEqual([]);
+    const body = await response.json();
+    expect(body.failed).toBe(2);
+    expect(body.failures).toEqual([
+      expect.objectContaining({ sha256: SHA, stage: 'lift', code: 'lift_check_unavailable' }),
+      expect.objectContaining({ sha256: next, stage: 'lift', code: 'lift_check_unavailable', error: expect.stringMatching(/^Not asked/) })
+    ]);
+  });
+
+  it('keeps asking after a refusal for one file', async () => {
+    const next = 'cd'.repeat(32);
+    liftAnswer = (body) => (body.sha256 === SHA ? AGE_REVIEW_REFUSAL() : allowed(body));
+
+    const response = await apply([SHA, next]);
+
+    expect(liftCalls).toHaveLength(2);
+    expect(blossomCalls).toEqual([expect.objectContaining({ sha256: next })]);
+    expect(await response.json()).toMatchObject({ notified: 1, failed: 1 });
+  });
+
   it('does not ask about a file the media server already shows behind the 18+ gate', async () => {
     blobStatus = 'age_restricted';
 
@@ -767,10 +798,10 @@ describe('POST /admin/api/classic-vines/rollback asks relay manager before resto
 
   // A D1 holding `row` for SHA, and a KV holding the `staleKvKeys` a rollback
   // clears.
-  const rollback = () => adminPost('/admin/api/classic-vines/rollback', {
+  const rollback = (shas = [SHA]) => adminPost('/admin/api/classic-vines/rollback', {
     mode: 'execute',
     source: 'sha-list',
-    videos: [{ sha256: SHA, nostrContext: CLASSIC_VINE }]
+    videos: shas.map((sha256) => ({ sha256, nostrContext: CLASSIC_VINE }))
   }, {
     BLOSSOM_DB: {
       ...env().BLOSSOM_DB,
@@ -849,6 +880,28 @@ describe('POST /admin/api/classic-vines/rollback asks relay manager before resto
 
     expectNoWrites();
     expect((await response.json()).candidates[0]).toMatchObject({ reason: 'lift-refused', lift_code: 'lift_check_unavailable' });
+  });
+
+  it('names the uploader the record carries', async () => {
+    const uploader = 'cd'.repeat(32);
+    row = { ...row, uploaded_by: uploader };
+
+    await rollback();
+
+    expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'SAFE', uploader }]);
+  });
+
+  it('stops asking for the rest of the batch once relay manager cannot be asked', async () => {
+    const next = 'cd'.repeat(32);
+    liftAnswer = () => { throw new Error('connection refused'); };
+
+    const response = await rollback([SHA, next]);
+
+    expect(liftCalls).toHaveLength(1);
+    expectNoWrites();
+    const { candidates, failed } = await response.json();
+    expect(failed).toBe(2);
+    expect(candidates[1]).toMatchObject({ sha256: next, reason: 'lift-refused', lift_code: 'lift_check_unavailable', error: expect.stringMatching(/^Not asked/) });
   });
 
   it('does not ask about a file that is already safe with nothing left to clear', async () => {
