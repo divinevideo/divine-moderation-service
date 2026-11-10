@@ -436,6 +436,48 @@ describe('admin uploader enforcement routes', () => {
     }
   });
 
+  // The deadline covers the whole answer, not only its headers: a body that
+  // stalls after the status line must not hold the moderator's request open.
+  // This body ignores the abort, so the deadline has to hold on its own.
+  it('fails with a timeout error when the relay-admin answer stalls after its headers', async () => {
+    vi.useFakeTimers();
+    const uploaderEnforcements = new Map();
+    const RELAY_ADMIN = {
+      fetch: async () => new Response(new ReadableStream({ start() {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' }
+      })
+    };
+
+    try {
+      const pending = worker.fetch(
+        new Request(`https://moderation.admin.divine.video/admin/api/uploader/${PUBKEY}/enforcement`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
+          },
+          body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
+        }),
+        createEnv({
+          BLOSSOM_DB: createDbMock({ uploaderEnforcements }),
+          RELAY_ADMIN,
+          RELAY_ADMIN_API_KEY: 'super-secret-admin-key',
+          RELAY_ADMIN_URL: 'https://relay.admin.divine.video'
+        })
+      );
+      await vi.advanceTimersByTimeAsync(15001);
+      const response = await pending;
+
+      expect(response.status).toBe(502);
+      const body = await response.json();
+      expect(String(body.error || '')).toMatch(/timed out after 15s/i);
+      // The ban was never confirmed, so it is not recorded as applied.
+      expect(uploaderEnforcements.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns uploader enforcement in focused lookup responses', async () => {
     const env = createEnv({
       BLOSSOM_DB: createDbMock({

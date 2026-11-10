@@ -805,10 +805,11 @@ async function callRelayAdminAction(env, payload) {
 }
 
 // One POST to relay-admin: its status and data on success, a RelayAdminError
-// on a refusal, and a plain Error when it cannot be reached. Shared by the ban
-// RPCs above and the media lift check (#231) so both use the same transport,
-// key and timeout. The timeout covers the response headers, not its body.
-async function postToRelayAdmin(env, path, body) {
+// on a refusal, and a plain Error when it cannot be reached or does not finish
+// answering within `timeoutMs`. Shared by the ban RPCs above and the media lift
+// check (#231) so both use the same transport and key. The deadline covers the
+// whole answer, body included (#242).
+async function postToRelayAdmin(env, path, body, timeoutMs = RELAY_ADMIN_TIMEOUT_MS) {
   const url = `${getRelayAdminUrl(env)}${path}`;
 
   // Prefer the worker-to-worker service binding when configured: it bypasses the
@@ -833,8 +834,21 @@ async function postToRelayAdmin(env, path, body) {
 
   // Bound the call so a dead/slow relay-admin endpoint fails fast instead of
   // hanging the request (and the moderator's UI) for the full CF edge timeout.
+  // The deadline holds until the body has been read, not only the headers: a
+  // body that stalls after the status line would otherwise hold the request
+  // open, or let a late answer through. It also rejects on its own, so it holds
+  // even where the transport does not stop reading on the abort.
+  const transport = viaBinding ? ', via service binding' : '';
+  const timedOut = () => new Error(`Relay admin call timed out after ${timeoutMs / 1000}s (${url}${transport})`);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), RELAY_ADMIN_TIMEOUT_MS);
+  let timeoutId;
+  const deadline = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(timedOut());
+    }, timeoutMs);
+  });
+  deadline.catch(() => {});
 
   const init = {
     method: 'POST',
@@ -847,12 +861,13 @@ async function postToRelayAdmin(env, path, body) {
   };
 
   let response;
+  let text;
   try {
-    response = viaBinding ? await binding.fetch(url, init) : await fetch(url, init);
+    response = await Promise.race([viaBinding ? binding.fetch(url, init) : fetch(url, init), deadline]);
+    text = await Promise.race([response.text(), deadline]);
   } catch (err) {
     if (err?.name === 'AbortError') {
-      const transport = viaBinding ? ', via service binding' : '';
-      throw new Error(`Relay admin call timed out after ${RELAY_ADMIN_TIMEOUT_MS / 1000}s (${url}${transport})`);
+      throw timedOut();
     }
     throw err;
   } finally {
@@ -874,7 +889,12 @@ async function postToRelayAdmin(env, path, body) {
     }
   }
 
-  const data = await response.json().catch(() => ({}));
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = {};
+  }
   if (!response.ok || data?.success === false) {
     throw new RelayAdminError(relayAdminField(data?.error) || `Relay admin error: HTTP ${response.status}`, {
       upstreamStatus: response.status,
@@ -983,27 +1003,14 @@ async function checkMediaLift(env, sha256, action) {
     return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
   }
 
-  // postToRelayAdmin's own timeout stops at the headers. A write must not wait
-  // on a body that never finishes, or go ahead on one that arrives late, so the
-  // whole answer has one deadline. The abandoned call's result is ignored.
-  const call = postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action });
-  call.catch(() => {});
-  let timeoutId;
-  const deadline = new Promise((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error(`Lift check did not answer within ${RELAY_ADMIN_TIMEOUT_MS / 1000}s`)),
-      RELAY_ADMIN_TIMEOUT_MS
-    );
-  });
-
+  // postToRelayAdmin's deadline covers the whole answer, so a write never waits
+  // on a body that does not finish, or goes ahead on one that arrives late.
   let status;
   let data;
   try {
-    ({ status, data } = await Promise.race([call, deadline]));
+    ({ status, data } = await postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action }));
   } catch (error) {
     return liftCheckFailureResponse(error, env);
-  } finally {
-    clearTimeout(timeoutId);
   }
 
   if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256.toLowerCase()) {
