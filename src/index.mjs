@@ -1030,10 +1030,21 @@ async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
 
   // postToRelayAdmin's deadline covers the whole answer, so a write never waits
   // on a body that does not finish, or goes ahead on one that arrives late.
+  let uploader;
+  try {
+    uploader = await recordedUploader(env, sha256, fallbackUploader);
+  } catch (error) {
+    console.error('[ADMIN] Could not read the recorded uploader for the lift check; refusing:', error);
+    return jsonResponse(502, {
+      success: false,
+      error: "Could not read this file's record to name its uploader to relay manager; refusing",
+      code: 'lift_check_unavailable'
+    });
+  }
+
   let status;
   let data;
   try {
-    const uploader = await recordedUploader(env, sha256, fallbackUploader);
     ({ status, data } = await postToRelayAdmin(
       env,
       '/api/moderate-media/lift-check',

@@ -388,8 +388,29 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
       expect(liftCalls[0].body).toEqual({ sha256: SHA, action: 'SAFE' });
     });
 
+    // relay manager was never asked, so the refusal says what could not be read.
     it('refuses without asking when the record cannot be read', async () => {
       const response = await moderate(SHA, { action: 'SAFE' }, { BLOSSOM_DB: recordDb(UPLOADER, { fail: true }) });
+
+      expect(response.status).toBe(502);
+      expect(await response.json()).toEqual({
+        success: false,
+        error: "Could not read this file's record to name its uploader to relay manager; refusing",
+        code: 'lift_check_unavailable'
+      });
+      expect(liftCalls).toEqual([]);
+      expectNoWrites();
+    });
+
+    it('refuses without asking when the older KV record cannot be read', async () => {
+      const response = await moderate(SHA, { action: 'SAFE' }, {
+        MODERATION_KV: {
+          async get() { throw new Error('KV unavailable'); },
+          async put(key) { kvPuts.push(key); },
+          async delete(key) { kvDeletes.push(key); },
+          async list() { return { keys: [], list_complete: true, cursor: null }; }
+        }
+      });
 
       expect(response.status).toBe(502);
       expect(await response.json()).toMatchObject({ success: false, code: 'lift_check_unavailable' });
