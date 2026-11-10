@@ -370,6 +370,24 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
       expect(liftCalls[0].body.uploader).toBe(UPLOADER);
     });
 
+    it('prefers the D1 record to the older KV record', async () => {
+      await moderate(SHA, { action: 'SAFE' }, {
+        BLOSSOM_DB: recordDb(UPLOADER),
+        MODERATION_KV: legacyKv({ action: 'QUARANTINE', uploadedBy: OTHER })
+      });
+
+      expect(liftCalls[0].body.uploader).toBe(UPLOADER);
+    });
+
+    it('passes over a D1 uploader that is not a pubkey for the older KV record\'s', async () => {
+      await moderate(SHA, { action: 'SAFE' }, {
+        BLOSSOM_DB: recordDb('not-a-pubkey'),
+        MODERATION_KV: legacyKv({ action: 'QUARANTINE', uploadedBy: UPLOADER })
+      });
+
+      expect(liftCalls[0].body.uploader).toBe(UPLOADER);
+    });
+
     it('sends the uploader the request names when the file has no record yet', async () => {
       await moderate(SHA, { action: 'SAFE', uploadedBy: UPLOADER });
 

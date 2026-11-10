@@ -1001,9 +1001,12 @@ function liftCheckFailureResponse(error, env) {
 // The account this service records as the file's uploader, in lowercase, or
 // null. relay manager reads the owner from the media server, and the two can
 // differ, so the lift check names this one too and relay manager checks its
-// open age review as well (#242). The first pubkey found in the D1 record, the
-// older KV-only record, then `fallback`: the uploader a write would record for
-// a file with no record yet.
+// open age review as well (#242). It is the first pubkey among the D1 record's
+// uploader, the older KV record's, and `fallback`, the uploader the caller's
+// write would record for a file with no record yet. A value that is not a
+// pubkey is passed over. `fallback` is used whenever neither record names a
+// pubkey, so the check can name an account the write will not record; that
+// only adds a check, never removes one.
 async function recordedUploader(env, sha256, fallback) {
   const row = await env.BLOSSOM_DB.prepare(
     'SELECT uploaded_by FROM moderation_results WHERE sha256 = ?'
