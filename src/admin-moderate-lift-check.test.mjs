@@ -119,7 +119,7 @@ beforeEach(() => {
       blossomCalls.push(JSON.parse(init.body));
       return Response.json({ success: true });
     }
-    if (url === `https://media.divine.video/admin/api/blob/${SHA}` && blobStatus) {
+    if (url.toLowerCase() === `https://media.divine.video/admin/api/blob/${SHA}` && blobStatus) {
       return Response.json({ sha256: SHA, status: blobStatus });
     }
     return new Response('not found', { status: 404 });
@@ -683,6 +683,31 @@ describe('POST /admin/api/reconcile/age-restricted/apply asks relay manager befo
     expect((await response.json()).failures).toEqual([
       expect.objectContaining({ sha256: SHA, stage: 'lift', code: 'lift_check_unavailable' })
     ]);
+  });
+
+  // Records are keyed by the lowercase hash. An uppercase one must still find
+  // the recorded uploader, and be asked about and replayed in lowercase.
+  it('asks under the lowercase hash, with the recorded uploader, when given an uppercase one', async () => {
+    const uploader = 'cd'.repeat(32);
+    const base = env().BLOSSOM_DB;
+    const response = await adminPost('/admin/api/reconcile/age-restricted/apply', { shas: [SHA.toUpperCase()] }, {
+      BLOSSOM_DB: {
+        ...base,
+        prepare(sql) {
+          const stmt = base.prepare(sql);
+          let key;
+          return {
+            ...stmt,
+            bind(...args) { key = args[0]; stmt.bind(...args); return this; },
+            async first() { return /FROM moderation_results/i.test(sql) && key === SHA ? { uploaded_by: uploader } : null; }
+          };
+        }
+      }
+    });
+
+    expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'AGE_RESTRICTED', uploader }]);
+    expect(blossomCalls).toEqual([expect.objectContaining({ sha256: SHA, action: 'AGE_RESTRICTED' })]);
+    expect((await response.json()).notified).toBe(1);
   });
 
   it('does not ask about a file the media server already shows behind the 18+ gate', async () => {

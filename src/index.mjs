@@ -1024,6 +1024,9 @@ async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
   if (!isValidSha256(sha256)) {
     return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
   }
+  // Records are keyed by the lowercase hash, so the uploader is looked up, and
+  // relay manager asked, under it whatever case the caller was given.
+  sha256 = sha256.toLowerCase();
 
   // postToRelayAdmin's deadline covers the whole answer, so a write never waits
   // on a body that does not finish, or goes ahead on one that arrives late.
@@ -1041,7 +1044,7 @@ async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
     return liftCheckFailureResponse(error, env);
   }
 
-  if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256.toLowerCase()) {
+  if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256) {
     return liftCheckUnavailable(new Error(`Unexpected lift check answer: HTTP ${status} ${JSON.stringify(data)}`));
   }
   return { sha256: data.sha256 };
