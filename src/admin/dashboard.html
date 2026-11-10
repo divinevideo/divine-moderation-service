@@ -3370,6 +3370,10 @@
             loadRealStats();
           }, 500);
         } else {
+          const failure = await moderationRefusal(response);
+          if (!offerRefusalCase(failure, isFocusedLookupResult(sha256))) {
+            showToast(`Approve failed: ${failure.message}`, null, 5000);
+          }
           button.innerHTML = '❌ Failed';
           setTimeout(() => {
             button.innerHTML = originalText;
@@ -3404,8 +3408,7 @@
         });
 
         if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.error || `HTTP ${response.status}`);
+          throw await moderationRefusal(response);
         }
 
         loadRealStats();
@@ -3431,8 +3434,50 @@
       } catch (error) {
         button.innerHTML = originalText;
         button.disabled = false;
-        setLookupStatus(`Action failed: ${error.message}`, true);
+        if (!offerRefusalCase(error, isFocusedLookupResult(sha256))) {
+          setLookupStatus(`Action failed: ${error.message}`, true);
+        }
       }
+    }
+
+    // A refused call, as an Error that carries the refusal's case. An un-ban
+    // of an account under age review, or a lift over one of its files (#231),
+    // comes back as a 409 naming the case that has to be resolved first.
+    async function moderationRefusal(response) {
+      const data = await response.json().catch(() => ({}));
+      const failure = new Error(data.error || `HTTP ${response.status}`);
+      failure.caseId = data.caseId || null;
+      failure.caseUrl = data.caseUrl || null;
+      return failure;
+    }
+
+    // An age-review block is a refusal that names where to go next, not a
+    // dead end. Offer the case instead of a bare red error, which is what
+    // makes the hold actionable rather than looking broken. Returns whether it
+    // did, so the caller can fall back to its own error otherwise.
+    // Only follow an https link: this arrives over the wire and is handed
+    // to window.open, so a javascript:/data: scheme must never be openable.
+    // `inLookup` also writes it into the lookup panel's status line, for a
+    // refusal about what that panel shows.
+    function offerRefusalCase(error, inLookup = false) {
+      const caseUrl = typeof error?.caseUrl === 'string' && error.caseUrl.startsWith('https://')
+        ? error.caseUrl
+        : null;
+      if (!caseUrl) {
+        return false;
+      }
+      // caseUrl is only built when caseId survived validation, so in
+      // practice the id is always here. Kept as a ternary because the two
+      // fields arrive as independent keys off the wire, and a link with no
+      // id printed is still worth offering.
+      const blockedMessage = error.caseId
+        ? `${error.message} (case ${error.caseId})`
+        : error.message;
+      showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
+      if (inLookup) {
+        setLookupStatus(blockedMessage, true);
+      }
+      return true;
     }
 
     async function updateUploaderEnforcement(pubkey, payload, button, successMessage) {
@@ -3447,15 +3492,8 @@
           body: JSON.stringify(payload)
         });
 
-        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-          const failure = new Error(data.error || `HTTP ${response.status}`);
-          // Carry the structured refusal through the throw. An un-ban of an
-          // account under age review comes back as a 409 naming the case that
-          // has to be resolved first, and the catch below routes to it.
-          failure.caseId = data.caseId || null;
-          failure.caseUrl = data.caseUrl || null;
-          throw failure;
+          throw await moderationRefusal(response);
         }
 
         // Confirm success immediately (before the slower list refresh) so the
@@ -3481,26 +3519,9 @@
         button.innerHTML = originalText;
         button.disabled = false;
 
-        // An age-review block is a refusal that names where to go next, not a
-        // dead end. Offer the case instead of a bare red toast, which is what
-        // makes the enforcement hold actionable rather than looking broken.
-        // Only follow an https link: this arrives over the wire and is handed
-        // to window.open, so a javascript:/data: scheme must never be openable.
-        // Anything else falls through to the plain toast below, which carries
-        // the refusal message but not the case id.
-        const caseUrl = typeof error.caseUrl === 'string' && error.caseUrl.startsWith('https://')
-          ? error.caseUrl
-          : null;
-        if (caseUrl) {
-          // caseUrl is only built when caseId survived validation, so in
-          // practice the id is always here. Kept as a ternary because the two
-          // fields arrive as independent keys off the wire, and a link with no
-          // id printed is still worth offering.
-          const blockedMessage = error.caseId
-            ? `${error.message} (case ${error.caseId})`
-            : error.message;
-          showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
-          setLookupStatus(blockedMessage, true);
+        // Anything but a case to open falls through to the plain toast below,
+        // which carries the refusal message but not the case id.
+        if (offerRefusalCase(error, true)) {
           return;
         }
 
@@ -4741,24 +4762,31 @@
       if (!video.categoryVerifications) {
         video.categoryVerifications = {};
       }
+      // Kept so a failed save puts back exactly what was there.
+      const previousVerification = video.categoryVerifications[category];
+      const setVerification = (value) => {
+        if (value === null || value === undefined) {
+          delete video.categoryVerifications[category];
+        } else {
+          video.categoryVerifications[category] = value;
+        }
+        const container = document.querySelector(`[data-sha256="${sha256}"][data-category="${category}"]`);
+        if (container) {
+          const confirmBtn = container.querySelector('.verify-btn.confirm');
+          const rejectBtn = container.querySelector('.verify-btn.reject');
+
+          confirmBtn.classList.toggle('confirmed', value === 'confirmed');
+          rejectBtn.classList.toggle('rejected', value === 'rejected');
+        }
+      };
 
       // Toggle: if already this status, clear it
-      if (video.categoryVerifications[category] === status) {
-        delete video.categoryVerifications[category];
+      if (previousVerification === status) {
         status = null;
-      } else {
-        video.categoryVerifications[category] = status;
       }
 
       // Update UI immediately
-      const container = document.querySelector(`[data-sha256="${sha256}"][data-category="${category}"]`);
-      if (container) {
-        const confirmBtn = container.querySelector('.verify-btn.confirm');
-        const rejectBtn = container.querySelector('.verify-btn.reject');
-
-        confirmBtn.classList.toggle('confirmed', status === 'confirmed');
-        rejectBtn.classList.toggle('rejected', status === 'rejected');
-      }
+      setVerification(status);
 
       try {
         const response = await fetch(`/admin/api/verify-category/${sha256}`, {
@@ -4799,6 +4827,26 @@
           }
         }
 
+        // The rejection was saved, but relay manager's lift check kept the
+        // auto-approve from going ahead (#231). Say so, with the case to open.
+        if (result.autoApproveRefused) {
+          // Another moderator's decision may have landed while the lift was
+          // checked; show the action the server kept.
+          if (result.action && result.action !== video.action) {
+            video.action = result.action;
+            updateVideoCardInPlace(sha256, video);
+          }
+          const refusal = new Error(
+            `${message}. Not approved: ${result.autoApproveRefused.error || 'the lift check refused'}`
+          );
+          refusal.caseId = result.autoApproveRefused.caseId || null;
+          refusal.caseUrl = result.autoApproveRefused.caseUrl || null;
+          if (!offerRefusalCase(refusal)) {
+            showToast(refusal.message, null, 6000);
+          }
+          return;
+        }
+
         // Show label event status
         if (result.labelEvent?.published) {
           message += ` 📡 Label published to Nostr`;
@@ -4810,12 +4858,9 @@
         console.error('Failed to save verification:', error);
         showToast('Failed to save verification: ' + error.message, null, 3000);
 
-        // Revert optimistic update on error
-        if (status === null) {
-          video.categoryVerifications[category] = status === 'confirmed' ? 'rejected' : 'confirmed';
-        } else {
-          delete video.categoryVerifications[category];
-        }
+        // Revert optimistic update on error: the verification and its buttons
+        // go back to what they were before the click.
+        setVerification(previousVerification);
       }
     }
 
@@ -5120,7 +5165,7 @@
         });
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw await moderationRefusal(response);
         }
 
         const result = await response.json();
@@ -5171,7 +5216,10 @@
           card.style.opacity = '1';
           card.style.pointerEvents = 'auto';
         });
-        alert('Failed to update: ' + error.message);
+        // Asked again: the panel may show another file by the time the answer comes.
+        if (!offerRefusalCase(error, isFocusedLookupResult(sha256))) {
+          alert('Failed to update: ' + error.message);
+        }
       }
     }
 
@@ -5217,6 +5265,12 @@
             applyFilters();
           }
           loadRealStats();
+        } else {
+          // An Undo back to SAFE or AGE_RESTRICTED is a lift, and can be refused.
+          const failure = await moderationRefusal(response);
+          if (!offerRefusalCase(failure, isFocusedLookupResult(sha256))) {
+            alert('Undo failed: ' + failure.message);
+          }
         }
       } catch (err) {
         console.error('Undo failed:', err);
@@ -5313,6 +5367,8 @@
 
     async function saveEdits() {
       if (!currentEditingSha256) return;
+      // closeEditModal() clears currentEditingSha256, so keep the hash being saved.
+      const sha256 = currentEditingSha256;
 
       // Get all slider values
       const categories = ['nudity', 'violence', 'gore', 'offensive', 'weapon', 'self_harm',
@@ -5332,7 +5388,7 @@
       const reason = document.getElementById('edit-reason').value || 'Manual score override by moderator';
 
       try {
-        const response = await fetch(`/admin/api/moderate/${currentEditingSha256}`, {
+        const response = await fetch(`/admin/api/moderate/${sha256}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -5343,7 +5399,7 @@
         });
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw await moderationRefusal(response);
         }
 
         const result = await response.json();
@@ -5353,13 +5409,15 @@
         if (document.getElementById('filter-action').value !== 'TRIAGE') {
           await loadVideos(paginationState.currentCursor);
         }
-        if (currentLookupSha === currentEditingSha256) {
-          await lookupVideo(currentEditingSha256);
+        if (currentLookupSha === sha256) {
+          await lookupVideo(sha256);
         }
         alert('Successfully updated scores and action');
       } catch (error) {
         console.error('Failed to update:', error);
-        alert('Failed to update: ' + error.message);
+        if (!offerRefusalCase(error, isFocusedLookupResult(sha256))) {
+          alert('Failed to update: ' + error.message);
+        }
       }
     }
 
