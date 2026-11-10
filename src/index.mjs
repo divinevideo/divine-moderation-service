@@ -2449,7 +2449,15 @@ export default {
         return authError;
       }
 
+      // Every action writes under the lowercase hash: the record is keyed
+      // case-sensitively, so a raw path segment could open a second record
+      // beside the lowercase one, or a junk record for a path that names no
+      // file (#242).
       let sha256 = url.pathname.split('/')[4];
+      if (!isValidSha256(sha256)) {
+        return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
+      }
+      sha256 = sha256.toLowerCase();
       const { action, reason, scores, videoUrl, uploadedBy } = await request.json();
 
       // Validate action

@@ -287,11 +287,32 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
     expectNoWrites();
   });
 
-  it('writes the lowercase hash relay manager checked', async () => {
+  // Every action, not only a lift: the record is keyed case-sensitively, so a
+  // raw path segment could open a second record beside the lowercase one.
+  it.each(['REVIEW', 'QUARANTINE', 'PERMANENT_BAN'])('refuses a %s for a path that does not name a sha256', async (action) => {
+    const response = await moderate('not-a-hash', { action });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ success: false, code: 'invalid_sha256' });
+    expectNoWrites();
+  });
+
+  it.each(['REVIEW', 'QUARANTINE', 'PERMANENT_BAN'])('writes a %s under the lowercase hash', async (action) => {
+    const response = await moderate(SHA.toUpperCase(), { action });
+
+    expect(response.status).toBe(200);
+    const insert = d1Writes.find((w) => /INSERT INTO moderation_results/i.test(w.sql));
+    expect(insert.binds[0]).toBe(SHA);
+    expect(kvPuts).toContain(`moderation:${SHA}`);
+    expect(kvPuts.concat(kvDeletes).every((key) => !key.includes(SHA.toUpperCase()))).toBe(true);
+    expect(blossomCalls.every((call) => call.sha256 === SHA)).toBe(true);
+  });
+
+  it('asks about, and writes, the lowercase hash', async () => {
     const response = await moderate(SHA.toUpperCase(), { action: 'SAFE' });
 
     expect(response.status).toBe(200);
-    expect(liftCalls[0].body.sha256).toBe(SHA.toUpperCase());
+    expect(liftCalls[0].body.sha256).toBe(SHA);
     const insert = d1Writes.find((w) => /INSERT INTO moderation_results/i.test(w.sql));
     expect(insert.binds[0]).toBe(SHA);
     expect(kvPuts).toContain(`moderation:${SHA}`);
