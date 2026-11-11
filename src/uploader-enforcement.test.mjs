@@ -478,6 +478,42 @@ describe('admin uploader enforcement routes', () => {
     }
   });
 
+  // A 200 whose body breaks off partway is not a confirmation either. It used
+  // to read as an empty success.
+  it('fails when the relay-admin answer breaks off partway through its body', async () => {
+    const uploaderEnforcements = new Map();
+    const RELAY_ADMIN = {
+      fetch: async () => new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"success":tr'));
+          controller.error(new Error('connection reset'));
+        }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    };
+
+    const response = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/admin/api/uploader/${PUBKEY}/enforcement`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cf-Access-Authenticated-User-Email': 'mod@divine.video', 'cf-access-jwt-assertion': 'test-access-token'
+        },
+        body: JSON.stringify({ relayBanned: true, reason: 'Escalated by trust and safety' })
+      }),
+      createEnv({
+        BLOSSOM_DB: createDbMock({ uploaderEnforcements }),
+        RELAY_ADMIN,
+        RELAY_ADMIN_API_KEY: 'super-secret-admin-key',
+        RELAY_ADMIN_URL: 'https://relay.admin.divine.video'
+      })
+    );
+
+    expect(response.status).toBe(502);
+    expect(String((await response.json()).error || '')).toMatch(/connection reset/);
+    // The ban was never confirmed, so it is not recorded as applied.
+    expect(uploaderEnforcements.size).toBe(0);
+  });
+
   it('returns uploader enforcement in focused lookup responses', async () => {
     const env = createEnv({
       BLOSSOM_DB: createDbMock({
