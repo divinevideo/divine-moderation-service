@@ -751,6 +751,29 @@ describe('POST /admin/api/reconcile/age-restricted/apply asks relay manager befo
     expect((await response.json()).notified).toBe(1);
   });
 
+  // An older KV record that is there but is not JSON can't be read for its
+  // uploader, so the file is left alone rather than asked about without one.
+  // The reconcile reads no record of its own that would catch it later.
+  it('leaves the file hidden when the older KV record is not JSON', async () => {
+    const response = await adminPost('/admin/api/reconcile/age-restricted/apply', { shas: [SHA] }, {
+      MODERATION_KV: {
+        async get(key) { return key === `moderation:${SHA}` ? '{"action":"QUARANTINE","uploadedBy":' : null; },
+        async put(key) { kvPuts.push(key); },
+        async delete(key) { kvDeletes.push(key); },
+        async list() { return { keys: [], list_complete: true, cursor: null }; }
+      }
+    });
+
+    expect(liftCalls).toEqual([]);
+    expect(blossomCalls).toEqual([]);
+    expect((await response.json()).failures).toEqual([{
+      sha256: SHA,
+      stage: 'lift',
+      code: 'lift_check_unavailable',
+      error: "Could not read this file's record to name its uploader to relay manager; refusing"
+    }]);
+  });
+
   // A relay manager that cannot be asked will not answer for the next file
   // either, and each try can wait the full deadline.
   it('stops asking for the rest of the batch once relay manager cannot be asked', async () => {
