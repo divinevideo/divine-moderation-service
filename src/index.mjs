@@ -805,10 +805,11 @@ async function callRelayAdminAction(env, payload) {
 }
 
 // One POST to relay-admin: its status and data on success, a RelayAdminError
-// on a refusal, and a plain Error when it cannot be reached. Shared by the ban
-// RPCs above and the media lift check (#231) so both use the same transport,
-// key and timeout. The timeout covers the response headers, not its body.
-async function postToRelayAdmin(env, path, body) {
+// on a refusal, and a plain Error when it cannot be reached or does not finish
+// answering within `timeoutMs`. Shared by the ban RPCs above and the media lift
+// check (#231) so both use the same transport and key. The deadline covers the
+// whole answer, body included (#242).
+async function postToRelayAdmin(env, path, body, timeoutMs = RELAY_ADMIN_TIMEOUT_MS) {
   const url = `${getRelayAdminUrl(env)}${path}`;
 
   // Prefer the worker-to-worker service binding when configured: it bypasses the
@@ -833,8 +834,21 @@ async function postToRelayAdmin(env, path, body) {
 
   // Bound the call so a dead/slow relay-admin endpoint fails fast instead of
   // hanging the request (and the moderator's UI) for the full CF edge timeout.
+  // The deadline holds until the body has been read, not only the headers: a
+  // body that stalls after the status line would otherwise hold the request
+  // open, or let a late answer through. It also rejects on its own, so it holds
+  // even where the transport does not stop reading on the abort.
+  const transport = viaBinding ? ', via service binding' : '';
+  const timedOut = () => new Error(`Relay admin call timed out after ${timeoutMs / 1000}s (${url}${transport})`);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), RELAY_ADMIN_TIMEOUT_MS);
+  let timeoutId;
+  const deadline = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(timedOut());
+    }, timeoutMs);
+  });
+  deadline.catch(() => {});
 
   const init = {
     method: 'POST',
@@ -847,12 +861,13 @@ async function postToRelayAdmin(env, path, body) {
   };
 
   let response;
+  let text;
   try {
-    response = viaBinding ? await binding.fetch(url, init) : await fetch(url, init);
+    response = await Promise.race([viaBinding ? binding.fetch(url, init) : fetch(url, init), deadline]);
+    text = await Promise.race([response.text(), deadline]);
   } catch (err) {
     if (err?.name === 'AbortError') {
-      const transport = viaBinding ? ', via service binding' : '';
-      throw new Error(`Relay admin call timed out after ${RELAY_ADMIN_TIMEOUT_MS / 1000}s (${url}${transport})`);
+      throw timedOut();
     }
     throw err;
   } finally {
@@ -874,7 +889,12 @@ async function postToRelayAdmin(env, path, body) {
     }
   }
 
-  const data = await response.json().catch(() => ({}));
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = {};
+  }
   if (!response.ok || data?.success === false) {
     throw new RelayAdminError(relayAdminField(data?.error) || `Relay admin error: HTTP ${response.status}`, {
       upstreamStatus: response.status,
@@ -942,6 +962,12 @@ function relayAdminFailureResponse(error, env) {
 // relay manager's lift check first (#231) instead of restating the rules.
 const MEDIA_LIFT_ACTIONS = new Set(['SAFE', 'AGE_RESTRICTED']);
 
+// relay manager's lift check can read the media server's record and then this
+// service's, up to 10s each (divine-relay-manager STATUS_READ_TIMEOUT_MS), so
+// its answer can take about 20s. Waiting any less refuses a lift it would have
+// allowed (#242).
+const LIFT_CHECK_TIMEOUT_MS = 25000;
+
 // relay manager's refusals that mean "not this file, not now", each with the
 // status it sends. Passed through so the dashboard can say why. Any other
 // failure, including one with an unexpected status, is "could not ask".
@@ -972,44 +998,110 @@ function liftCheckFailureResponse(error, env) {
   return liftCheckUnavailable(error);
 }
 
+// The account this service records as the file's uploader, in lowercase, or
+// null. relay manager reads the owner from the media server, and the two can
+// differ, so the lift check names this one too and relay manager checks its
+// open age review as well (#242). It is the first pubkey among the D1 record's
+// uploader, the older KV record's, and `fallback`, the uploader the caller's
+// write would record for a file with no record yet. A value that is not a
+// pubkey is passed over. `fallback` is used whenever neither record names a
+// pubkey, so the check can name an account the write will not record; that
+// only adds a check, never removes one. The KV record is read only when the
+// D1 record names no pubkey. If it is there but is not JSON, this throws, like
+// a read that fails, so the lift is refused rather than checked without the
+// uploader it may name.
+async function recordedUploader(env, sha256, fallback) {
+  const row = await env.BLOSSOM_DB.prepare(
+    'SELECT uploaded_by FROM moderation_results WHERE sha256 = ?'
+  ).bind(sha256).first();
+  if (isValidPubkey(row?.uploaded_by)) {
+    return row.uploaded_by.toLowerCase();
+  }
+  const legacyText = await env.MODERATION_KV.get(`moderation:${sha256}`);
+  const legacy = legacyText == null ? null : JSON.parse(legacyText);
+  const uploader = [legacy?.uploadedBy, fallback].find(isValidPubkey);
+  return uploader ? uploader.toLowerCase() : null;
+}
+
 // Ask relay manager whether `action` may go ahead on this file. Returns the
 // lowercase hash it checked, which is the one to write, or the Response to send
-// instead. Fails closed: anything short of a 200 checked allow naming this
-// file, within the deadline, is a refusal. Check-then-act, as on relay
-// manager's own route: a case opened between the check and the write is not
-// seen.
-async function checkMediaLift(env, sha256, action) {
+// instead. `fallbackUploader` is what recordedUploader falls back to. Fails
+// closed: anything short of a 200 checked allow naming this file, within the
+// deadline, is a refusal, and so is a record that cannot be read for its
+// uploader. Check-then-act, as on relay manager's own route: a case opened
+// between the check and the write is not seen.
+async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
   if (!isValidSha256(sha256)) {
     return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
   }
+  // Records are keyed by the lowercase hash, so the uploader is looked up, and
+  // relay manager asked, under it whatever case the caller was given.
+  sha256 = sha256.toLowerCase();
 
-  // postToRelayAdmin's own timeout stops at the headers. A write must not wait
-  // on a body that never finishes, or go ahead on one that arrives late, so the
-  // whole answer has one deadline. The abandoned call's result is ignored.
-  const call = postToRelayAdmin(env, '/api/moderate-media/lift-check', { sha256, action });
-  call.catch(() => {});
-  let timeoutId;
-  const deadline = new Promise((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error(`Lift check did not answer within ${RELAY_ADMIN_TIMEOUT_MS / 1000}s`)),
-      RELAY_ADMIN_TIMEOUT_MS
-    );
-  });
+  // postToRelayAdmin's deadline covers the whole answer, so a write never waits
+  // on a body that does not finish, or goes ahead on one that arrives late.
+  let uploader;
+  try {
+    uploader = await recordedUploader(env, sha256, fallbackUploader);
+  } catch (error) {
+    console.error('[ADMIN] Could not read the recorded uploader for the lift check; refusing:', error);
+    return jsonResponse(502, {
+      success: false,
+      error: "Could not read this file's record to name its uploader to relay manager; refusing",
+      code: 'lift_check_unavailable'
+    });
+  }
 
   let status;
   let data;
   try {
-    ({ status, data } = await Promise.race([call, deadline]));
+    ({ status, data } = await postToRelayAdmin(
+      env,
+      '/api/moderate-media/lift-check',
+      { sha256, action, ...(uploader ? { uploader } : {}) },
+      LIFT_CHECK_TIMEOUT_MS
+    ));
   } catch (error) {
     return liftCheckFailureResponse(error, env);
-  } finally {
-    clearTimeout(timeoutId);
   }
 
-  if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256.toLowerCase()) {
+  if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256) {
     return liftCheckUnavailable(new Error(`Unexpected lift check answer: HTTP ${status} ${JSON.stringify(data)}`));
   }
   return { sha256: data.sha256 };
+}
+
+// checkMediaLift for an endpoint that acts on a batch of files and reports
+// each file's outcome rather than answer with one refusal. The checker it
+// returns answers `{ sha256 }` to go ahead with, or `{ refused }` holding the
+// refusal's status, code, error and, for an open age review, its case. Once
+// the check cannot run for one file, because relay manager cannot be asked or
+// this service's record cannot be read, the rest of the batch is refused
+// without asking: the next file would fail the same way, and each try can wait
+// the full deadline, so a stalled relay manager would otherwise hold the
+// request open for the whole batch.
+function batchLiftChecker(env) {
+  let unavailable = null;
+  return async (sha256, action) => {
+    if (unavailable !== null) {
+      return {
+        refused: {
+          status: 502,
+          code: 'lift_check_unavailable',
+          error: `Not asked: the lift check could not run for an earlier file in this batch (${unavailable})`
+        }
+      };
+    }
+    const lift = await checkMediaLift(env, sha256, action);
+    if (!(lift instanceof Response)) {
+      return lift;
+    }
+    const { success: _success, ...refusal } = await lift.json();
+    if (refusal.code === 'lift_check_unavailable') {
+      unavailable = refusal.error;
+    }
+    return { refused: { status: lift.status, ...refusal } };
+  };
 }
 
 async function deleteRelayEventIds(eventIds, env, reason) {
@@ -2434,7 +2526,15 @@ export default {
         return authError;
       }
 
+      // Every action writes under the lowercase hash: the record is keyed
+      // case-sensitively, so a raw path segment could open a second record
+      // beside the lowercase one, or a junk record for a path that names no
+      // file (#242).
       let sha256 = url.pathname.split('/')[4];
+      if (!isValidSha256(sha256)) {
+        return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
+      }
+      sha256 = sha256.toLowerCase();
       const { action, reason, scores, videoUrl, uploadedBy } = await request.json();
 
       // Validate action
@@ -2448,7 +2548,7 @@ export default {
       // Before anything is written: a lift must clear relay manager's age-review
       // guard (#231). An Undo or an Edit Scores that sends SAFE is a lift too.
       if (MEDIA_LIFT_ACTIONS.has(action)) {
-        const lift = await checkMediaLift(env, sha256, action);
+        const lift = await checkMediaLift(env, sha256, action, uploadedBy);
         if (lift instanceof Response) {
           return lift;
         }
@@ -4143,7 +4243,8 @@ async function runMigration() {
       try {
         const body = await request.json();
         const result = await runClassicVineRollback(body, env, {
-          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env)
+          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env),
+          checkMediaLift: batchLiftChecker(env)
         });
         return jsonResponse(200, result);
       } catch (error) {
@@ -4308,7 +4409,8 @@ async function runMigration() {
           shas,
           env,
           fetchBlossomBlobDetail,
-          notifyBlossom
+          notifyBlossom,
+          checkMediaLift: batchLiftChecker(env)
         });
         console.log('[AR-RECONCILE][apply]', JSON.stringify({
           attempted: result.attempted,

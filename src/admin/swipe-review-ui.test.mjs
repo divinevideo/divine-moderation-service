@@ -250,6 +250,38 @@ describe('swipe review answers that arrive after the moderator moved on', () => 
     expect(h.fetches[1].body.action).toBe('AGE_RESTRICTED');
   });
 
+  // A Since or queue-order change empties the queue at once and reloads it, so
+  // a swipe released just before it can fire for a card that is gone (#242).
+  it('sends nothing, and says so, when the swiped card left the queue before its decision was sent', async () => {
+    const h = swipeHarness([OK], 'AGE_RESTRICTED', [SHA, NEXT]);
+    h.reviewQueue.splice(0, h.reviewQueue.length);
+
+    await h.handleAction(SHA, 'SAFE');
+
+    expect(h.fetches).toEqual([]);
+    expect(h.text(h.latest())).toBe('The queue reloaded before that decision was sent. Nothing was changed.');
+    expect(h.state()).toEqual({ currentIndex: 0, reviewedCount: 0 });
+  });
+
+  it('does not decide with another card\'s data when the reloaded queue no longer holds the swiped card', async () => {
+    const h = swipeHarness([OK], 'AGE_RESTRICTED', [SHA, NEXT]);
+    h.reviewQueue.splice(0, h.reviewQueue.length, { sha256: NEXT, action: 'UNTRIAGED', isUntriaged: true });
+
+    await h.handleAction(SHA, 'SAFE');
+
+    expect(h.fetches).toEqual([]);
+    expect(h.state()).toEqual({ currentIndex: 0, reviewedCount: 0 });
+  });
+
+  it('decides the swiped card when the reloaded queue still holds it', async () => {
+    const h = swipeHarness([OK], 'AGE_RESTRICTED', [SHA, NEXT]);
+    h.reviewQueue.splice(0, h.reviewQueue.length, { sha256: NEXT, action: 'REVIEW', isUntriaged: false }, { sha256: SHA, action: 'QUARANTINE', isUntriaged: false });
+
+    await h.handleAction(SHA, 'SAFE');
+
+    expect(h.fetches).toEqual([{ url: `/admin/api/moderate/${SHA}`, body: { action: 'SAFE', reason: 'Quick review: SAFE' } }]);
+  });
+
   it('keeps the review where it is on Undo when the decided card left the queue', async () => {
     const first = held();
     const h = swipeHarness([first.answer, OK], 'AGE_RESTRICTED', [SHA, NEXT]);

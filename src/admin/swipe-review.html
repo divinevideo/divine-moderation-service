@@ -1694,7 +1694,14 @@
     async function handleAction(sha256, action) {
       // The card this decision is for. A swipe sends it 300ms after the card
       // starts to fade, and a skip in that time puts the next card on screen.
-      const video = reviewQueue.find((v) => v.sha256 === sha256) ?? reviewQueue[currentIndex];
+      // A Since or queue-order change in that time reloads the queue, which may
+      // no longer hold the card. Another card's data would decide it wrongly,
+      // so nothing is sent (#242).
+      const video = reviewQueue.find((v) => v.sha256 === sha256);
+      if (!video) {
+        showToast('The queue reloaded before that decision was sent. Nothing was changed.', null, 3000);
+        return;
+      }
       const previousAction = video.action;
       // The answer can take a while (a lift waits on relay manager), and by
       // then the moderator may have skipped on or decided this card again. It

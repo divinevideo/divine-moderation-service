@@ -224,21 +224,27 @@ export function buildPreviewResponse({ rows, classifications, limit, nextCursor 
  * `restricted`. Other states are classified into the skip buckets. Read and
  * notify failures are counted separately with their stage preserved.
  *
+ * The replay shows a hidden file to signed-in adults, so it is a lift: relay
+ * manager's lift check is asked first, and a file it refuses, or cannot be
+ * asked about, stays hidden as a failure at the `lift` stage that carries the
+ * refusal's code and, for an open age review, its case (#242).
+ *
  * @param {object} params
  * @param {string[]} params.shas
  * @param {object} params.env
  * @param {Function} params.fetchBlossomBlobDetail - async (sha, env) -> { status, body } | { status: 404 } | throws
  * @param {Function} params.notifyBlossom - async (sha, action, env) -> { success, error? }
+ * @param {Function} params.checkMediaLift - async (sha, action) -> { sha256 } | { refused: { code, error, caseId?, caseUrl? } }
  * @returns {Promise<{
  *   success: boolean,
  *   attempted: number,
  *   notified: number,
  *   failed: number,
  *   skipped: { aligned: number, skip_deleted: number, skip_missing: number, unexpected_state: number, read_failed: number },
- *   failures: Array<{ sha256: string, error: string, stage: 'read'|'notify' }>
+ *   failures: Array<{ sha256: string, error: string, stage: 'read'|'lift'|'notify', code?: string, caseId?: string, caseUrl?: string }>
  * }>}
  */
-export async function applyAgeRestrictedRepairs({ shas, env, fetchBlossomBlobDetail, notifyBlossom }) {
+export async function applyAgeRestrictedRepairs({ shas, env, fetchBlossomBlobDetail, notifyBlossom, checkMediaLift }) {
   const result = {
     success: true,
     attempted: Array.isArray(shas) ? shas.length : 0,
@@ -292,10 +298,32 @@ export async function applyAgeRestrictedRepairs({ shas, env, fetchBlossomBlobDet
       continue;
     }
 
-    // Live state is still 'restricted' — replay the AGE_RESTRICTED webhook
+    // Live state is still 'restricted' — replay the AGE_RESTRICTED webhook,
+    // once relay manager allows the lift. Fails closed.
+    let lift;
+    try {
+      lift = typeof checkMediaLift === 'function'
+        ? await checkMediaLift(sha256, 'AGE_RESTRICTED')
+        : { refused: { code: 'lift_check_unavailable', error: 'No lift check configured' } };
+    } catch (error) {
+      lift = { refused: { code: 'lift_check_unavailable', error: String(error?.message ?? error) } };
+    }
+    if (!lift?.sha256) {
+      const refused = lift?.refused ?? { code: 'lift_check_unavailable', error: 'Lift check gave no answer' };
+      result.failed += 1;
+      result.failures.push({
+        sha256,
+        error: String(refused.error ?? 'Lift check refused'),
+        stage: 'lift',
+        code: refused.code ?? null,
+        ...(refused.caseId ? { caseId: refused.caseId, caseUrl: refused.caseUrl ?? null } : {})
+      });
+      continue;
+    }
+
     let notifyResult;
     try {
-      notifyResult = await notifyBlossom(sha256, 'AGE_RESTRICTED', env);
+      notifyResult = await notifyBlossom(lift.sha256, 'AGE_RESTRICTED', env);
     } catch (error) {
       result.failed += 1;
       result.failures.push({
