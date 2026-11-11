@@ -1006,16 +1006,20 @@ function liftCheckFailureResponse(error, env) {
 // write would record for a file with no record yet. A value that is not a
 // pubkey is passed over. `fallback` is used whenever neither record names a
 // pubkey, so the check can name an account the write will not record; that
-// only adds a check, never removes one. A KV record that is there but is not
-// JSON throws, like a read that fails, so the lift is refused rather than
-// checked without the uploader it may name.
+// only adds a check, never removes one. The KV record is read only when the
+// D1 record names no pubkey. If it is there but is not JSON, this throws, like
+// a read that fails, so the lift is refused rather than checked without the
+// uploader it may name.
 async function recordedUploader(env, sha256, fallback) {
   const row = await env.BLOSSOM_DB.prepare(
     'SELECT uploaded_by FROM moderation_results WHERE sha256 = ?'
   ).bind(sha256).first();
+  if (isValidPubkey(row?.uploaded_by)) {
+    return row.uploaded_by.toLowerCase();
+  }
   const legacyText = await env.MODERATION_KV.get(`moderation:${sha256}`);
   const legacy = legacyText == null ? null : JSON.parse(legacyText);
-  const uploader = [row?.uploaded_by, legacy?.uploadedBy, fallback].find(isValidPubkey);
+  const uploader = [legacy?.uploadedBy, fallback].find(isValidPubkey);
   return uploader ? uploader.toLowerCase() : null;
 }
 

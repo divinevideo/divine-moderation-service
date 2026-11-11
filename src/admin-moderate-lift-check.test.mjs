@@ -381,6 +381,28 @@ describe('POST /admin/api/moderate/:sha256 asks relay manager before a lift', ()
       expect(liftCalls[0].body.uploader).toBe(UPLOADER);
     });
 
+    // The older KV record is only needed when the D1 record names no uploader,
+    // so a KV record that is not JSON doesn't refuse a lift D1 already covers.
+    it('does not read the older KV record when the D1 record names the uploader', async () => {
+      const kvReads = [];
+      const response = await moderate(SHA, { action: 'SAFE' }, {
+        BLOSSOM_DB: recordDb(UPLOADER),
+        MODERATION_KV: {
+          async get(key) {
+            kvReads.push(key);
+            return key === `moderation:${SHA}` ? '{"action":"QUARANTINE","uploadedBy":' : null;
+          },
+          async put(key) { kvPuts.push(key); },
+          async delete(key) { kvDeletes.push(key); },
+          async list() { return { keys: [], list_complete: true, cursor: null }; }
+        }
+      });
+
+      expect(response.status).toBe(200);
+      expect(liftCalls.map((c) => c.body)).toEqual([{ sha256: SHA, action: 'SAFE', uploader: UPLOADER }]);
+      expect(kvReads).not.toContain(`moderation:${SHA}`);
+    });
+
     it('passes over a D1 uploader that is not a pubkey for the older KV record\'s', async () => {
       await moderate(SHA, { action: 'SAFE' }, {
         BLOSSOM_DB: recordDb('not-a-pubkey'),
