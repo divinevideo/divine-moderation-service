@@ -125,6 +125,35 @@ describe('executeClassicVineRollback', () => {
     expect(result.alreadySafe).toBe(true);
     expect(result.blossomNotified).toBe(true);
   });
+
+  // A restore is a lift (#242). With no lift check to ask, it refuses.
+  it('writes nothing when no lift check is wired', async () => {
+    const writes = [];
+    const notified = [];
+    const env = {
+      BLOSSOM_DB: {
+        prepare(sql) {
+          return {
+            bind() { return this; },
+            async first() { return { sha256: 'a'.repeat(64), action: 'PERMANENT_BAN', uploaded_by: null }; },
+            async run() { writes.push(sql); return { success: true }; }
+          };
+        }
+      },
+      MODERATION_KV: {
+        async get() { return null; },
+        async delete(key) { writes.push(key); }
+      }
+    };
+
+    const result = await executeClassicVineRollback({ sha256: 'a'.repeat(64) }, env, {
+      notifyBlossom: async (...args) => { notified.push(args); return { success: true }; }
+    });
+
+    expect(result.liftRefused).toMatchObject({ code: 'lift_check_unavailable' });
+    expect(writes).toEqual([]);
+    expect(notified).toEqual([]);
+  });
 });
 
 describe('runClassicVineRollback', () => {

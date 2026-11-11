@@ -880,9 +880,15 @@
     let currentX = 0;
     let currentY = 0;
     let swipeDirection = null; // 'horizontal' or 'vertical'
+    let detachSwipeHandlers = null; // takes the on-screen card's document listeners off
 
     function applySinceFilter() {
-      // Reset queue and reload with new filter
+      // Reset queue and reload with new filter. The card on screen goes with
+      // it, so its listeners come off and a drag held on it ends here.
+      if (detachSwipeHandlers) {
+        detachSwipeHandlers();
+        detachSwipeHandlers = null;
+      }
       reviewQueue = [];
       currentIndex = 0;
       reviewedCount = 0;
@@ -990,7 +996,12 @@
 
     function showCurrentVideo() {
       if (currentIndex >= reviewQueue.length) {
-        // Finished all reviews
+        // Finished all reviews. No card is left to drag, so take the last
+        // one's listeners off and end any drag still held on it.
+        if (detachSwipeHandlers) {
+          detachSwipeHandlers();
+          detachSwipeHandlers = null;
+        }
         document.getElementById('review-container').innerHTML = '';
         document.getElementById('empty').style.display = 'block';
         document.getElementById('progress').style.display = 'none';
@@ -1565,6 +1576,14 @@
     }
 
     function setupSwipeHandlers(card) {
+      // Only the card on screen may answer a drag. Every card adds listeners
+      // to the document, and the drag state is shared, so a previous card's
+      // handleEnd left in place runs first on each mouseup and sends the
+      // decision for that old card's hash.
+      if (detachSwipeHandlers) {
+        detachSwipeHandlers();
+      }
+
       // Mouse/touch start
       const handleStart = (e) => {
         isDragging = true;
@@ -1648,6 +1667,20 @@
 
       document.addEventListener('mouseup', handleEnd);
       document.addEventListener('touchend', handleEnd);
+
+      detachSwipeHandlers = () => {
+        document.removeEventListener('mousemove', handleMove);
+        document.removeEventListener('touchmove', handleMove);
+        document.removeEventListener('mouseup', handleEnd);
+        document.removeEventListener('touchend', handleEnd);
+        // A drag still held when its card is replaced (a late answer moved the
+        // review on) ends with it, or releasing it would decide the new card.
+        isDragging = false;
+        swipeDirection = null;
+        currentX = 0;
+        currentY = 0;
+        card.classList.remove('swiping');
+      };
     }
 
     function swipeAction(card, direction, sha256, action) {
@@ -1659,8 +1692,31 @@
     }
 
     async function handleAction(sha256, action) {
-      const video = reviewQueue[currentIndex];
+      // The card this decision is for. A swipe sends it 300ms after the card
+      // starts to fade, and a skip in that time puts the next card on screen.
+      // A Since or queue-order change in that time reloads the queue, which may
+      // no longer hold the card. Another card's data would decide it wrongly,
+      // so nothing is sent (#242).
+      const video = reviewQueue.find((v) => v.sha256 === sha256);
+      if (!video) {
+        showToast('The queue reloaded before that decision was sent. Nothing was changed.', null, 3000);
+        return;
+      }
       const previousAction = video.action;
+      // The answer can take a while (a lift waits on relay manager), and by
+      // then the moderator may have skipped on or decided this card again. It
+      // only moves the review along, or brings the card back, while this card
+      // is still the one on screen.
+      const stillShowing = () => reviewQueue[currentIndex]?.sha256 === sha256;
+      // A swipe fades the card out before the decision is sent; a key press
+      // leaves it where it is.
+      const swipedAway = () => {
+        const card = document.querySelector('.video-card-swipe');
+        return !!card && ['swipe-left', 'swipe-right', 'swipe-up'].some((name) => card.classList.contains(name));
+      };
+      // Set once the server has taken the decision, so a failure after that
+      // point (drawing the next card) is not reported as a failed decision.
+      let decided = false;
 
       try {
         // For untriaged videos, queue for moderation instead of setting action directly
@@ -1675,14 +1731,19 @@
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
           }
+          decided = true;
 
           reviewedCount++;
           reviewedSha256s.add(sha256);
           showToast('Queued for AI moderation', null, 2000);
 
           // Move to next video
-          currentIndex++;
-          showCurrentVideo();
+          if (stillShowing()) {
+            currentIndex++;
+            showCurrentVideo();
+          } else {
+            updateProgress();
+          }
           return;
         }
 
@@ -1695,8 +1756,9 @@
         });
 
         if (!response.ok) {
-          throw new Error('HTTP ' + response.status);
+          throw await moderationRefusal(response);
         }
+        decided = true;
 
         reviewedCount++;
         reviewedSha256s.add(sha256);
@@ -1718,11 +1780,23 @@
             });
 
             if (undoResponse.ok) {
-              currentIndex--;
+              // Back to the card this decision was for. Its answer may have
+              // come after a skip or a reload, when it did not move the review
+              // on, so stepping back one card can land on the wrong one.
+              const decidedAt = reviewQueue.findIndex((v) => v.sha256 === sha256);
+              if (decidedAt >= 0) {
+                currentIndex = decidedAt;
+              }
               reviewedCount--;
               reviewedSha256s.delete(sha256);
               showCurrentVideo();
               showToast('Action undone', null, 2000);
+            } else {
+              // An Undo back to SAFE or AGE_RESTRICTED is a lift, and can be refused.
+              const failure = await moderationRefusal(undoResponse);
+              if (!offerRefusalCase(failure)) {
+                showToast('Undo failed: ' + failure.message, null, 3000);
+              }
             }
           } catch (err) {
             console.error('Undo failed:', err);
@@ -1730,13 +1804,57 @@
         });
 
         // Move to next video
-        currentIndex++;
-        showCurrentVideo();
+        if (stillShowing()) {
+          currentIndex++;
+          showCurrentVideo();
+        } else {
+          updateProgress();
+        }
 
       } catch (error) {
+        if (decided) {
+          console.error('Decision saved, but the next video failed to show:', error);
+          return;
+        }
         console.error('Failed to update action:', error);
-        showToast('Failed to update: ' + error.message, null, 3000);
+        // The decision did not happen. If a swipe faded the card out, draw it
+        // again, unless the moderator has moved on.
+        if (stillShowing() && swipedAway()) {
+          showCurrentVideo();
+        }
+        if (!offerRefusalCase(error)) {
+          showToast('Failed to update: ' + error.message, null, 3000);
+        }
       }
+    }
+
+    // A refused call, as an Error that carries the refusal's case. A lift over
+    // a file whose owner is under age review comes back as a 409 naming the
+    // case that has to be resolved first (#231).
+    async function moderationRefusal(response) {
+      const data = await response.json().catch(() => ({}));
+      const failure = new Error(data.error || 'HTTP ' + response.status);
+      failure.caseId = data.caseId || null;
+      failure.caseUrl = data.caseUrl || null;
+      return failure;
+    }
+
+    // Offer the case a refusal names instead of a bare error, so the hold is
+    // something to act on rather than a dead end. Returns whether it did.
+    // Only follow an https link: this arrives over the wire and is handed to
+    // window.open, so a javascript:/data: scheme must never be openable.
+    function offerRefusalCase(error) {
+      const caseUrl = typeof error?.caseUrl === 'string' && error.caseUrl.startsWith('https://')
+        ? error.caseUrl
+        : null;
+      if (!caseUrl) {
+        return false;
+      }
+      const blockedMessage = error.caseId
+        ? error.message + ' (case ' + error.caseId + ')'
+        : error.message;
+      showToast(blockedMessage, () => window.open(caseUrl, '_blank', 'noopener'), 10000, 'Open case');
+      return true;
     }
 
     function skipVideo() {
@@ -1777,7 +1895,7 @@
       }
     });
 
-    function showToast(message, onUndo = null, duration = 5000) {
+    function showToast(message, onUndo = null, duration = 5000, actionLabel = 'Undo') {
       if (currentToast) {
         currentToast.remove();
       }
@@ -1793,7 +1911,7 @@
       if (onUndo) {
         const undoBtn = document.createElement('button');
         undoBtn.className = 'toast-undo';
-        undoBtn.textContent = 'Undo';
+        undoBtn.textContent = actionLabel;
         undoBtn.onclick = () => {
           onUndo();
           hideToast(toast);

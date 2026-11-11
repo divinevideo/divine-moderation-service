@@ -800,8 +800,17 @@ function relayRpcForAction(payload) {
 }
 
 async function callRelayAdminAction(env, payload) {
-  const rpcBody = relayRpcForAction(payload);
-  const url = `${getRelayAdminUrl(env)}/api/relay-rpc`;
+  const { data } = await postToRelayAdmin(env, '/api/relay-rpc', relayRpcForAction(payload));
+  return data;
+}
+
+// One POST to relay-admin: its status and data on success, a RelayAdminError
+// on a refusal, and a plain Error when it cannot be reached or does not finish
+// answering within `timeoutMs`. Shared by the ban RPCs above and the media lift
+// check (#231) so both use the same transport and key. The deadline covers the
+// whole answer, body included (#242).
+async function postToRelayAdmin(env, path, body, timeoutMs = RELAY_ADMIN_TIMEOUT_MS) {
+  const url = `${getRelayAdminUrl(env)}${path}`;
 
   // Prefer the worker-to-worker service binding when configured: it bypasses the
   // public CF edge and CF Access (the source of the deprecated-endpoint 522 and
@@ -825,26 +834,40 @@ async function callRelayAdminAction(env, payload) {
 
   // Bound the call so a dead/slow relay-admin endpoint fails fast instead of
   // hanging the request (and the moderator's UI) for the full CF edge timeout.
+  // The deadline holds until the body has been read, not only the headers: a
+  // body that stalls after the status line would otherwise hold the request
+  // open, or let a late answer through. It also rejects on its own, so it holds
+  // even where the transport does not stop reading on the abort.
+  const transport = viaBinding ? ', via service binding' : '';
+  const timedOut = () => new Error(`Relay admin call timed out after ${timeoutMs / 1000}s (${url}${transport})`);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), RELAY_ADMIN_TIMEOUT_MS);
+  let timeoutId;
+  const deadline = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(timedOut());
+    }, timeoutMs);
+  });
+  deadline.catch(() => {});
 
   const init = {
     method: 'POST',
     headers: viaBinding
       ? { 'Content-Type': 'application/json', 'X-Admin-Key': adminKey || '' }
       : getRelayAdminHeaders(env),
-    body: JSON.stringify(rpcBody),
+    body: JSON.stringify(body),
     redirect: 'manual',
     signal: controller.signal
   };
 
   let response;
+  let text;
   try {
-    response = viaBinding ? await binding.fetch(url, init) : await fetch(url, init);
+    response = await Promise.race([viaBinding ? binding.fetch(url, init) : fetch(url, init), deadline]);
+    text = await Promise.race([response.text(), deadline]);
   } catch (err) {
     if (err?.name === 'AbortError') {
-      const transport = viaBinding ? ', via service binding' : '';
-      throw new Error(`Relay admin call timed out after ${RELAY_ADMIN_TIMEOUT_MS / 1000}s (${url}${transport})`);
+      throw timedOut();
     }
     throw err;
   } finally {
@@ -866,7 +889,12 @@ async function callRelayAdminAction(env, payload) {
     }
   }
 
-  const data = await response.json().catch(() => ({}));
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = {};
+  }
   if (!response.ok || data?.success === false) {
     throw new RelayAdminError(relayAdminField(data?.error) || `Relay admin error: HTTP ${response.status}`, {
       upstreamStatus: response.status,
@@ -876,7 +904,7 @@ async function callRelayAdminAction(env, payload) {
     });
   }
 
-  return data;
+  return { status: response.status, data };
 }
 
 // Turn a relay-admin failure into a response a caller can route on.
@@ -926,6 +954,154 @@ function relayAdminFailureResponse(error, env) {
     status: 502,
     headers: { 'Content-Type': 'application/json' }
   });
+}
+
+// SAFE and AGE_RESTRICTED can make a file more visible. relay manager refuses
+// those while the file's owner has an open age review (divine-relay-manager
+// #335), but the dashboard writes here without going through it, so it asks
+// relay manager's lift check first (#231) instead of restating the rules.
+const MEDIA_LIFT_ACTIONS = new Set(['SAFE', 'AGE_RESTRICTED']);
+
+// relay manager's lift check can read the media server's record and then this
+// service's, up to 10s each (divine-relay-manager STATUS_READ_TIMEOUT_MS), so
+// its answer can take about 20s. Waiting any less refuses a lift it would have
+// allowed (#242).
+const LIFT_CHECK_TIMEOUT_MS = 25000;
+
+// relay manager's refusals that mean "not this file, not now", each with the
+// status it sends. Passed through so the dashboard can say why. Any other
+// failure, including one with an unexpected status, is "could not ask".
+const LIFT_REFUSAL_STATUS = {
+  media_record_missing: 409,
+  owner_unreadable: 503,
+  age_review_check_failed: 503,
+  state_unreadable: 503
+};
+
+function liftCheckUnavailable(error) {
+  console.error('[ADMIN] Media lift check failed; refusing:', error);
+  return jsonResponse(502, {
+    success: false,
+    error: 'Could not confirm with relay manager that this file may be made more visible; refusing',
+    code: 'lift_check_unavailable'
+  });
+}
+
+function liftCheckFailureResponse(error, env) {
+  const code = error instanceof RelayAdminError ? error.code : null;
+  if (code === 'age_review_active' && error.upstreamStatus === 409) {
+    return relayAdminFailureResponse(error, env);
+  }
+  if (code && LIFT_REFUSAL_STATUS[code] === error.upstreamStatus) {
+    return jsonResponse(error.upstreamStatus, { success: false, error: error.message, code });
+  }
+  return liftCheckUnavailable(error);
+}
+
+// The account this service records as the file's uploader, in lowercase, or
+// null. relay manager reads the owner from the media server, and the two can
+// differ, so the lift check names this one too and relay manager checks its
+// open age review as well (#242). It is the first pubkey among the D1 record's
+// uploader, the older KV record's, and `fallback`, the uploader the caller's
+// write would record for a file with no record yet. A value that is not a
+// pubkey is passed over. `fallback` is used whenever neither record names a
+// pubkey, so the check can name an account the write will not record; that
+// only adds a check, never removes one. The KV record is read only when the
+// D1 record names no pubkey. If it is there but is not JSON, this throws, like
+// a read that fails, so the lift is refused rather than checked without the
+// uploader it may name.
+async function recordedUploader(env, sha256, fallback) {
+  const row = await env.BLOSSOM_DB.prepare(
+    'SELECT uploaded_by FROM moderation_results WHERE sha256 = ?'
+  ).bind(sha256).first();
+  if (isValidPubkey(row?.uploaded_by)) {
+    return row.uploaded_by.toLowerCase();
+  }
+  const legacyText = await env.MODERATION_KV.get(`moderation:${sha256}`);
+  const legacy = legacyText == null ? null : JSON.parse(legacyText);
+  const uploader = [legacy?.uploadedBy, fallback].find(isValidPubkey);
+  return uploader ? uploader.toLowerCase() : null;
+}
+
+// Ask relay manager whether `action` may go ahead on this file. Returns the
+// lowercase hash it checked, which is the one to write, or the Response to send
+// instead. `fallbackUploader` is what recordedUploader falls back to. Fails
+// closed: anything short of a 200 checked allow naming this file, within the
+// deadline, is a refusal, and so is a record that cannot be read for its
+// uploader. Check-then-act, as on relay manager's own route: a case opened
+// between the check and the write is not seen.
+async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
+  if (!isValidSha256(sha256)) {
+    return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
+  }
+  // Records are keyed by the lowercase hash, so the uploader is looked up, and
+  // relay manager asked, under it whatever case the caller was given.
+  sha256 = sha256.toLowerCase();
+
+  // postToRelayAdmin's deadline covers the whole answer, so a write never waits
+  // on a body that does not finish, or goes ahead on one that arrives late.
+  let uploader;
+  try {
+    uploader = await recordedUploader(env, sha256, fallbackUploader);
+  } catch (error) {
+    console.error('[ADMIN] Could not read the recorded uploader for the lift check; refusing:', error);
+    return jsonResponse(502, {
+      success: false,
+      error: "Could not read this file's record to name its uploader to relay manager; refusing",
+      code: 'lift_check_unavailable'
+    });
+  }
+
+  let status;
+  let data;
+  try {
+    ({ status, data } = await postToRelayAdmin(
+      env,
+      '/api/moderate-media/lift-check',
+      { sha256, action, ...(uploader ? { uploader } : {}) },
+      LIFT_CHECK_TIMEOUT_MS
+    ));
+  } catch (error) {
+    return liftCheckFailureResponse(error, env);
+  }
+
+  if (status !== 200 || data?.allowed !== true || data?.checked !== true || data?.sha256 !== sha256) {
+    return liftCheckUnavailable(new Error(`Unexpected lift check answer: HTTP ${status} ${JSON.stringify(data)}`));
+  }
+  return { sha256: data.sha256 };
+}
+
+// checkMediaLift for an endpoint that acts on a batch of files and reports
+// each file's outcome rather than answer with one refusal. The checker it
+// returns answers `{ sha256 }` to go ahead with, or `{ refused }` holding the
+// refusal's status, code, error and, for an open age review, its case. Once
+// the check cannot run for one file, because relay manager cannot be asked or
+// this service's record cannot be read, the rest of the batch is refused
+// without asking: the next file would fail the same way, and each try can wait
+// the full deadline, so a stalled relay manager would otherwise hold the
+// request open for the whole batch.
+function batchLiftChecker(env) {
+  let unavailable = null;
+  return async (sha256, action) => {
+    if (unavailable !== null) {
+      return {
+        refused: {
+          status: 502,
+          code: 'lift_check_unavailable',
+          error: `Not asked: the lift check could not run for an earlier file in this batch (${unavailable})`
+        }
+      };
+    }
+    const lift = await checkMediaLift(env, sha256, action);
+    if (!(lift instanceof Response)) {
+      return lift;
+    }
+    const { success: _success, ...refusal } = await lift.json();
+    if (refusal.code === 'lift_check_unavailable') {
+      unavailable = refusal.error;
+    }
+    return { refused: { status: lift.status, ...refusal } };
+  };
 }
 
 async function deleteRelayEventIds(eventIds, env, reason) {
@@ -2350,7 +2526,15 @@ export default {
         return authError;
       }
 
-      const sha256 = url.pathname.split('/')[4];
+      // Every action writes under the lowercase hash: the record is keyed
+      // case-sensitively, so a raw path segment could open a second record
+      // beside the lowercase one, or a junk record for a path that names no
+      // file (#242).
+      let sha256 = url.pathname.split('/')[4];
+      if (!isValidSha256(sha256)) {
+        return jsonResponse(400, { success: false, error: 'Invalid sha256', code: 'invalid_sha256' });
+      }
+      sha256 = sha256.toLowerCase();
       const { action, reason, scores, videoUrl, uploadedBy } = await request.json();
 
       // Validate action
@@ -2359,6 +2543,16 @@ export default {
           status: 400,
           headers: { 'Content-Type': 'application/json' }
         });
+      }
+
+      // Before anything is written: a lift must clear relay manager's age-review
+      // guard (#231). An Undo or an Edit Scores that sends SAFE is a lift too.
+      if (MEDIA_LIFT_ACTIONS.has(action)) {
+        const lift = await checkMediaLift(env, sha256, action, uploadedBy);
+        if (lift instanceof Response) {
+          return lift;
+        }
+        sha256 = lift.sha256;
       }
 
       // Get existing moderation result — check D1 first, fall back to KV
@@ -2631,26 +2825,47 @@ export default {
       }
 
       // Get existing moderation result — check KV first, fall back to D1
-      let existing = null;
-      const existingData = await env.MODERATION_KV.get(`moderation:${sha256}`);
-      if (existingData) {
-        existing = JSON.parse(existingData);
-      } else {
+      const loadModerationRecord = async () => {
+        const existingData = await env.MODERATION_KV.get(`moderation:${sha256}`);
+        if (existingData) {
+          return JSON.parse(existingData);
+        }
         // Fall back to D1
         const d1Row = await env.BLOSSOM_DB.prepare(
           'SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, event_id FROM moderation_results WHERE sha256 = ?'
         ).bind(sha256).first();
-        if (d1Row) {
-          existing = {
-            action: d1Row.action,
-            scores: d1Row.scores ? JSON.parse(d1Row.scores) : {},
-            provider: d1Row.provider,
-            categories: d1Row.categories ? JSON.parse(d1Row.categories) : [],
-            moderated_at: d1Row.moderated_at
-          };
+        if (!d1Row) {
+          return null;
         }
-      }
+        return {
+          action: d1Row.action,
+          scores: d1Row.scores ? JSON.parse(d1Row.scores) : {},
+          provider: d1Row.provider,
+          categories: d1Row.categories ? JSON.parse(d1Row.categories) : [],
+          moderated_at: d1Row.moderated_at
+        };
+      };
 
+      const recordVerification = (record) => {
+        if (!record.categoryVerifications) {
+          record.categoryVerifications = {};
+        }
+
+        if (status === null) {
+          delete record.categoryVerifications[category];
+        } else {
+          record.categoryVerifications[category] = status;
+        }
+
+        // Generate NIP-85 tags based on verifications
+        record.nip85Tags = generateNIP85Tags(record.scores, record.categoryVerifications);
+
+        // Track who verified and when
+        record.lastVerifiedAt = Date.now();
+        record.lastVerifiedBy = 'admin';
+      };
+
+      let existing = await loadModerationRecord();
       if (!existing) {
         return new Response(JSON.stringify({ error: 'Moderation result not found for this video' }), {
           status: 404,
@@ -2659,38 +2874,62 @@ export default {
       }
       const previousAction = existing.action;
 
-      // Update category verifications
-      if (!existing.categoryVerifications) {
-        existing.categoryVerifications = {};
-      }
-
-      if (status === null) {
-        delete existing.categoryVerifications[category];
-      } else {
-        existing.categoryVerifications[category] = status;
-      }
-
-      // Generate NIP-85 tags based on verifications
-      existing.nip85Tags = generateNIP85Tags(existing.scores, existing.categoryVerifications);
-
-      // Track who verified and when
-      existing.lastVerifiedAt = Date.now();
-      existing.lastVerifiedBy = 'admin';
+      recordVerification(existing);
 
       // AUTO-APPROVE LOGIC: Check if rejecting a major flag should auto-approve
       let autoApproved = false;
+      let autoApproveRefused;
       if (status === 'rejected' && majorFlags.includes(category) && existing.action !== 'SAFE') {
         // Check if there are any remaining unrejected major flags with high scores
-        const remainingMajorFlags = majorFlags.filter(flag => {
-          const score = existing.scores?.[flag] || 0;
-          const verification = existing.categoryVerifications[flag];
+        const remainingMajorFlagsOf = (record) => majorFlags.filter(flag => {
+          const score = record.scores?.[flag] || 0;
+          const verification = record.categoryVerifications?.[flag];
           // Flag is still active if: score >= 0.6 AND NOT rejected
           return score >= 0.6 && verification !== 'rejected';
         });
+        const remainingMajorFlags = remainingMajorFlagsOf(existing);
 
         console.log(`[${requestId}] Remaining major flags after rejecting ${category}:`, remainingMajorFlags);
 
-        if (remainingMajorFlags.length === 0) {
+        // Setting SAFE is a lift, so it asks relay manager first, as
+        // /admin/api/moderate does (#231). A refusal, or no answer, keeps the
+        // current action; the rejection itself is still saved below.
+        const lift = remainingMajorFlags.length === 0
+          ? await checkMediaLift(env, sha256, 'SAFE')
+          : null;
+
+        // The check can take seconds. Save the rejection onto the record as it
+        // is now, so a decision saved meanwhile is kept, and approve only if
+        // that record still has the action this rejection was made against
+        // and no major flag left standing. A record removed meanwhile stays
+        // removed.
+        let changedWhileChecking = false;
+        if (lift !== null) {
+          const current = await loadModerationRecord();
+          if (!current) {
+            return new Response(JSON.stringify({ error: 'Moderation result not found for this video' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+          recordVerification(current);
+          existing = current;
+          changedWhileChecking = current.action !== previousAction
+            || remainingMajorFlagsOf(current).length > 0;
+        }
+
+        if (lift instanceof Response) {
+          autoApproveRefused = { status: lift.status, ...(await lift.json()) };
+          delete autoApproveRefused.success;
+          console.log(`[${requestId}] Not auto-approving ${sha256}: lift check refused (${autoApproveRefused.code})`);
+        } else if (lift && changedWhileChecking) {
+          autoApproveRefused = {
+            status: 409,
+            error: 'This file\'s moderation changed while relay manager was asked; not approved',
+            code: 'moderation_changed'
+          };
+          console.log(`[${requestId}] Not auto-approving ${sha256}: moderation changed during the lift check`);
+        } else if (lift) {
           // No more major flags - auto-approve!
           console.log(`[${requestId}] Auto-approving ${sha256.substring(0, 16)}... - all major flags rejected`);
           existing.action = 'SAFE';
@@ -2737,11 +2976,15 @@ export default {
         sha256,
         category,
         status,
+        // The action now stored, which a decision saved during the lift check
+        // may have changed, so the dashboard can show it.
+        action: existing.action,
         categoryVerifications: existing.categoryVerifications,
         nip85Tags: existing.nip85Tags,
         autoApproved,
         previousAction: autoApproved ? previousAction : undefined,
         newAction: autoApproved ? 'SAFE' : undefined,
+        autoApproveRefused,
         labelEvent: labelResult
       }), {
         headers: { 'Content-Type': 'application/json' }
@@ -4000,7 +4243,8 @@ async function runMigration() {
       try {
         const body = await request.json();
         const result = await runClassicVineRollback(body, env, {
-          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env)
+          notifyBlossom: (sha256, action) => notifyBlossom(sha256, action, env),
+          checkMediaLift: batchLiftChecker(env)
         });
         return jsonResponse(200, result);
       } catch (error) {
@@ -4165,7 +4409,8 @@ async function runMigration() {
           shas,
           env,
           fetchBlossomBlobDetail,
-          notifyBlossom
+          notifyBlossom,
+          checkMediaLift: batchLiftChecker(env)
         });
         console.log('[AR-RECONCILE][apply]', JSON.stringify({
           attempted: result.attempted,

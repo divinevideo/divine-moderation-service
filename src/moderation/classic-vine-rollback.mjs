@@ -269,6 +269,32 @@ export async function executeClassicVineRollback(item, env, deps = {}) {
   const staleKvKeys = await getClassicVineRollbackStaleKvKeys(item.sha256, env);
   const alreadySafe = existingRow?.action === 'SAFE';
 
+  // A restore sets the file SAFE, which is a lift whatever it was before, so
+  // relay manager's lift check is asked before anything is written. A refusal,
+  // or no answer, leaves the file as it is (#242). A file already safe with
+  // nothing left to clear changes nothing and is not asked about.
+  if (!alreadySafe || staleKvKeys.length > 0) {
+    let lift;
+    try {
+      lift = typeof deps.checkMediaLift === 'function'
+        ? await deps.checkMediaLift(item.sha256, 'SAFE')
+        : { refused: { code: 'lift_check_unavailable', error: 'No lift check configured' } };
+    } catch (error) {
+      lift = { refused: { code: 'lift_check_unavailable', error: error?.message || String(error) } };
+    }
+    if (!lift?.sha256) {
+      return {
+        sha256: item.sha256,
+        previousAction: existingRow?.action || null,
+        alreadySafe,
+        staleKvKeysCleared: [],
+        blossomNotified: false,
+        blossomError: null,
+        liftRefused: lift?.refused ?? { code: 'lift_check_unavailable', error: 'Lift check gave no answer' }
+      };
+    }
+  }
+
   if (!alreadySafe) {
     const update = buildClassicVineRollbackUpdate(existingRow || {
       sha256: item.sha256,
@@ -385,6 +411,19 @@ export async function runClassicVineRollback(body, env, deps = {}) {
       }
 
       const rollbackResult = await executeClassicVineRollback(item, env, deps);
+
+      if (rollbackResult.liftRefused) {
+        const refused = rollbackResult.liftRefused;
+        failed += 1;
+        candidates.push(createRollbackCandidateResult(item.sha256, 'lift-refused', {
+          restored: false,
+          previous_action: rollbackResult.previousAction,
+          error: refused.error || 'Lift check refused',
+          lift_code: refused.code || null,
+          ...(refused.caseId ? { case_id: refused.caseId, case_url: refused.caseUrl || null } : {})
+        }));
+        continue;
+      }
 
       if (!rollbackResult.blossomNotified) {
         failed += 1;
