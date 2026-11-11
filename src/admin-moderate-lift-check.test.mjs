@@ -1,8 +1,8 @@
 // This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// ABOUTME: The dashboard's SAFE and AGE_RESTRICTED writes ask relay manager's lift
-// ABOUTME: check first, and refuse when it says no or cannot be asked (#231)
+// ABOUTME: The dashboard, verify-category, the age-restricted reconcile and the classic-vine rollback
+// ABOUTME: ask relay manager's lift check first, and refuse when it says no or cannot be asked (#231, #242)
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
