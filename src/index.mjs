@@ -1068,10 +1068,11 @@ async function checkMediaLift(env, sha256, action, fallbackUploader = null) {
 // each file's outcome rather than answer with one refusal. The checker it
 // returns answers `{ sha256 }` to go ahead with, or `{ refused }` holding the
 // refusal's status, code, error and, for an open age review, its case. Once
-// relay manager cannot be asked about one file, the rest of the batch is
-// refused without asking: it would not answer for the next file either, and
-// each try can wait the full deadline, so a stalled relay manager would
-// otherwise hold the request open for the whole batch.
+// the check cannot run for one file, because relay manager cannot be asked or
+// this service's record cannot be read, the rest of the batch is refused
+// without asking: the next file would fail the same way, and each try can wait
+// the full deadline, so a stalled relay manager would otherwise hold the
+// request open for the whole batch.
 function batchLiftChecker(env) {
   let unavailable = null;
   return async (sha256, action) => {
@@ -1080,7 +1081,7 @@ function batchLiftChecker(env) {
         refused: {
           status: 502,
           code: 'lift_check_unavailable',
-          error: `Not asked: relay manager could not be asked about an earlier file in this batch (${unavailable})`
+          error: `Not asked: the lift check could not run for an earlier file in this batch (${unavailable})`
         }
       };
     }

@@ -769,6 +769,37 @@ describe('POST /admin/api/reconcile/age-restricted/apply asks relay manager befo
     ]);
   });
 
+  // A record that cannot be read stops the batch too, and the files after it
+  // say the check could not run, not that relay manager could not be asked.
+  it('says the check could not run, not that relay manager was unreachable, after a record read fails', async () => {
+    const next = 'cd'.repeat(32);
+    const base = env().BLOSSOM_DB;
+    const response = await adminPost('/admin/api/reconcile/age-restricted/apply', { shas: [SHA, next] }, {
+      BLOSSOM_DB: {
+        ...base,
+        prepare(sql) {
+          const stmt = base.prepare(sql);
+          return {
+            ...stmt,
+            bind(...args) { stmt.bind(...args); return this; },
+            async first() {
+              if (/FROM moderation_results/i.test(sql)) throw new Error('D1_ERROR: database unavailable');
+              return stmt.first();
+            }
+          };
+        }
+      }
+    });
+
+    expect(liftCalls).toHaveLength(0);
+    expect(blossomCalls).toEqual([]);
+    const { failures } = await response.json();
+    expect(failures).toHaveLength(2);
+    expect(failures[1]).toMatchObject({ sha256: next, stage: 'lift', code: 'lift_check_unavailable' });
+    expect(failures[1].error).toMatch(/^Not asked: the lift check could not run/);
+    expect(failures[1].error).not.toMatch(/relay manager could not be asked/);
+  });
+
   it('keeps asking after a refusal for one file', async () => {
     const next = 'cd'.repeat(32);
     liftAnswer = (body) => (body.sha256 === SHA ? AGE_REVIEW_REFUSAL() : allowed(body));
