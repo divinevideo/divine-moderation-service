@@ -149,6 +149,13 @@ function createDbMock({
           if (sql.includes('FROM user_reports') && sql.includes('COUNT(DISTINCT reporter_pubkey)')) {
             return { cnt: reporterCount, escalation_cnt: escalationReporterCount };
           }
+          // DM filter counts and per-conversation state: empty inbox, no mark.
+          if (/AS all_count/i.test(sql)) {
+            return { all_count: 0, waiting: 0, person: 0, reports: 0, notices: 0, outcomes: 0, warnings: 0 };
+          }
+          if (/AS conversation_id\) target/i.test(sql)) {
+            return { waiting: null, no_reply_needed_at: null };
+          }
           return null;
         },
         async all() {
@@ -7968,6 +7975,108 @@ describe('POST /admin/api/messages/{pubkey}/read', () => {
     expect(res.status).toBe(400);
     expect(prepared.some((sql) => /INSERT INTO dm_conversation_read_state/i.test(sql))).toBe(false);
   });
+});
+
+describe('DM filter routes', () => {
+  const HEX = '00000000000000000000000000000000000000000000000000000000000000ab';
+  const BASE = 'https://moderation.admin.divine.video/admin/api/messages';
+  const KEY = 'deadbeef'.repeat(8);
+  const authed = (method = 'GET') => ({ method, headers: { 'cf-access-jwt-assertion': 'test-access-token' } });
+  const env = (extra = {}) => createEnv({ ALLOW_DEV_ACCESS: 'true', NOSTR_PRIVATE_KEY: KEY, ...extra });
+
+  it('GET /admin/api/messages?filter=bogus returns 400 listing the allowed filters', async () => {
+    const { CONVERSATION_FILTERS } = await import('./nostr/dm-store.mjs');
+    const res = await worker.fetch(new Request(BASE + '?filter=bogus', authed()), env());
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Unknown filter', allowed: CONVERSATION_FILTERS });
+  });
+
+  it('GET /admin/api/messages treats an empty filter as All and accepts a known one', async () => {
+    expect((await worker.fetch(new Request(BASE + '?filter=', authed()), env())).status).toBe(200);
+    expect((await worker.fetch(new Request(BASE + '?filter=waiting', authed()), env())).status).toBe(200);
+  });
+
+  it('GET /admin/api/messages ensures dm_conversation_reply_state before the query joins it', async () => {
+    const prepared = [];
+    const res = await worker.fetch(
+      new Request(BASE, authed()),
+      env({ BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }) }),
+    );
+    expect(res.status).toBe(200);
+    const createIndex = prepared.findIndex((sql) =>
+      /CREATE TABLE IF NOT EXISTS\s+dm_conversation_reply_state/i.test(sql));
+    const selectIndex = prepared.findIndex((sql) =>
+      /LEFT JOIN dm_conversation_reply_state/i.test(sql));
+    expect(createIndex).toBeGreaterThanOrEqual(0);
+    expect(selectIndex).toBeGreaterThan(createIndex);
+  });
+
+  it('GET /admin/api/messages/counts returns counts, not an empty thread', async () => {
+    const res = await worker.fetch(new Request(BASE + '/counts', authed()), env());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).not.toHaveProperty('messages');
+    expect(Object.keys(body).sort()).toEqual(
+      ['all', 'notices', 'outcomes', 'person', 'reports', 'waiting', 'warnings']);
+  });
+
+  it('GET /admin/api/messages/{pubkey}/state returns 200 for a never-messaged pubkey', async () => {
+    const res = await worker.fetch(new Request(BASE + '/' + HEX + '/state', authed()), env());
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ waiting: false, no_reply_needed_at: null });
+  });
+
+  for (const method of ['POST', 'DELETE']) {
+    it(method + ' /no-reply-needed returns the success shape and touches dm_conversation_reply_state', async () => {
+      const prepared = [];
+      const res = await worker.fetch(
+        new Request(BASE + '/' + HEX + '/no-reply-needed', authed(method)),
+        env({ BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }) }),
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ success: true, waiting: false, no_reply_needed_at: null });
+      const createIndex = prepared.findIndex((sql) =>
+        /CREATE TABLE IF NOT EXISTS\s+dm_conversation_reply_state/i.test(sql));
+      const writeIndex = prepared.findIndex((sql) =>
+        (method === 'POST' ? /INSERT/i : /DELETE/i).test(sql) && /dm_conversation_reply_state/i.test(sql));
+      expect(createIndex).toBeGreaterThanOrEqual(0);
+      expect(writeIndex).toBeGreaterThan(createIndex);
+    });
+  }
+
+  const routes = [
+    ['GET', '/state'],
+    ['POST', '/no-reply-needed'],
+    ['DELETE', '/no-reply-needed'],
+  ];
+  for (const [method, suffix] of routes) {
+    it(method + ' ' + suffix + ' rejects a non-hex pubkey with 400', async () => {
+      const prepared = [];
+      const res = await worker.fetch(
+        new Request(BASE + '/not-a-pubkey' + suffix, authed(method)),
+        env({ BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }) }),
+      );
+      expect(res.status).toBe(400);
+      expect(prepared.some((sql) => /dm_conversation_reply_state/i.test(sql))).toBe(false);
+    });
+
+    it(method + ' ' + suffix + ' requires auth', async () => {
+      const res = await worker.fetch(
+        new Request(BASE + '/' + HEX + suffix, { method }),
+        createEnv({ NOSTR_PRIVATE_KEY: KEY }),
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it(method + ' ' + suffix + ' returns 500 when NOSTR_PRIVATE_KEY is unset', async () => {
+      const res = await worker.fetch(
+        new Request(BASE + '/' + HEX + suffix, authed(method)),
+        createEnv({ ALLOW_DEV_ACCESS: 'true', NOSTR_PRIVATE_KEY: undefined }),
+      );
+      expect(res.status).toBe(500);
+      expect((await res.json()).error).toBeTruthy();
+    });
+  }
 });
 
 describe('GET /admin/api/dm-templates', () => {
