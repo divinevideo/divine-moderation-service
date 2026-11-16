@@ -18,8 +18,9 @@ function extractFunction(src, name) {
     if (src[i] === '{') depth++;
     else if (src[i] === '}' && --depth === 0) { i++; break; }
   }
+  const isAsync = src.slice(Math.max(0, start - 6), start) === 'async ';
   // eslint-disable-next-line no-new-func
-  return new Function('return (' + src.slice(start, i) + ')')();
+  return new Function('return (' + (isAsync ? 'async ' : '') + src.slice(start, i) + ')')();
 }
 
 describe('messages UI — new message compose hooks', () => {
@@ -462,5 +463,51 @@ describe('messages UI — filter chips and No reply needed', () => {
     expect(init.indexOf('restoreFilter()')).toBeGreaterThan(-1);
     expect(init.indexOf('restoreFilter()')).toBeLessThan(init.indexOf('fetchConversations()'));
     expect(init).toContain('fetchFilterCounts()');
+  });
+});
+
+describe('messages UI — reply state behavior', () => {
+  const saved = {};
+  function setup({ selected, marked, state }) {
+    const calls = [];
+    for (const k of ['selectedPubkey', 'markedPubkey', 'showReplyState', 'fetch']) saved[k] = globalThis[k];
+    globalThis.selectedPubkey = selected;
+    globalThis.markedPubkey = marked;
+    globalThis.showReplyState = (arg) => calls.push(arg);
+    globalThis.fetch = async () => ({ ok: true, json: async () => state });
+    return { calls, loadReplyState: extractFunction(messagesHTML, 'loadReplyState') };
+  }
+  function restore() {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete globalThis[k]; else globalThis[k] = saved[k];
+    }
+  }
+
+  it('does not touch the header when another conversation is open', async () => {
+    const { calls, loadReplyState } = setup({ selected: 'B', marked: null, state: { waiting: true } });
+    try {
+      await loadReplyState('A');
+      expect(calls).toEqual([]);
+    } finally { restore(); }
+  });
+
+  it('keeps Undo visible on reload while the mark is active', async () => {
+    const { calls, loadReplyState } = setup({
+      selected: 'A', marked: 'A', state: { waiting: false, no_reply_needed_at: '2026-11-16T00:00:00Z' },
+    });
+    try {
+      await loadReplyState('A');
+      expect(calls.at(-1)).toEqual({ waiting: false, marked: true });
+    } finally { restore(); }
+  });
+
+  it('does not show Undo for a mark made on a different conversation', async () => {
+    const { calls, loadReplyState } = setup({
+      selected: 'A', marked: 'B', state: { waiting: false, no_reply_needed_at: '2026-11-16T00:00:00Z' },
+    });
+    try {
+      await loadReplyState('A');
+      expect(calls.at(-1)).toEqual({ waiting: false, marked: false });
+    } finally { restore(); }
   });
 });

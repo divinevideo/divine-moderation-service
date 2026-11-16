@@ -651,6 +651,9 @@
 
   <script>
     let selectedPubkey = null;
+    // Conversation whose No reply needed mark was set in this page session, so
+    // Undo survives a reload of reply state while the mark is still active.
+    let markedPubkey = null;
     let conversations = [];
     let profileCache = {};
 
@@ -938,13 +941,16 @@
     }
 
     async function loadReplyState(pubkey) {
+      if (selectedPubkey !== pubkey) return; // moderator moved on; leave the open thread's header alone
       showReplyState({ waiting: false, marked: false });
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
         if (!res.ok) return;
         const data = await res.json();
         if (selectedPubkey !== pubkey) return; // moderator moved on
-        showReplyState({ waiting: Boolean(data.waiting), marked: false });
+        const waiting = Boolean(data.waiting);
+        const marked = markedPubkey === pubkey && data.no_reply_needed_at != null && !waiting;
+        showReplyState({ waiting, marked });
       } catch (err) {
         console.error('loadReplyState error:', err);
       }
@@ -959,6 +965,7 @@
         if (!res.ok) throw new Error('Failed to mark no reply needed');
         fetchFilterCounts();
         if (selectedPubkey !== target) return;
+        markedPubkey = target;
         showReplyState({ waiting: false, marked: true });
       } catch (err) {
         if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = false;
@@ -973,6 +980,7 @@
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'DELETE' });
         if (!res.ok) throw new Error('Failed to undo');
+        if (markedPubkey === target) markedPubkey = null;
         fetchFilterCounts();
         if (selectedPubkey !== target) return;
         await loadReplyState(target);
@@ -1191,6 +1199,7 @@
         const searchStatus = document.getElementById('search-status');
         if (searchStatus) searchStatus.textContent = '';
       }
+      if (markedPubkey !== pubkey) markedPubkey = null;
       selectedPubkey = pubkey;
 
       // Optimistically clear the unread dot for this row, then tell the
@@ -1388,7 +1397,7 @@
           if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
         }
         // Our reply changes who is waiting: refresh the counts and, if this
-        // thread is still open, its button (loadReplyState drops stale replies).
+        // thread is still open, its button (loadReplyState ignores calls for a thread that is no longer open).
         fetchFilterCounts();
         loadReplyState(targetPubkey);
       } catch (err) {
