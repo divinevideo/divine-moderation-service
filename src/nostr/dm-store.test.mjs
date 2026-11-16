@@ -1292,6 +1292,36 @@ describe('DM Store - conversation filters against real D1', () => {
     }
   });
 
+  it('rows carry the latest typed message even when an automated message came later', async () => {
+    const typedAt = await recent(4);
+    await fromCreator(1, 'creator_reply', typedAt, 'typed');
+    await fromUs(1, 'moderation_notice', await recent(3), 'notice');
+
+    const row = await rowFor(convFor(1));
+    expect(row.last_message).toBe('moderation_notice notice');
+    expect(row.last_typed_message).toBe('creator_reply typed');
+    expect(row.last_typed_at).toBe(typedAt);
+  });
+
+  it('last_typed_message is null when the conversation has no typed row since the cutoff', async () => {
+    await fromCreator(1, 'creator_reply', '2026-08-12 23:59:59', 'pre-cutoff');
+    await fromUs(2, 'moderation_notice', await recent(2), 'notice');
+
+    for (const n of [1, 2]) {
+      const row = await rowFor(convFor(n));
+      expect(row.last_typed_message).toBeNull();
+      expect(row.last_typed_at).toBeNull();
+    }
+  });
+
+  it('the latest of several typed rows wins', async () => {
+    await fromCreator(1, 'creator_reply', await recent(5), 'first');
+    await fromCreator(1, 'creator_reply', await recent(2), 'second');
+    await fromUs(1, 'moderation_notice', await recent(1), 'notice');
+
+    expect((await rowFor(convFor(1))).last_typed_message).toBe('creator_reply second');
+  });
+
   it('no filter returns every conversation, unchanged order', async () => {
     await fromCreator(1, 'creator_reply', '2026-10-01 10:00:00', 'c1');
     await fromCreator(2, 'conversation_report', '2026-10-03 10:00:00', 'c2');

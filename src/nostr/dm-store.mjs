@@ -280,7 +280,7 @@ const FILTER_CONDITIONS = {
  * @returns {{ sql: string, params: unknown[] }}
  */
 function conversationFlagsCte({ conversationId } = {}) {
-  const params = [TYPED_MESSAGE_CUTOFF];
+  const params = [TYPED_MESSAGE_CUTOFF, TYPED_MESSAGE_CUTOFF];
   let where = '';
   if (conversationId !== undefined) {
     where = 'WHERE conversation_id = ?';
@@ -295,6 +295,9 @@ function conversationFlagsCte({ conversationId } = {}) {
         MAX(id) AS max_id,
         COUNT(*) AS message_count,
         MAX(CASE WHEN direction = 'incoming' AND message_type = 'creator_reply' AND created_at >= ? THEN created_at END) AS last_typed_at,
+        -- Same typed-row definition as above (so it binds the cutoff too); the
+        -- row's content is joined in getConversations for the people-chip preview.
+        MAX(CASE WHEN direction = 'incoming' AND message_type = 'creator_reply' AND created_at >= ? THEN id END) AS last_typed_id,
         MAX(CASE WHEN message_type = 'moderator_reply' THEN created_at END) AS last_reply_at,
         SUM(CASE WHEN message_type = 'conversation_report' THEN 1 ELSE 0 END) AS report_count,
         SUM(CASE WHEN message_type = 'moderation_notice' THEN 1 ELSE 0 END) AS notice_count,
@@ -376,6 +379,8 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       dl.message_type as last_message_type,
       flags.message_count,
       flags.waiting,
+      flags.last_typed_at,
+      lt.content AS last_typed_message,
       CASE
         WHEN li.latest_incoming_at IS NULL THEN 0
         WHEN rs.read_at IS NULL THEN 1
@@ -387,6 +392,7 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       END AS unread
     FROM flags
     JOIN dm_log dl ON dl.id = flags.max_id
+    LEFT JOIN dm_log lt ON lt.id = flags.last_typed_id
     LEFT JOIN latest_incoming li ON li.conversation_id = flags.conversation_id
     LEFT JOIN dm_conversation_read_state rs ON rs.conversation_id = flags.conversation_id
     ${filterWhere}

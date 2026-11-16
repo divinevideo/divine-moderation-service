@@ -511,3 +511,135 @@ describe('messages UI — reply state behavior', () => {
     } finally { restore(); }
   });
 });
+
+describe('messages UI — handled rows and people-chip previews', () => {
+  const names = ['activeFilter', 'selectedPubkey', 'markedPubkey', 'conversations', 'showReplyState', 'renderConversations',
+    'fetchFilterCounts', 'fetch', 'alert', 'document', 'currentConversationSearch', 'avatarHtml', 'displayName',
+    'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
+    'renderConversationList', 'loadReplyState'];
+  const saved = {};
+  function setup({ filter = '', rows = [], selected = 'A' } = {}) {
+    for (const k of names) saved[k] = globalThis[k];
+    const g = globalThis;
+    g.activeFilter = filter;
+    g.selectedPubkey = selected;
+    g.markedPubkey = null;
+    g.conversations = rows;
+    g.showReplyState = () => {};
+    g.fetchFilterCounts = () => {};
+    g.alert = () => {};
+    g.currentConversationSearch = () => '';
+    g.avatarHtml = () => '';
+    g.displayName = (p) => p;
+    g.relativeTime = (t) => 'T:' + t;
+    g.badgeClass = () => 'b';
+    g.badgeLabel = (t) => (t === 'creator_reply' ? 'Creator Reply' : t);
+    g.escapeHtml = (t) => String(t);
+    g.appendLoadMoreError = () => {};
+    const container = { innerHTML: '', scrollTop: 0 };
+    g.document = { getElementById: () => container };
+    g.setConversationWaiting = extractFunction(messagesHTML, 'setConversationWaiting');
+    g.renderConversationList = extractFunction(messagesHTML, 'renderConversationList');
+    g.renderConversations = () => g.renderConversationList(g.conversations);
+    g.loadReplyState = extractFunction(messagesHTML, 'loadReplyState');
+    const respond = (state) => { g.fetch = async () => ({ ok: true, json: async () => state }); };
+    respond({ waiting: false });
+    return {
+      respond,
+      render: () => { g.renderConversationList(g.conversations); return container.innerHTML; },
+      markNoReplyNeeded: extractFunction(messagesHTML, 'markNoReplyNeeded'),
+      undoNoReplyNeeded: extractFunction(messagesHTML, 'undoNoReplyNeeded'),
+    };
+  }
+  function restore() {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete globalThis[k]; else globalThis[k] = saved[k];
+    }
+  }
+  const row = (over = {}) => ({
+    participant_pubkey: 'A', latest_message: 'Your video was removed', message_type: 'moderation_notice',
+    last_message_at: 'LAST', last_typed_message: 'That was a news clip', last_typed_at: 'TYPED', waiting: true, ...over,
+  });
+
+  it("people chips preview the person's latest typed message", () => {
+    for (const filter of ['waiting', 'person']) {
+      const { render } = setup({ filter, rows: [row()] });
+      try {
+        const html = render();
+        expect(html, filter).toContain('That was a news clip');
+        expect(html, filter).toContain('Creator Reply');
+        expect(html, filter).toContain('T:TYPED');
+        expect(html, filter).not.toContain('Your video was removed');
+      } finally { restore(); }
+    }
+  });
+
+  it('other chips keep the last message', () => {
+    for (const filter of ['', 'notices']) {
+      const { render } = setup({ filter, rows: [row()] });
+      try {
+        const html = render();
+        expect(html, filter).toContain('Your video was removed');
+        expect(html, filter).toContain('T:LAST');
+        expect(html, filter).not.toContain('That was a news clip');
+      } finally { restore(); }
+    }
+  });
+
+  it('falls back to the last message when last_typed_message is null', () => {
+    const { render } = setup({ filter: 'person', rows: [row({ last_typed_message: null, last_typed_at: null })] });
+    try {
+      const html = render();
+      expect(html).toContain('Your video was removed');
+      expect(html).toContain('T:LAST');
+    } finally { restore(); }
+  });
+
+  it('a row greys on Waiting on us only when it is no longer waiting', () => {
+    const cases = [['waiting', false, true], ['waiting', true, false], ['', false, false], ['person', false, false]];
+    for (const [filter, waiting, greyed] of cases) {
+      const { render } = setup({ filter, rows: [row({ waiting })] });
+      try {
+        expect(render().includes('handled'), `${filter}/${waiting}`).toBe(greyed);
+      } finally { restore(); }
+    }
+  });
+
+  it('mark, undo and a later waiting state flip the grey', async () => {
+    const { render, respond, markNoReplyNeeded, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      await markNoReplyNeeded();
+      expect(render()).toContain('handled');
+
+      respond({ waiting: true });
+      await undoNoReplyNeeded();
+      expect(render()).not.toContain('handled');
+
+      respond({ waiting: false });
+      await globalThis.loadReplyState('A');
+      expect(render()).toContain('handled');
+
+      respond({ waiting: true });
+      await globalThis.loadReplyState('A');
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('a stale reply-state response does not touch the row', async () => {
+    const { render } = setup({ filter: 'waiting', rows: [row()], selected: 'B' });
+    try {
+      await globalThis.loadReplyState('A');
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('a reply sent from the thread greys the row via the state reload', async () => {
+    const send = messagesHTML.slice(messagesHTML.indexOf('async function sendMessage('));
+    expect(send.slice(0, send.indexOf('\n    }\n'))).toContain('loadReplyState(targetPubkey)');
+    const { render } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      await globalThis.loadReplyState('A');
+      expect(render()).toContain('handled');
+    } finally { restore(); }
+  });
+});

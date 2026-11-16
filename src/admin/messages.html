@@ -181,6 +181,15 @@
       background: #1a1a1a;
     }
 
+    .conversation-item.handled {
+      opacity: 0.5;
+    }
+
+    .conversation-item.handled:hover,
+    .conversation-item.handled.active {
+      opacity: 0.85;
+    }
+
     .conversation-item.active {
       background: #1a2332;
       border-left: 3px solid #2563eb;
@@ -940,6 +949,15 @@
       document.getElementById('no-reply-done').style.display = marked ? '' : 'none';
     }
 
+    // Keep the loaded row in step with the server's waiting state so the Waiting
+    // on us list can grey a handled row. Grey itself is derived at render time.
+    function setConversationWaiting(pubkey, waiting) {
+      const conv = conversations.find(c => (c.participant_pubkey || c.pubkey) === pubkey);
+      if (!conv) return;
+      conv.waiting = Boolean(waiting);
+      renderConversations();
+    }
+
     async function loadReplyState(pubkey) {
       if (selectedPubkey !== pubkey) return; // moderator moved on; leave the open thread's header alone
       showReplyState({ waiting: false, marked: false });
@@ -951,6 +969,7 @@
         const waiting = Boolean(data.waiting);
         const marked = markedPubkey === pubkey && data.no_reply_needed_at != null && !waiting;
         showReplyState({ waiting, marked });
+        setConversationWaiting(pubkey, waiting);
       } catch (err) {
         console.error('loadReplyState error:', err);
       }
@@ -964,6 +983,7 @@
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'POST' });
         if (!res.ok) throw new Error('Failed to mark no reply needed');
         fetchFilterCounts();
+        setConversationWaiting(target, false);
         if (selectedPubkey !== target) return;
         markedPubkey = target;
         showReplyState({ waiting: false, marked: true });
@@ -982,7 +1002,16 @@
         if (!res.ok) throw new Error('Failed to undo');
         if (markedPubkey === target) markedPubkey = null;
         fetchFilterCounts();
-        if (selectedPubkey !== target) return;
+        if (selectedPubkey !== target) {
+          // Thread not open, so no reload below will run. Undo only restores
+          // waiting if the person's message is still newer than any reply, so
+          // ask the server rather than assuming.
+          try {
+            const stateRes = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/state');
+            if (stateRes.ok) setConversationWaiting(target, Boolean((await stateRes.json()).waiting));
+          } catch (e) { /* the next refresh corrects the row */ }
+          return;
+        }
         await loadReplyState(target);
       } catch (err) {
         alert('Failed to undo: ' + err.message);
@@ -1127,14 +1156,18 @@
 
       container.innerHTML = list.map(conv => {
         const pubkey = conv.participant_pubkey || conv.pubkey || '';
-        const preview = (conv.latest_message || conv.preview || '').slice(0, 80);
-        const ts = conv.last_message_at || conv.updated_at || conv.created_at;
-        const msgType = conv.message_type || conv.latest_message_type || '';
+        // On the people chips, show what the person typed, not a later automated notice.
+        const showTyped = (activeFilter === 'waiting' || activeFilter === 'person') && conv.last_typed_message != null;
+        const preview = (showTyped ? conv.last_typed_message : (conv.latest_message || conv.preview || '')).slice(0, 80);
+        const ts = showTyped ? conv.last_typed_at : (conv.last_message_at || conv.updated_at || conv.created_at);
+        const msgType = showTyped ? 'creator_reply' : (conv.message_type || conv.latest_message_type || '');
+        // Derived, never stored: only Waiting on us greys a row that has been handled.
+        const handled = activeFilter === 'waiting' && conv.waiting === false;
         const unread = Boolean(conv.unread);
         const isActive = pubkey === selectedPubkey;
 
         return `
-          <div class="conversation-item ${isActive ? 'active' : ''}" onclick="selectConversation('${pubkey}')">
+          <div class="conversation-item ${isActive ? 'active' : ''}${handled ? ' handled' : ''}" onclick="selectConversation('${pubkey}')">
             <div class="pubkey">
               ${unread ? '<span class="unread-dot"></span>' : ''}
               ${avatarHtml(pubkey)}
