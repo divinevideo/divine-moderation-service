@@ -516,7 +516,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
   const names = ['activeFilter', 'selectedPubkey', 'markedPubkey', 'conversations', 'showReplyState', 'renderConversations',
     'fetchFilterCounts', 'fetch', 'alert', 'document', 'currentConversationSearch', 'avatarHtml', 'displayName',
     'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
-    'renderConversationList', 'loadReplyState'];
+    'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble'];
   const saved = {};
   function setup({ filter = '', rows = [], selected = 'A' } = {}) {
     for (const k of names) saved[k] = globalThis[k];
@@ -542,6 +542,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.renderConversationList = extractFunction(messagesHTML, 'renderConversationList');
     g.renderConversations = () => g.renderConversationList(g.conversations);
     g.loadReplyState = extractFunction(messagesHTML, 'loadReplyState');
+    g.refreshRowWaiting = extractFunction(messagesHTML, 'refreshRowWaiting');
+    g.conversationsOffset = 10;
     const respond = (state) => { g.fetch = async () => ({ ok: true, json: async () => state }); };
     respond({ waiting: false });
     return {
@@ -600,7 +602,9 @@ describe('messages UI — handled rows and people-chip previews', () => {
     for (const [filter, waiting, greyed] of cases) {
       const { render } = setup({ filter, rows: [row({ waiting })] });
       try {
-        expect(render().includes('handled'), `${filter}/${waiting}`).toBe(greyed);
+        const html = render();
+        expect(html.includes('handled'), `${filter}/${waiting}`).toBe(greyed);
+        expect(html.includes('title="No longer waiting on us"'), `${filter}/${waiting} title`).toBe(greyed);
       } finally { restore(); }
     }
   });
@@ -645,30 +649,46 @@ describe('messages UI — handled rows and people-chip previews', () => {
   }
   const flush = () => new Promise((r) => setTimeout(r, 0));
 
+  // Shared composer stubs for sendMessage; returns the swap-back for the list document.
+  function stubComposer() {
+    const extra = ['compose-input', 'compose-sha256', 'send-btn'];
+    const listDocument = globalThis.document;
+    const el = { value: ' hello ', disabled: false, focus() {}, innerHTML: '', scrollTop: 0 };
+    globalThis.document = { getElementById: (id) => (extra.includes(id) ? el : { innerHTML: '', scrollTop: 0 }) };
+    globalThis.appendOutgoingBubble = () => ({ isConnected: false });
+    return () => { globalThis.document = listDocument; };
+  }
+
   it('a reply greys the row even when the moderator opens another conversation mid-send', async () => {
     const { render } = setup({ filter: 'waiting', rows: [row()] });
-    const extra = ['compose-input', 'compose-sha256', 'send-btn'];
-    for (const k of ['appendOutgoingBubble', 'relativeTime']) saved[k] = globalThis[k];
-    for (const k of ['refreshRowWaiting']) saved[k] = globalThis[k];
     try {
-      const listDocument = globalThis.document;
-      const el = { value: ' hello ', disabled: false, focus() {}, innerHTML: '', scrollTop: 0 };
-      globalThis.document = { getElementById: (id) => (extra.includes(id) ? el : { innerHTML: '', scrollTop: 0 }) };
-      globalThis.appendOutgoingBubble = () => ({ isConnected: false });
-      try { globalThis.refreshRowWaiting = extractFunction(messagesHTML, 'refreshRowWaiting'); } catch (e) { /* not extracted yet */ }
+      const back = stubComposer();
       routedFetch({ onPost: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: false } });
       await extractFunction(messagesHTML, 'sendMessage')();
       await flush();
-      globalThis.document = listDocument;
+      back();
       expect(render()).toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('a reply sent from the still-open thread greys the row and updates the header', async () => {
+    const { render } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const shown = [];
+      globalThis.showReplyState = (s) => shown.push(s);
+      const back = stubComposer();
+      routedFetch({ state: { waiting: false } });
+      await extractFunction(messagesHTML, 'sendMessage')();
+      await flush();
+      back();
+      expect(render()).toContain('handled');
+      expect(shown.at(-1)).toMatchObject({ waiting: false });
     } finally { restore(); }
   });
 
   it('undo with the thread moved on after the DELETE un-greys the row', async () => {
     const { render, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row({ waiting: false })] });
-    saved.refreshRowWaiting = globalThis.refreshRowWaiting;
     try {
-      try { globalThis.refreshRowWaiting = extractFunction(messagesHTML, 'refreshRowWaiting'); } catch (e) { /* not extracted yet */ }
       routedFetch({ onDelete: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: true } });
       await undoNoReplyNeeded();
       await flush();
@@ -683,6 +703,45 @@ describe('messages UI — handled rows and people-chip previews', () => {
       await undoNoReplyNeeded();
       await flush();
       expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('on Waiting, handling a row moves the next-page offset back and undo moves it forward', () => {
+    const { } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      globalThis.setConversationWaiting('A', false);
+      expect(globalThis.conversationsOffset).toBe(9);
+      globalThis.setConversationWaiting('A', false); // no-op repeat
+      expect(globalThis.conversationsOffset).toBe(9);
+      globalThis.setConversationWaiting('A', true);
+      expect(globalThis.conversationsOffset).toBe(10);
+      globalThis.setConversationWaiting('A', true); // no-op repeat
+      expect(globalThis.conversationsOffset).toBe(10);
+    } finally { restore(); }
+  });
+
+  it('the offset never goes below zero', () => {
+    setup({ filter: 'waiting', rows: [row()] });
+    try {
+      globalThis.conversationsOffset = 0;
+      globalThis.setConversationWaiting('A', false);
+      expect(globalThis.conversationsOffset).toBe(0);
+    } finally { restore(); }
+  });
+
+  it('other chips and unloaded rows never move the offset', () => {
+    for (const filter of ['', 'notices', 'person']) {
+      setup({ filter, rows: [row()] });
+      try {
+        globalThis.setConversationWaiting('A', false);
+        globalThis.setConversationWaiting('A', true);
+        expect(globalThis.conversationsOffset, filter).toBe(10);
+      } finally { restore(); }
+    }
+    setup({ filter: 'waiting', rows: [row()] });
+    try {
+      globalThis.setConversationWaiting('ZZZ', false);
+      expect(globalThis.conversationsOffset).toBe(10);
     } finally { restore(); }
   });
 });

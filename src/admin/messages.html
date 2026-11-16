@@ -954,7 +954,15 @@
     function setConversationWaiting(pubkey, waiting) {
       const conv = conversations.find(c => (c.participant_pubkey || c.pubkey) === pubkey);
       if (!conv) return;
-      conv.waiting = Boolean(waiting);
+      const was = conv.waiting !== false; // a loaded row with no flag came from the Waiting set
+      const now = Boolean(waiting);
+      conv.waiting = now;
+      // The server's Waiting set shrinks when a row is handled, so the next page
+      // starts one earlier (and one later again if Undo makes it wait). Only on
+      // Waiting on us: other chips' sets don't depend on waiting.
+      if (activeFilter === 'waiting' && was !== now) {
+        conversationsOffset = Math.max(0, conversationsOffset + (now ? 1 : -1));
+      }
       renderConversations();
     }
 
@@ -1179,7 +1187,7 @@
         const isActive = pubkey === selectedPubkey;
 
         return `
-          <div class="conversation-item ${isActive ? 'active' : ''}${handled ? ' handled' : ''}" onclick="selectConversation('${pubkey}')">
+          <div class="conversation-item ${isActive ? 'active' : ''}${handled ? ' handled' : ''}"${handled ? ' title="No longer waiting on us"' : ''} onclick="selectConversation('${pubkey}')">
             <div class="pubkey">
               ${unread ? '<span class="unread-dot"></span>' : ''}
               ${avatarHtml(pubkey)}
