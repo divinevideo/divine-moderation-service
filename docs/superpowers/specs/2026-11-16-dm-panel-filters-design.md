@@ -97,7 +97,11 @@ Each chip shows how many conversations match it ("All" shows the total). Counts 
 ## No reply needed
 
 - **Where:** a button in the open thread's header, shown only while that conversation is in Waiting on us (read from the conversation's `state` endpoint, see Server shape).
-- **Rows already loaded:** after a reply or No reply needed, the counts reload, but the row stays in the currently loaded Waiting list until the next fetch. Removing rows from a paged list would shift offsets.
+- **Rows already loaded:** after a reply or No reply needed, the counts reload, but the row stays in the currently loaded Waiting list until the next fetch. Removing rows from a paged list would shift offsets. Instead the row is shown greyed (added 2026-11-16 after Matt's review of the local preview). Grey is derived, never stored: a row is greyed only when the active chip is Waiting on us and that row's current `waiting` is false. The page keeps each loaded row's `waiting` up to date from every state response (mark, undo, a reply sent, and any reload of the open conversation's state), so:
+  - it goes grey on No reply needed or a reply sent from the thread;
+  - it returns to normal on Undo, or when a later state or list response says it's waiting again (the person wrote back);
+  - switching chips, Refresh or reload fetches fresh rows, so nothing grey survives;
+  - it's never greyed on any other chip.
 - **Effect:** records a shared mark for the conversation at the current time. The conversation leaves Waiting on us (and its count) for everyone. A typed message logged after the mark puts it back.
 - **Undo:** after clicking, the header shows "Marked no reply needed · Undo" until the conversation is closed or changed. Undo deletes the mark.
 - **Does not:** send anything, change the unread dot, or hide the conversation from All or any other chip.
@@ -108,6 +112,7 @@ Each chip shows how many conversations match it ("All" shows the total). Counts 
 - `getConversations(db, { limit, offset, moderatorPubkey, filter })`. `filter` is one of `waiting`, `person`, `reports`, `notices`, `outcomes`, `warnings`, or absent for All. An unknown value returns 400 at the route rather than silently returning everything.
 - The per-conversation flags come from conditional aggregation in the existing `latest` GROUP BY over `dm_log` (for example `MAX(CASE WHEN <typed row> THEN created_at END) AS last_typed_at`, `MAX(CASE WHEN message_type = 'moderator_reply' THEN created_at END) AS last_reply_at`, `SUM(CASE WHEN message_type = 'conversation_report' THEN 1 ELSE 0 END) AS report_count`, and so on). The filter is a WHERE over those flags, placed before ORDER BY/LIMIT. Values are bound parameters, never interpolated. This is the same single scan `getConversations` already does, so no new index.
 - Each row gains `waiting` (boolean) so the client knows whether to show No reply needed.
+- Each row also gains `last_typed_message` and `last_typed_at`: the content and time of the conversation's latest typed row (the same definition `last_typed_at` already uses), or null when there is none. Taken from the row whose id is the latest typed row's id, via one LEFT JOIN on the existing query.
 - Counts come from a new `GET /admin/api/messages/counts` returning `{ all, waiting, person, reports, notices, outcomes, warnings }`. The list route keeps returning a bare array, so the response shape doesn't change for existing clients. **Route order matters:** the thread route (`GET /admin/api/messages/:pubkey`) matches any five-segment path and doesn't validate the pubkey, so a counts route registered after it would silently return an empty thread with a 200. Register counts before the thread route, as `/sync` is, and pin that with a route test.
 - `GET /admin/api/messages/:pubkey/state` returning `{ waiting, no_reply_needed_at }` for one conversation. The client needs this because a conversation opened by identifier lookup, or one beyond the loaded pages, has no list row to read `waiting` from, and the thread route's bare-array response shouldn't change. The list's per-row `waiting` and this endpoint share one store-level definition, so they can't disagree.
 - `POST /admin/api/messages/:pubkey/no-reply-needed` and `DELETE` on the same path, with the same auth and pubkey validation as `/read`.
@@ -117,6 +122,7 @@ Each chip shows how many conversations match it ("All" shows the total). Counts 
 
 - A chip row in `.conversation-list-header`, under the search box: `All · Waiting on us · A person wrote · Reports · Notices · Outcomes · Warnings`, each with its count.
 - Picking a chip resets paging (offset 0, clear the list and the dedupe set) and fetches with `&filter=`. The append-retry row (#208) and dedupe-on-append keep working per filter.
+- **Row preview in the people chips** (added 2026-11-16 after Matt's review). On Waiting on us and A person wrote, each row shows the person's latest typed message, its time, and a Creator Reply badge, instead of the conversation's last message, because a later automated notice would otherwise hide what the person said. All and the automated chips keep the team's last-message labels. Row order is unchanged (latest activity in either direction).
 - Name search keeps filtering the loaded rows client-side, so within a chip it narrows that chip's loaded rows. Identifier lookup (Enter) still opens the matching conversation whatever chip is active.
 - Remembering the active chip across reloads is optional (localStorage, wrapped in try/catch).
 

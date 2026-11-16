@@ -241,3 +241,48 @@ git commit -m "feat(messages): filter, counts, state and no-reply-needed admin r
 git add src/admin/messages.html src/admin/messages-ui.test.mjs
 git commit -m "feat(messages): filter chips with counts and a No reply needed action"
 ```
+
+### Task 5: Greyed handled rows and people-chip previews (added 2026-11-16 after Matt's review)
+
+Spec sections: "No reply needed → Rows already loaded", "Server shape" (`last_typed_message`, `last_typed_at`), "Client shape → Row preview in the people chips".
+
+**Files:**
+- Modify: `src/nostr/dm-store.mjs` (`conversationFlagsCte`, `getConversations`)
+- Modify: `src/admin/messages.html` (`renderConversationList` ~1107-1150; `loadReplyState` ~943; `markNoReplyNeeded` ~959; `undoNoReplyNeeded` ~977; `sendMessage` success path; CSS for a handled row)
+- Test: `src/nostr/dm-store.test.mjs`, `src/admin/messages-ui.test.mjs`
+
+**Interfaces:**
+- Consumes: the Task 2 typed-row definition in `conversationFlagsCte`; `activeFilter`, `conversations`, `selectedPubkey`, `renderConversations()` in the page.
+- Produces: every `getConversations` row carries `last_typed_message: string | null` and `last_typed_at: string | null`; a page helper `setConversationWaiting(pubkey: string, waiting: boolean): void` that updates the loaded row for that participant (if any) and re-renders.
+
+- [ ] **Step 1: Write the failing store tests** in the conversation-filters describe:
+  - `rows carry the latest typed message even when an automated message came later`: typed row "That was a news clip" (4 days ago), then outgoing `moderation_notice` (3 days ago). The row's `last_message` is the notice, `last_typed_message === 'That was a news clip'`, and `last_typed_at` equals the typed row's `created_at`.
+  - `last_typed_message is null when the conversation has no typed row since the cutoff`: a conversation with only a pre-cutoff `creator_reply` and one with only a `moderation_notice` both give `null` for both fields.
+  - `the latest of several typed rows wins`: two typed rows, so the later one's content is returned.
+
+- [ ] **Step 2: Write the failing page tests** (behavioral: extract the functions with stubbed globals, as the reply-state tests do):
+  - `people chips preview the person's latest typed message`: with `activeFilter = 'waiting'` (and again with `'person'`), `renderConversationList` on a row whose `latest_message` is a notice and `last_typed_message` is "That was a news clip" renders "That was a news clip", a Creator Reply badge, and a time from `last_typed_at`. With `activeFilter = ''` (and `'notices'`) it renders the notice as today.
+  - `falls back to the last message when last_typed_message is null` on a people chip.
+  - `a row greys on Waiting on us only when it is no longer waiting`: `waiting: false` under `activeFilter = 'waiting'` renders the handled-row class. `waiting: true` doesn't. `waiting: false` under `''` or `'person'` doesn't.
+  - `mark, undo and a later waiting state flip the grey`: after a successful mark, `setConversationWaiting(pubkey, false)` runs and the row renders greyed. After undo, or a `loadReplyState` response with `waiting: true`, it renders normal.
+  - `a reply sent from the thread greys the row` on Waiting on us (via the state reload after send).
+
+- [ ] **Step 3: Run to verify they fail**
+  Run: `npx vitest run src/nostr/dm-store.test.mjs src/admin/messages-ui.test.mjs`
+  Expected: FAIL on the new tests only.
+
+- [ ] **Step 4: Implement.**
+  - Store: add `MAX(CASE WHEN <typed row> THEN id END) AS last_typed_id` beside `last_typed_at` (same typed definition and bound cutoff). In `getConversations`, `LEFT JOIN dm_log lt ON lt.id = flags.last_typed_id` and select `lt.content AS last_typed_message` and `flags.last_typed_at`. Keep bind order and existing columns.
+  - Page: grey is derived in `renderConversationList` (`activeFilter === 'waiting' && conv.waiting === false`), never stored. `loadReplyState`, mark success, undo success and the post-send state reload call `setConversationWaiting` with the server's `waiting`. The preview, time and badge switch to the typed fields when `activeFilter` is `waiting` or `person` and `last_typed_message` is non-null. The handled-row style is a muted opacity using existing CSS variables, and the row stays clickable.
+
+- [ ] **Step 5: Run to verify they pass**, then mutation checks, one at a time (confirm the named test fails, then restore):
+  - Drop the `activeFilter === 'waiting'` condition from the grey rule, so the other-chip test fails.
+  - Remove the `setConversationWaiting` call from undo, so the undo test fails.
+  - Make the store take `last_typed_message` from the latest row of any type, so the automated-later test fails.
+
+- [ ] **Step 6: Full check and commit**
+  Run: `npm run lint && npm test`. Expected: both pass.
+```bash
+git add src/nostr/dm-store.mjs src/nostr/dm-store.test.mjs src/admin/messages.html src/admin/messages-ui.test.mjs
+git commit -m "feat(messages): grey handled rows and preview what the person wrote in people chips"
+```
