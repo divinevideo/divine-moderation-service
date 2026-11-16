@@ -633,13 +633,56 @@ describe('messages UI — handled rows and people-chip previews', () => {
     } finally { restore(); }
   });
 
-  it('a reply sent from the thread greys the row via the state reload', async () => {
-    const send = messagesHTML.slice(messagesHTML.indexOf('async function sendMessage('));
-    expect(send.slice(0, send.indexOf('\n    }\n'))).toContain('loadReplyState(targetPubkey)');
+  // fetch stub keyed by method: `onPost` / `onDelete` / `onGet` run before the response.
+  function routedFetch({ onPost, onDelete, onGet, state }) {
+    globalThis.fetch = async (url, opts = {}) => {
+      const method = opts.method || 'GET';
+      if (method === 'POST') onPost?.();
+      else if (method === 'DELETE') onDelete?.();
+      else onGet?.();
+      return { ok: true, json: async () => (method === 'GET' ? state : {}) };
+    };
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('a reply greys the row even when the moderator opens another conversation mid-send', async () => {
     const { render } = setup({ filter: 'waiting', rows: [row()] });
+    const extra = ['compose-input', 'compose-sha256', 'send-btn'];
+    for (const k of ['appendOutgoingBubble', 'relativeTime']) saved[k] = globalThis[k];
+    for (const k of ['refreshRowWaiting']) saved[k] = globalThis[k];
     try {
-      await globalThis.loadReplyState('A');
+      const listDocument = globalThis.document;
+      const el = { value: ' hello ', disabled: false, focus() {}, innerHTML: '', scrollTop: 0 };
+      globalThis.document = { getElementById: (id) => (extra.includes(id) ? el : { innerHTML: '', scrollTop: 0 }) };
+      globalThis.appendOutgoingBubble = () => ({ isConnected: false });
+      try { globalThis.refreshRowWaiting = extractFunction(messagesHTML, 'refreshRowWaiting'); } catch (e) { /* not extracted yet */ }
+      routedFetch({ onPost: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: false } });
+      await extractFunction(messagesHTML, 'sendMessage')();
+      await flush();
+      globalThis.document = listDocument;
       expect(render()).toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('undo with the thread moved on after the DELETE un-greys the row', async () => {
+    const { render, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row({ waiting: false })] });
+    saved.refreshRowWaiting = globalThis.refreshRowWaiting;
+    try {
+      try { globalThis.refreshRowWaiting = extractFunction(messagesHTML, 'refreshRowWaiting'); } catch (e) { /* not extracted yet */ }
+      routedFetch({ onDelete: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: true } });
+      await undoNoReplyNeeded();
+      await flush();
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('undo with the thread open, moved on during the state fetch, still un-greys the row', async () => {
+    const { render, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row({ waiting: false })] });
+    try {
+      routedFetch({ onGet: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: true } });
+      await undoNoReplyNeeded();
+      await flush();
+      expect(render()).not.toContain('handled');
     } finally { restore(); }
   });
 });

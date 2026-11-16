@@ -379,7 +379,7 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       dl.message_type as last_message_type,
       flags.message_count,
       flags.waiting,
-      flags.last_typed_at,
+      lt.created_at AS last_typed_at,
       lt.content AS last_typed_message,
       CASE
         WHEN li.latest_incoming_at IS NULL THEN 0

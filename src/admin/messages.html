@@ -958,6 +958,19 @@
       renderConversations();
     }
 
+    // Row-only refresh for a thread that is not (or no longer) open: never
+    // touches the header, which belongs to the open thread.
+    async function refreshRowWaiting(pubkey) {
+      try {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
+        if (!res.ok) return;
+        const data = await res.json();
+        setConversationWaiting(pubkey, Boolean(data.waiting));
+      } catch (err) {
+        console.error('refreshRowWaiting error:', err); // the next refresh corrects the row
+      }
+    }
+
     async function loadReplyState(pubkey) {
       if (selectedPubkey !== pubkey) return; // moderator moved on; leave the open thread's header alone
       showReplyState({ waiting: false, marked: false });
@@ -965,8 +978,10 @@
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
         if (!res.ok) return;
         const data = await res.json();
-        if (selectedPubkey !== pubkey) return; // moderator moved on
         const waiting = Boolean(data.waiting);
+        // The row belongs to pubkey whether or not it is still open; only the
+        // header must stay untouched once the moderator has moved on.
+        if (selectedPubkey !== pubkey) { setConversationWaiting(pubkey, waiting); return; }
         const marked = markedPubkey === pubkey && data.no_reply_needed_at != null && !waiting;
         showReplyState({ waiting, marked });
         setConversationWaiting(pubkey, waiting);
@@ -1006,10 +1021,7 @@
           // Thread not open, so no reload below will run. Undo only restores
           // waiting if the person's message is still newer than any reply, so
           // ask the server rather than assuming.
-          try {
-            const stateRes = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/state');
-            if (stateRes.ok) setConversationWaiting(target, Boolean((await stateRes.json()).waiting));
-          } catch (e) { /* the next refresh corrects the row */ }
+          await refreshRowWaiting(target);
           return;
         }
         await loadReplyState(target);
@@ -1430,9 +1442,10 @@
           if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
         }
         // Our reply changes who is waiting: refresh the counts and, if this
-        // thread is still open, its button (loadReplyState ignores calls for a thread that is no longer open).
+        // thread is still open, its button; otherwise just the replied-to row.
         fetchFilterCounts();
-        loadReplyState(targetPubkey);
+        if (selectedPubkey === targetPubkey) loadReplyState(targetPubkey);
+        else refreshRowWaiting(targetPubkey);
       } catch (err) {
         // Revert: remove the optimistic bubble if still present, and restore the
         // typed text only if we're still on the same thread (the composer is a
