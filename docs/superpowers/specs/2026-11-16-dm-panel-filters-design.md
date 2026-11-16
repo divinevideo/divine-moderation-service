@@ -88,7 +88,7 @@ Terms used below:
 
 Order within every filter stays newest activity first (`last_message_at DESC, id DESC`), as today.
 
-The "A person wrote" chip's description points people at Waiting on us, because "A person wrote" includes conversations we've already answered. Suggested tooltip: "Everyone who has typed to us since 12 August, answered or not. For the ones that need a reply, use Waiting on us." This answers the clarity question Matt raised after the preview went out.
+The "A person wrote" chip's description points people at Waiting on us, because "A person wrote" includes conversations we've already answered. Suggested tooltip: "Everyone who has typed to us since 13 August, answered or not. For the ones that need a reply, use Waiting on us." This answers the clarity question Matt raised after the preview went out.
 
 ## Counts
 
