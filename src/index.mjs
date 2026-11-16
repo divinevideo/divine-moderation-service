@@ -4085,9 +4085,8 @@ async function runMigration() {
       const authError = await requireAuth(request, env);
       if (authError) return authError;
 
-      const { getFilterCounts, initDmReadStateTable, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
-      // Counts use the same flags as the list, so they need both state tables.
-      await initDmReadStateTable(env.BLOSSOM_DB);
+      const { getFilterCounts, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
+      // Counts use the same flags as the list; those read only the reply-state table.
       await initDmReplyStateTable(env.BLOSSOM_DB);
       const counts = await getFilterCounts(env.BLOSSOM_DB);
       return new Response(JSON.stringify(counts), { headers: { 'Content-Type': 'application/json' } });
@@ -4111,13 +4110,12 @@ async function runMigration() {
           return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
         const pubkey = stateParts[4].toLowerCase();
-        const { computeConversationId, getConversationState, markNoReplyNeeded, clearNoReplyNeeded, initDmReadStateTable, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
+        const { computeConversationId, getConversationState, markNoReplyNeeded, clearNoReplyNeeded, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
         const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
         const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
         if (!moderatorPubkey) {
           return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
-        await initDmReadStateTable(env.BLOSSOM_DB);
         await initDmReplyStateTable(env.BLOSSOM_DB);
         const conversationId = computeConversationId(moderatorPubkey, pubkey);
         if (request.method === 'POST') await markNoReplyNeeded(env.BLOSSOM_DB, conversationId);

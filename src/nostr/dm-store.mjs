@@ -342,8 +342,10 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
   // No extra index is needed. The flags read direction, message_type and
   // created_at, so this pass reads full rows rather than just
   // idx_dm_conversation; but latest_incoming below already reads full rows
-  // for its direction filter and MAX(created_at), so the query's access
-  // pattern is unchanged, only more columns are aggregated per row. The filter
+  // for its direction filter and MAX(created_at). The `latest` CTE was a
+  // covering-index scan before and now reads full rows, so the access pattern
+  // is heavier; that is acceptable because the scan is bounded by the
+  // moderation account's message volume and retention. The filter
   // WHERE and the ORDER BY run over the reduced one-row-per-conversation set
   // (bounded by the moderation account's conversation count), so neither
   // warrants its own index. id DESC is a deterministic tiebreaker for rows

@@ -8011,6 +8011,30 @@ describe('DM filter routes', () => {
     expect(selectIndex).toBeGreaterThan(createIndex);
   });
 
+  it('GET /admin/api/messages passes ?filter through to the conversations query', async () => {
+    const run = async (query) => {
+      const prepared = [];
+      const res = await worker.fetch(
+        new Request(BASE + query, authed()),
+        env({ BLOSSOM_DB: createDbMock({ onPrepare: (sql) => prepared.push(sql) }) }),
+      );
+      expect(res.status).toBe(200);
+      return prepared;
+    };
+    const filtered = await run('?filter=waiting');
+    expect(filtered.some((sql) => /WHERE\s+flags\.waiting = 1/.test(sql))).toBe(true);
+    const unfiltered = await run('?filter=');
+    expect(unfiltered.some((sql) => /WHERE\s+flags\./.test(sql))).toBe(false);
+  });
+
+  it('GET /admin/api/messages/counts requires auth', async () => {
+    const res = await worker.fetch(
+      new Request(BASE + '/counts', { method: 'GET' }),
+      createEnv({ NOSTR_PRIVATE_KEY: KEY }),
+    );
+    expect(res.status).toBe(401);
+  });
+
   it('GET /admin/api/messages/counts returns counts, not an empty thread', async () => {
     const res = await worker.fetch(new Request(BASE + '/counts', authed()), env());
     expect(res.status).toBe(200);

@@ -999,7 +999,7 @@ describe('DM Store - no reply needed against real D1', () => {
   it('clearNoReplyNeeded removes the mark', async () => {
     await markNoReplyNeeded(db, conversationId);
     await clearNoReplyNeeded(db, conversationId);
-    const count = await db.prepare('SELECT COUNT(*) AS n FROM dm_conversation_reply_state').first();
+    const count = await db.prepare('SELECT COUNT(*) AS n FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
     expect(count.n).toBe(0);
   });
 
