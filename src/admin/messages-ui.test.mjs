@@ -375,3 +375,92 @@ describe('messages UI — reporter-included message', () => {
     expect(messagesHTML).toMatch(/\.unverified-excerpt-text\s*\{[^}]*white-space:\s*pre-wrap/);
   });
 });
+
+// Slice a function's source (sync or async) up to its closing brace at the
+// page's 4-space indent.
+function sliceFn(prefix) {
+  const start = messagesHTML.indexOf(prefix);
+  if (start === -1) throw new Error('function not found: ' + prefix);
+  return messagesHTML.slice(start, messagesHTML.indexOf('\n    }\n', start) + 6);
+}
+
+describe('messages UI — filter chips and No reply needed', () => {
+  it('FILTER_CHIPS lists the seven chips in order with these labels', () => {
+    const m = messagesHTML.match(/const FILTER_CHIPS = \[([\s\S]*?)\n    \];/);
+    expect(m).not.toBeNull();
+    const chips = [...m[1].matchAll(/key: '([a-z]*)', label: '([^']*)'/g)].map(x => [x[1], x[2]]);
+    expect(chips).toEqual([
+      ['', 'All'],
+      ['waiting', 'Waiting on us'],
+      ['person', 'A person wrote'],
+      ['reports', 'Reports'],
+      ['notices', 'Notices'],
+      ['outcomes', 'Outcomes'],
+      ['warnings', 'Warnings'],
+    ]);
+  });
+
+  it('chip tooltips carry the agreed copy', () => {
+    for (const copy of [
+      "Someone typed to us in the last 30 days and nobody on the team has replied since. Our automatic messages don't count as a reply. Messages from before 13 August aren't counted.",
+      'Everyone who has typed to us since 13 August, answered or not. For the ones that need a reply, use Waiting on us.',
+      'Has at least one automatic report from the app.',
+      'Has at least one moderation notice we sent.',
+      'Has at least one report outcome we sent.',
+      'Has at least one community warning we sent.',
+    ]) {
+      expect(messagesHTML).toContain(copy);
+    }
+  });
+
+  it('fetchConversations sends the active filter, and nothing for All', () => {
+    expect(messagesHTML).toContain("'&filter=' + encodeURIComponent(activeFilter)");
+    expect(messagesHTML).toMatch(/activeFilter \? '&filter=' \+ encodeURIComponent\(activeFilter\) : ''/);
+  });
+
+  it('setFilter starts a fresh load and ignores re-selecting the active chip', () => {
+    const fn = sliceFn('function setFilter(');
+    expect(fn).toMatch(/if \(key === activeFilter\) return;/);
+    expect(fn).toContain('fetchConversations()');
+    expect(fn).not.toContain('append');
+    expect(fn).toContain('maybeAutoFillConversations()');
+  });
+
+  it('restoreFilter falls back to All for an unknown key or a throwing store', () => {
+    const FILTER_CHIPS = [{ key: '' }, { key: 'waiting' }, { key: 'person' }];
+    const text = sliceFn('function restoreFilter(');
+    const make = (ls) => new Function('FILTER_CHIPS', 'FILTER_STORAGE_KEY', 'localStorage', 'return (' + text + ')')(FILTER_CHIPS, 'k', ls);
+    expect(make({ getItem: () => 'bogus' })()).toBe('');
+    expect(make({ getItem: () => { throw new Error('blocked'); } })()).toBe('');
+    expect(make({ getItem: () => 'waiting' })()).toBe('waiting');
+    expect(make({ getItem: () => null })()).toBe('');
+  });
+
+  it('reply-state handlers drop stale responses', () => {
+    for (const name of ['loadReplyState', 'markNoReplyNeeded', 'undoNoReplyNeeded']) {
+      const fn = sliceFn('async function ' + name + '(');
+      expect(fn, name).toMatch(/selectedPubkey !== (pubkey|target)/);
+    }
+  });
+
+  it('counts refresh after refresh, send and no-reply changes', () => {
+    for (const name of ['refreshAll', 'sendMessage', 'markNoReplyNeeded', 'undoNoReplyNeeded']) {
+      expect(sliceFn('async function ' + name + '('), name).toContain('fetchFilterCounts()');
+    }
+  });
+
+  it('the thread header has the No reply needed button and undo copy', () => {
+    expect(messagesHTML).toContain('id="no-reply-btn"');
+    expect(messagesHTML).toContain('No reply needed');
+    expect(messagesHTML).toContain('Marked no reply needed');
+    expect(messagesHTML).toContain('Undo');
+    expect(messagesHTML).toContain('No conversations match this filter.');
+  });
+
+  it('init restores the saved filter before the first load', () => {
+    const init = messagesHTML.slice(messagesHTML.indexOf('async function init()'));
+    expect(init.indexOf('restoreFilter()')).toBeGreaterThan(-1);
+    expect(init.indexOf('restoreFilter()')).toBeLessThan(init.indexOf('fetchConversations()'));
+    expect(init).toContain('fetchFilterCounts()');
+  });
+});

@@ -116,6 +116,35 @@
       border-color: #2563eb;
     }
 
+    .filter-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+
+    .filter-chip {
+      padding: 3px 9px;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 12px;
+      color: #aaa;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .filter-chip:hover {
+      background: #252525;
+      color: #fff;
+    }
+
+    .filter-chip.active {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #fff;
+    }
+
     .search-status {
       font-size: 11px;
       color: #888;
@@ -290,6 +319,45 @@
       border-bottom: 1px solid #222;
       background: #0f0f0f;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .reply-state {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #888;
+      flex-shrink: 0;
+    }
+
+    .reply-state button {
+      padding: 4px 10px;
+      background: #333;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .reply-state button:hover:not(:disabled) {
+      background: #444;
+    }
+
+    .reply-state button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .reply-state button.link-btn {
+      padding: 0;
+      background: none;
+      color: #6ea8fe;
+      text-decoration: underline;
     }
 
     .thread-header .thread-pubkey {
@@ -526,6 +594,7 @@
         <span>Conversations</span>
         <input type="text" id="search-input" placeholder="Search name, pubkey, npub, or nip-05 (Enter to look up)"
           oninput="onSearchInput(this.value)">
+        <div id="filter-chips" class="filter-chips"></div>
         <div id="search-status" class="search-status"></div>
       </div>
       <div class="conversation-items" id="conversation-items">
@@ -550,6 +619,10 @@
       <div id="thread-content" style="display: none; flex-direction: column; height: 100%;">
         <div class="thread-header">
           <span class="thread-pubkey" id="thread-pubkey"></span>
+          <div class="reply-state">
+            <button type="button" id="no-reply-btn" style="display:none;" onclick="markNoReplyNeeded()">No reply needed</button>
+            <span id="no-reply-done" style="display:none;">Marked no reply needed · <button type="button" class="link-btn" onclick="undoNoReplyNeeded()">Undo</button></span>
+          </div>
         </div>
         <div class="thread-messages" id="thread-messages">
           <div class="loading-state" id="thread-loading" style="display: none;">
@@ -596,6 +669,23 @@
     // A load-more (append) page failed. Surfaced as an inline retry row at the
     // list bottom so a failed page isn't mistaken for the end of history (#207).
     let conversationsError = false;
+
+    // Filter chips. Keys match the server's ?filter= values; '' is All and sends
+    // no param. Tooltips are the agreed T&S copy.
+    const FILTER_CHIPS = [
+      { key: '', label: 'All', tip: 'Every conversation.' },
+      { key: 'waiting', label: 'Waiting on us', tip: "Someone typed to us in the last 30 days and nobody on the team has replied since. Our automatic messages don't count as a reply. Messages from before 13 August aren't counted." },
+      { key: 'person', label: 'A person wrote', tip: 'Everyone who has typed to us since 13 August, answered or not. For the ones that need a reply, use Waiting on us.' },
+      { key: 'reports', label: 'Reports', tip: 'Has at least one automatic report from the app.' },
+      { key: 'notices', label: 'Notices', tip: 'Has at least one moderation notice we sent.' },
+      { key: 'outcomes', label: 'Outcomes', tip: 'Has at least one report outcome we sent.' },
+      { key: 'warnings', label: 'Warnings', tip: 'Has at least one community warning we sent.' },
+    ];
+    const FILTER_STORAGE_KEY = 'messagesFilter';
+    let activeFilter = '';
+    let filterCounts = null;
+    // Drops an out-of-order counts response (several refresh triggers can overlap).
+    let filterCountsGen = 0;
     // Invalidates an in-flight identifier lookup when the moderator searches
     // again, keeps typing, or opens a different conversation.
     let conversationSearchGen = 0;
@@ -788,6 +878,110 @@
       filterConversations(value);
     }
 
+    // --- Filter chips ---
+
+    function restoreFilter() {
+      try {
+        const saved = localStorage.getItem(FILTER_STORAGE_KEY);
+        if (FILTER_CHIPS.some(c => c.key === saved)) return saved;
+      } catch (e) {
+        // storage blocked; fall through to All
+      }
+      return '';
+    }
+
+    function renderFilterChips() {
+      const el = document.getElementById('filter-chips');
+      if (!el) return;
+      el.innerHTML = FILTER_CHIPS.map(c => {
+        const n = filterCounts && typeof filterCounts[c.key || 'all'] === 'number'
+          ? ' (' + filterCounts[c.key || 'all'] + ')' : '';
+        return '<button type="button" class="filter-chip' + (c.key === activeFilter ? ' active' : '') + '"'
+          + ' title="' + escapeHtml(c.tip) + '"'
+          + ' onclick="setFilter(\'' + c.key + '\')">' + escapeHtml(c.label + n) + '</button>';
+      }).join('');
+    }
+
+    function setFilter(key) {
+      if (key === activeFilter) return;
+      activeFilter = key;
+      try { localStorage.setItem(FILTER_STORAGE_KEY, key); } catch (e) { /* non-fatal */ }
+      renderFilterChips();
+      // Drop the old chip's rows so they don't sit under the new chip while the
+      // fresh load (which resets paging and supersedes anything in flight) runs.
+      conversations = [];
+      document.getElementById('conversation-items').innerHTML =
+        '<div class="loading-state" id="conv-loading"><div class="spinner"></div><span>Loading conversations...</span></div>';
+      fetchConversations().then(() => maybeAutoFillConversations());
+    }
+
+    async function fetchFilterCounts() {
+      const gen = ++filterCountsGen;
+      try {
+        const res = await fetch('/admin/api/messages/counts');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (gen !== filterCountsGen) return;
+        filterCounts = data;
+        renderFilterChips();
+      } catch (err) {
+        console.error('fetchFilterCounts error:', err);
+      }
+    }
+
+    // --- Reply state (shared "No reply needed" mark) ---
+
+    function showReplyState({ waiting, marked }) {
+      document.getElementById('no-reply-btn').style.display = waiting ? '' : 'none';
+      document.getElementById('no-reply-btn').disabled = false;
+      document.getElementById('no-reply-done').style.display = marked ? '' : 'none';
+    }
+
+    async function loadReplyState(pubkey) {
+      showReplyState({ waiting: false, marked: false });
+      try {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (selectedPubkey !== pubkey) return; // moderator moved on
+        showReplyState({ waiting: Boolean(data.waiting), marked: false });
+      } catch (err) {
+        console.error('loadReplyState error:', err);
+      }
+    }
+
+    async function markNoReplyNeeded() {
+      const target = selectedPubkey;
+      if (!target) return;
+      document.getElementById('no-reply-btn').disabled = true;
+      try {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'POST' });
+        if (!res.ok) throw new Error('Failed to mark no reply needed');
+        fetchFilterCounts();
+        if (selectedPubkey !== target) return;
+        showReplyState({ waiting: false, marked: true });
+      } catch (err) {
+        if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = false;
+        alert('Failed to mark no reply needed: ' + err.message);
+        console.error('markNoReplyNeeded error:', err);
+      }
+    }
+
+    async function undoNoReplyNeeded() {
+      const target = selectedPubkey;
+      if (!target) return;
+      try {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'DELETE' });
+        if (!res.ok) throw new Error('Failed to undo');
+        fetchFilterCounts();
+        if (selectedPubkey !== target) return;
+        await loadReplyState(target);
+      } catch (err) {
+        alert('Failed to undo: ' + err.message);
+        console.error('undoNoReplyNeeded error:', err);
+      }
+    }
+
     // --- Fetch conversations ---
 
     async function fetchConversations({ append = false } = {}) {
@@ -813,7 +1007,11 @@
       conversationsLoading = true;
 
       try {
-        const res = await fetch('/admin/api/messages?limit=' + CONVERSATIONS_PAGE_SIZE + '&offset=' + conversationsOffset);
+        // The filter is read synchronously with the offset; a chip switch bumps
+        // conversationsGen (fresh load), so a slow response for the old chip is
+        // discarded below and can't paint over the new one.
+        const res = await fetch('/admin/api/messages?limit=' + CONVERSATIONS_PAGE_SIZE + '&offset=' + conversationsOffset
+          + (activeFilter ? '&filter=' + encodeURIComponent(activeFilter) : ''));
         if (!res.ok) throw new Error('Failed to fetch conversations');
         const data = await res.json();
         if (gen !== conversationsGen) return; // superseded by a fresh load — discard
@@ -910,7 +1108,8 @@
       const preserveScroll = !currentConversationSearch().trim();
 
       if (!list.length) {
-        container.innerHTML = '<div class="empty-state">No conversations yet</div>';
+        container.innerHTML = '<div class="empty-state">'
+          + (activeFilter ? 'No conversations match this filter.' : 'No conversations yet') + '</div>';
         // Unreachable today (a pending append error implies a non-empty
         // unfiltered list), but keep the retry row reachable if that invariant
         // ever changes — otherwise a failure could silently look like the end.
@@ -1030,6 +1229,7 @@
       document.getElementById('compose-input').value = '';
       document.getElementById('compose-sha256').value = '';
 
+      loadReplyState(pubkey);
       await loadThread(pubkey);
     }
 
@@ -1187,6 +1387,10 @@
           const meta = pendingBubble.querySelector('.bubble-meta');
           if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
         }
+        // Our reply changes who is waiting: refresh the counts and, if this
+        // thread is still open, its button (loadReplyState drops stale replies).
+        fetchFilterCounts();
+        loadReplyState(targetPubkey);
       } catch (err) {
         // Revert: remove the optimistic bubble if still present, and restore the
         // typed text only if we're still on the same thread (the composer is a
@@ -1219,9 +1423,11 @@
       } catch (e) {
         // sync endpoint may not exist yet; ignore
       }
+      fetchFilterCounts();
       await fetchConversations();
       maybeAutoFillConversations();
       if (selectedPubkey) {
+        loadReplyState(selectedPubkey);
         await loadThread(selectedPubkey);
       }
     }
@@ -1334,6 +1540,9 @@
       const urlParams = new URLSearchParams(window.location.search);
       const preselectedPubkey = urlParams.get('pubkey');
 
+      activeFilter = restoreFilter();
+      renderFilterChips();
+      fetchFilterCounts();
       await fetchConversations();
       maybeAutoFillConversations();
       loadTemplates();
