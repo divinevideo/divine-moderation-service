@@ -221,26 +221,137 @@ export async function pruneExpiredDmLog(db) {
   };
 }
 
-export async function getConversations(db, { limit = 20, offset = 0, moderatorPubkey } = {}) {
-  // One grouped pass computes both the latest row id AND the per-conversation
-  // message_count in the same scan, then we join back for the latest row's
-  // columns. This replaces the earlier shape (a per-returned-row correlated
+/**
+ * Only an incoming creator_reply logged on or after this time counts as a
+ * message a person typed. Before #194, every report DM was stored as
+ * creator_reply too, and those rows were never relabelled, so an older
+ * creator_reply can't be told apart from a report. #194 merged at 06:32 UTC
+ * on 2026-08-12 and CI deployed it minutes later; the cutoff is the start of
+ * the 13th rather than the 12th so that no report logged earlier on the 12th
+ * counts as typed. Losing about 18 hours of typed messages is the safer side.
+ * Permanent: the mislabelled rows stay until retention removes them.
+ * CURRENT_TIMESTAMP format (UTC), so it compares as text against created_at.
+ */
+export const TYPED_MESSAGE_CUTOFF = '2026-08-13 00:00:00';
+
+/**
+ * How far back "Waiting on us" looks for an unanswered typed message. 30 days
+ * is the Trust & Safety team's choice (2026-11-16 filter design): older
+ * unanswered messages stay findable under "A person wrote" but stop inflating
+ * the waiting count. A constant rather than a setting by design.
+ */
+export const WAITING_WINDOW_DAYS = 30;
+
+/**
+ * The filter keys getConversations accepts. No filter means All.
+ */
+export const CONVERSATION_FILTERS = ['waiting', 'person', 'reports', 'notices', 'outcomes', 'warnings'];
+
+// The condition over the `flags` CTE that each filter key selects. Fixed SQL
+// fragments chosen by key, never built from input. getFilterCounts sums these
+// same expressions, so a chip's count and its list can't disagree.
+const FILTER_CONDITIONS = {
+  waiting: 'flags.waiting = 1',
+  person: 'flags.last_typed_at IS NOT NULL',
+  reports: 'flags.report_count > 0',
+  notices: 'flags.notice_count > 0',
+  outcomes: 'flags.outcome_count > 0',
+  warnings: 'flags.warning_count > 0',
+};
+
+/**
+ * The per-conversation flags behind the Messages filters, counts and state,
+ * as two CTEs (`latest`, then `flags`) for a caller to put after WITH. One
+ * builder for all three readers keeps their definitions identical.
+ *
+ * `latest` is one grouped pass over dm_log: the latest row id and message
+ * count (as getConversations always had), the latest typed row and the latest
+ * moderator_reply, and how many rows of each automated type the conversation
+ * ever had. Only moderator_reply counts as our reply: moderation_notice,
+ * report_outcome and community_warning are sent automatically and must not
+ * clear "Waiting on us".
+ *
+ * `flags` adds the "No reply needed" mark and computes `waiting`: the latest
+ * typed row is within the window and strictly later than both our latest
+ * reply and the mark. Strictly, because created_at has one-second resolution
+ * and a reply logged in the same second as the message answered it.
+ *
+ * @param {{ conversationId?: string }} [options] restrict to one conversation
+ * @returns {{ sql: string, params: unknown[] }}
+ */
+function conversationFlagsCte({ conversationId } = {}) {
+  const params = [TYPED_MESSAGE_CUTOFF];
+  let where = '';
+  if (conversationId !== undefined) {
+    where = 'WHERE conversation_id = ?';
+    params.push(conversationId);
+  }
+  params.push(`-${WAITING_WINDOW_DAYS} days`);
+
+  const sql = `
+    latest AS (
+      SELECT
+        conversation_id,
+        MAX(id) AS max_id,
+        COUNT(*) AS message_count,
+        MAX(CASE WHEN direction = 'incoming' AND message_type = 'creator_reply' AND created_at >= ? THEN created_at END) AS last_typed_at,
+        MAX(CASE WHEN message_type = 'moderator_reply' THEN created_at END) AS last_reply_at,
+        SUM(CASE WHEN message_type = 'conversation_report' THEN 1 ELSE 0 END) AS report_count,
+        SUM(CASE WHEN message_type = 'moderation_notice' THEN 1 ELSE 0 END) AS notice_count,
+        SUM(CASE WHEN message_type = 'report_outcome' THEN 1 ELSE 0 END) AS outcome_count,
+        SUM(CASE WHEN message_type = 'community_warning' THEN 1 ELSE 0 END) AS warning_count
+      FROM dm_log
+      ${where}
+      GROUP BY conversation_id
+    ),
+    flags AS (
+      SELECT
+        latest.*,
+        rps.no_reply_needed_at,
+        CASE
+          WHEN latest.last_typed_at IS NOT NULL
+            AND latest.last_typed_at >= datetime('now', ?)
+            AND (latest.last_reply_at IS NULL OR latest.last_typed_at > latest.last_reply_at)
+            AND (rps.no_reply_needed_at IS NULL OR latest.last_typed_at > rps.no_reply_needed_at)
+          THEN 1 ELSE 0
+        END AS waiting
+      FROM latest
+      LEFT JOIN dm_conversation_reply_state rps ON rps.conversation_id = latest.conversation_id
+    )`;
+  return { sql, params };
+}
+
+/**
+ * List conversations, newest first, optionally narrowed to one filter.
+ * @param {D1Database} db
+ * @param {{ limit?: number, offset?: number, moderatorPubkey?: string, filter?: string }} [options]
+ *   filter is one of CONVERSATION_FILTERS, or undefined for All
+ */
+export async function getConversations(db, { limit = 20, offset = 0, moderatorPubkey, filter } = {}) {
+  if (filter !== undefined && !CONVERSATION_FILTERS.includes(filter)) {
+    throw new Error(`Unknown conversation filter: ${filter}`);
+  }
+
+  // One grouped pass (the `latest` CTE inside conversationFlagsCte) computes
+  // the latest row id, the per-conversation message_count and the filter
+  // flags in the same scan, then we join back for the latest row's columns.
+  // This replaces the earlier shape (a per-returned-row correlated
   // `(SELECT COUNT(*) ...)` subquery on top of a separate MAX(id) GROUP BY),
   // which did the grouped scan AND an extra index lookup per row.
   //
-  // No extra index is needed: `id` is INTEGER PRIMARY KEY (the rowid), so the
-  // existing idx_dm_conversation on (conversation_id) is physically
-  // (conversation_id, id) and already covers MAX(id)/COUNT(*) GROUP BY. The
-  // final ORDER BY runs over the reduced one-row-per-conversation set (bounded
-  // by the moderation account's conversation count), so it doesn't warrant its
-  // own created_at index. id DESC is a deterministic tiebreaker for rows that
-  // share a (1-second-resolution) created_at, so pagination is stable.
+  // No extra index is needed. The flags read direction, message_type and
+  // created_at, so this pass reads full rows rather than just
+  // idx_dm_conversation; but latest_incoming below already reads full rows
+  // for its direction filter and MAX(created_at), so the query's access
+  // pattern is unchanged, only more columns are aggregated per row. The filter
+  // WHERE and the ORDER BY run over the reduced one-row-per-conversation set
+  // (bounded by the moderation account's conversation count), so neither
+  // warrants its own index. id DESC is a deterministic tiebreaker for rows
+  // that share a (1-second-resolution) created_at, so pagination is stable.
+  const flags = conversationFlagsCte();
+  const filterWhere = filter ? `WHERE ${FILTER_CONDITIONS[filter]}` : '';
   const rows = await db.prepare(`
-    WITH latest AS (
-      SELECT conversation_id, MAX(id) AS max_id, COUNT(*) AS message_count
-      FROM dm_log
-      GROUP BY conversation_id
-    ),
+    WITH ${flags.sql},
     latest_incoming AS (
       -- The most recent INCOMING message per conversation, used for the
       -- unread computation below. Deliberately separate from the "latest"
@@ -261,7 +372,8 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       dl.content as last_message,
       dl.sha256 as last_sha256,
       dl.message_type as last_message_type,
-      latest.message_count,
+      flags.message_count,
+      flags.waiting,
       CASE
         WHEN li.latest_incoming_at IS NULL THEN 0
         WHEN rs.read_at IS NULL THEN 1
@@ -271,14 +383,16 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
         WHEN li.latest_incoming_at > rs.read_at THEN 1
         ELSE 0
       END AS unread
-    FROM latest
-    JOIN dm_log dl ON dl.id = latest.max_id
-    LEFT JOIN latest_incoming li ON li.conversation_id = latest.conversation_id
-    LEFT JOIN dm_conversation_read_state rs ON rs.conversation_id = latest.conversation_id
+    FROM flags
+    JOIN dm_log dl ON dl.id = flags.max_id
+    LEFT JOIN latest_incoming li ON li.conversation_id = flags.conversation_id
+    LEFT JOIN dm_conversation_read_state rs ON rs.conversation_id = flags.conversation_id
+    ${filterWhere}
     ORDER BY last_message_at DESC, dl.id DESC
     LIMIT ? OFFSET ?
-  `).bind(limit, offset).all();
-  const results = rows.results || [];
+  `).bind(...flags.params, limit, offset).all();
+  // D1 returns the 0/1 CASE as a number; callers get a boolean.
+  const results = (rows.results || []).map((row) => ({ ...row, waiting: row.waiting === 1 }));
 
   // The admin messages UI expects participant_pubkey (the other side of the
   // conversation, not the moderator) plus latest_message / message_type
@@ -293,6 +407,55 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
     latest_message: row.last_message,
     message_type: row.last_message_type,
   }));
+}
+
+/**
+ * How many conversations each filter would list, plus the total for All.
+ * Sums the same FILTER_CONDITIONS getConversations filters by.
+ * @param {D1Database} db
+ * @returns {Promise<{ all: number, waiting: number, person: number, reports: number, notices: number, outcomes: number, warnings: number }>}
+ */
+export async function getFilterCounts(db) {
+  const flags = conversationFlagsCte();
+  // SUM over zero rows is NULL, hence the COALESCE for an empty dm_log.
+  const sums = CONVERSATION_FILTERS
+    .map((key) => `COALESCE(SUM(${FILTER_CONDITIONS[key]}), 0) AS ${key}`)
+    .join(',\n      ');
+  const row = await db.prepare(`
+    WITH ${flags.sql}
+    SELECT
+      COUNT(*) AS all_count,
+      ${sums}
+    FROM flags
+  `).bind(...flags.params).first();
+
+  const counts = { all: row.all_count };
+  for (const key of CONVERSATION_FILTERS) counts[key] = row[key];
+  return counts;
+}
+
+/**
+ * One conversation's "Waiting on us" flag and "No reply needed" mark, from
+ * the same flags the list uses. A conversation with no messages is not
+ * waiting; its mark is still read from the table, so a mark is never hidden.
+ * @param {D1Database} db
+ * @param {string} conversationId
+ * @returns {Promise<{ waiting: boolean, no_reply_needed_at: string | null }>}
+ */
+export async function getConversationState(db, conversationId) {
+  const flags = conversationFlagsCte({ conversationId });
+  const row = await db.prepare(`
+    WITH ${flags.sql}
+    SELECT flags.waiting, rps.no_reply_needed_at
+    FROM (SELECT ? AS conversation_id) target
+    LEFT JOIN flags ON flags.conversation_id = target.conversation_id
+    LEFT JOIN dm_conversation_reply_state rps ON rps.conversation_id = target.conversation_id
+  `).bind(...flags.params, conversationId).first();
+
+  return {
+    waiting: row.waiting === 1,
+    no_reply_needed_at: row.no_reply_needed_at ?? null,
+  };
 }
 
 export async function getConversation(db, conversationId) {
