@@ -31,6 +31,7 @@ export async function initDmLogTable(db) {
   await db.prepare('CREATE INDEX IF NOT EXISTS idx_dm_log_created_at ON dm_log(created_at)').run();
   await ensureDmLogExcerptColumn(db);
   await initDmReadStateTable(db);
+  await initDmReplyStateTable(db);
 }
 
 /**
@@ -75,6 +76,22 @@ export async function initDmReadStateTable(db) {
     CREATE TABLE IF NOT EXISTS dm_conversation_read_state (
       conversation_id TEXT PRIMARY KEY,
       read_at TEXT NOT NULL
+    )
+  `).run();
+}
+
+/**
+ * Create the per-conversation "No reply needed" table if it doesn't exist.
+ * Callable on its own for the same reason as initDmReadStateTable: CI deploys
+ * on every push to main without applying migrations, so the code that reads
+ * or writes this table has to be able to create it.
+ * @param {D1Database} db
+ */
+export async function initDmReplyStateTable(db) {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS dm_conversation_reply_state (
+      conversation_id TEXT PRIMARY KEY,
+      no_reply_needed_at TEXT NOT NULL
     )
   `).run();
 }
@@ -137,27 +154,62 @@ export async function markConversationRead(db, conversationId) {
 }
 
 /**
+ * Mark a conversation "No reply needed" as of now. One shared mark per
+ * conversation, not per moderator. Monotonic like markConversationRead: a
+ * second call never moves the mark backwards.
+ * @param {D1Database} db
+ * @param {string} conversationId
+ */
+export async function markNoReplyNeeded(db, conversationId) {
+  await db.prepare(`
+    INSERT INTO dm_conversation_reply_state (conversation_id, no_reply_needed_at)
+    VALUES (?, CURRENT_TIMESTAMP)
+    ON CONFLICT(conversation_id) DO UPDATE SET no_reply_needed_at = CURRENT_TIMESTAMP
+    WHERE CURRENT_TIMESTAMP > dm_conversation_reply_state.no_reply_needed_at
+  `).bind(conversationId).run();
+}
+
+/**
+ * Remove a conversation's "No reply needed" mark. A no-op when it has none.
+ * @param {D1Database} db
+ * @param {string} conversationId
+ */
+export async function clearNoReplyNeeded(db, conversationId) {
+  await db.prepare('DELETE FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).run();
+}
+
+/**
  * Delete dm_log rows older than the Trust & Safety-decided one-year
- * retention period, and any dm_conversation_read_state row left orphaned
- * once every message in its conversation has expired. Both deletes run as
- * one D1 batch (atomic) because dm_conversation_read_state has no foreign
- * key to dm_log -- see PR #219 for the retention decision (Trust & Safety,
+ * retention period, and any dm_conversation_read_state or
+ * dm_conversation_reply_state row left orphaned once every message in its
+ * conversation has expired. All three deletes run as one D1 batch (atomic)
+ * because the state tables have no foreign key to dm_log -- see PR #219 for the retention decision (Trust & Safety,
  * 2026-09-14: Charlie, Mike, Aleysha) and the sizing/key-rotation notes.
  *
  * A row is kept until strictly one year old, comparing created_at as text
  * against `datetime('now', '-1 years')` -- both are SQLite's
  * CURRENT_TIMESTAMP-format text ("YYYY-MM-DD HH:MM:SS"), the same
- * comparability markConversationRead already relies on. A read-state row is
+ * comparability markConversationRead already relies on. A state row is
  * deleted only when NO dm_log row remains for its conversation_id; a
- * conversation with any surviving message keeps its read marker.
+ * conversation with any surviving message keeps its markers.
+ *
+ * The state tables are ensured first: this sweep is gated by a flag and can
+ * run before anything else has created them (CI skips migrations), and a
+ * missing table would fail the whole batch, including the dm_log delete.
  * @param {D1Database} db
- * @returns {Promise<{deletedMessages: number, deletedReadStates: number}>}
+ * @returns {Promise<{deletedMessages: number, deletedReadStates: number, deletedReplyStates: number}>}
  */
 export async function pruneExpiredDmLog(db) {
-  const [messagesResult, readStateResult] = await db.batch([
+  await initDmReadStateTable(db);
+  await initDmReplyStateTable(db);
+  const [messagesResult, readStateResult, replyStateResult] = await db.batch([
     db.prepare(`DELETE FROM dm_log WHERE created_at < datetime('now', '-1 years')`),
     db.prepare(`
       DELETE FROM dm_conversation_read_state
+      WHERE conversation_id NOT IN (SELECT DISTINCT conversation_id FROM dm_log)
+    `),
+    db.prepare(`
+      DELETE FROM dm_conversation_reply_state
       WHERE conversation_id NOT IN (SELECT DISTINCT conversation_id FROM dm_log)
     `),
   ]);
@@ -165,6 +217,7 @@ export async function pruneExpiredDmLog(db) {
   return {
     deletedMessages: messagesResult.meta.changes,
     deletedReadStates: readStateResult.meta.changes,
+    deletedReplyStates: replyStateResult.meta.changes,
   };
 }
 

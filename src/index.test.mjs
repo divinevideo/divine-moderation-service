@@ -848,7 +848,7 @@ describe('scheduled private report delivery', () => {
     const db = {
       ...createDbMock(),
       async batch() {
-        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }];
+        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }, { meta: { changes: 0 } }];
       }
     };
 
@@ -864,7 +864,7 @@ describe('scheduled private report delivery', () => {
     const db = {
       ...createDbMock(),
       async batch() {
-        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }];
+        return [{ meta: { changes: 0 } }, { meta: { changes: 0 } }, { meta: { changes: 0 } }];
       }
     };
 

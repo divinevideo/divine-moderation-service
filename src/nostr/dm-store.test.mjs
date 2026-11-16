@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { computeConversationId, ensureDmLogExcerptColumn, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead, pruneExpiredDmLog } from './dm-store.mjs';
+import { computeConversationId, ensureDmLogExcerptColumn, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead, markNoReplyNeeded, clearNoReplyNeeded, pruneExpiredDmLog } from './dm-store.mjs';
 
 /**
  * Create a mock D1 database that tracks calls and stores data in-memory
@@ -601,6 +601,7 @@ describe('DM Store - unread / markConversationRead against real D1', () => {
     await initDmLogTable(db);
     await db.prepare('DELETE FROM dm_log').run();
     await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
   });
 
   async function backdateMessage(nostrEventId, timestamp) {
@@ -888,9 +889,129 @@ describe('DM Store - pruneExpiredDmLog against real D1', () => {
 
     const result = await pruneExpiredDmLog(db);
 
-    expect(result).toEqual({ deletedMessages: 0, deletedReadStates: 0 });
+    expect(result).toEqual({ deletedMessages: 0, deletedReadStates: 0, deletedReplyStates: 0 });
     const remaining = await db.prepare('SELECT COUNT(*) AS n FROM dm_log').first();
     expect(remaining.n).toBe(1);
+  });
+
+  it('deletes the reply-state row for a conversation whose only message expired', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-r1',
+    });
+    await backdateMessage('evt-old-r1', '2000-01-01 00:00:00');
+    await markNoReplyNeeded(db, conversationId);
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedReplyStates).toBe(1);
+    const row = await db.prepare('SELECT * FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(row).toBeNull();
+  });
+
+  it('keeps the reply-state row for a conversation with a surviving message', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_B);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_B,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-r2',
+    });
+    await backdateMessage('evt-old-r2', '2000-01-01 00:00:00');
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_B,
+      recipientPubkey: MODERATOR,
+      content: 'fresh',
+      nostrEventId: 'evt-new-r2',
+    });
+    await markNoReplyNeeded(db, conversationId);
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedReplyStates).toBe(0);
+    const row = await db.prepare('SELECT * FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(row).not.toBeNull();
+  });
+
+  it('runs when neither state table exists yet', async () => {
+    // CI deploys on merge without applying migrations, so the retention sweep
+    // can be the first thing to touch these tables on a fresh environment.
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-r3',
+    });
+    await backdateMessage('evt-old-r3', '2000-01-01 00:00:00');
+    await db.prepare('DROP TABLE dm_conversation_read_state').run();
+    await db.prepare('DROP TABLE dm_conversation_reply_state').run();
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedMessages).toBe(1);
+    const remaining = await db.prepare('SELECT COUNT(*) AS n FROM dm_log').first();
+    expect(remaining.n).toBe(0);
+  });
+});
+
+describe('DM Store - no reply needed against real D1', () => {
+  const db = env.BLOSSOM_DB;
+  const conversationId = computeConversationId('f'.repeat(64), 'a'.repeat(64));
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
+  });
+
+  async function markValue() {
+    const row = await db.prepare('SELECT no_reply_needed_at FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    return row ? row.no_reply_needed_at : null;
+  }
+
+  it('markNoReplyNeeded writes a CURRENT_TIMESTAMP-format mark', async () => {
+    await markNoReplyNeeded(db, conversationId);
+    expect(await markValue()).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  });
+
+  it('markNoReplyNeeded does not move the mark backwards', async () => {
+    await markNoReplyNeeded(db, conversationId);
+    await db.prepare('UPDATE dm_conversation_reply_state SET no_reply_needed_at = ? WHERE conversation_id = ?').bind('2999-01-01 00:00:00', conversationId).run();
+
+    await markNoReplyNeeded(db, conversationId);
+
+    expect(await markValue()).toBe('2999-01-01 00:00:00');
+  });
+
+  it('clearNoReplyNeeded removes the mark', async () => {
+    await markNoReplyNeeded(db, conversationId);
+    await clearNoReplyNeeded(db, conversationId);
+    const count = await db.prepare('SELECT COUNT(*) AS n FROM dm_conversation_reply_state').first();
+    expect(count.n).toBe(0);
+  });
+
+  it('clearNoReplyNeeded is safe on a conversation with no row', async () => {
+    await expect(clearNoReplyNeeded(db, conversationId)).resolves.toBeUndefined();
+  });
+
+  it('initDmLogTable creates dm_conversation_reply_state', async () => {
+    await db.prepare('DROP TABLE dm_conversation_reply_state').run();
+    await initDmLogTable(db);
+    const row = await db.prepare(`SELECT name FROM sqlite_master WHERE name = 'dm_conversation_reply_state'`).first();
+    expect(row).not.toBeNull();
   });
 });
 

@@ -5616,8 +5616,8 @@ async function runMigration() {
           const dayMs = 24 * 60 * 60 * 1000;
           if (Date.now() - last >= dayMs) {
             const { pruneExpiredDmLog } = await import('./nostr/dm-store.mjs');
-            const { deletedMessages, deletedReadStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
-            console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s)`);
+            const { deletedMessages, deletedReadStates, deletedReplyStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
+            console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s), ${deletedReplyStates} orphaned reply-state row(s)`);
             // private_report_intake follows the same one-year decision: it pairs
             // a reporter with the account they reported, as the report's
             // dm_log row does. Only delivered and rejected rows go; a pending
