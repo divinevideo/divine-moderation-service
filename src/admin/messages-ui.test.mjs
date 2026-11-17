@@ -471,7 +471,7 @@ describe('messages UI — reply state behavior', () => {
   const saved = {};
   function setup({ selected, marked, state }) {
     const calls = [];
-    for (const k of ['selectedPubkey', 'markedPubkey', 'showReplyState', 'setConversationWaiting', 'fetch', 'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState']) saved[k] = globalThis[k];
+    for (const k of ['selectedPubkey', 'markedPubkey', 'showReplyState', 'setConversationWaiting', 'fetch', 'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingActions', 'beginWaitingAction', 'waitingListNeedsRefresh']) saved[k] = globalThis[k];
     globalThis.selectedPubkey = selected;
     globalThis.markedPubkey = marked;
     globalThis.showReplyState = (arg) => calls.push(arg);
@@ -480,6 +480,8 @@ describe('messages UI — reply state behavior', () => {
     globalThis.replyStateGenerations = new Map();
     globalThis.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
     globalThis.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
+    globalThis.waitingActions = new Set();
+    globalThis.beginWaitingAction = extractFunction(messagesHTML, 'beginWaitingAction');
     return { calls, loadReplyState: extractFunction(messagesHTML, 'loadReplyState') };
   }
   function restore() {
@@ -523,7 +525,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
     'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
     'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble',
     'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingListGeneration', 'fetchConversations',
-    'waitingActions', 'beginWaitingAction', 'waitForWaitingActions'];
+    'waitingActions', 'beginWaitingAction', 'waitForWaitingActions', 'waitingListNeedsRefresh'];
   const saved = {};
   function setup({ filter = '', rows = [], selected = 'A' } = {}) {
     for (const k of names) saved[k] = globalThis[k];
@@ -532,6 +534,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.selectedPubkey = selected;
     g.markedPubkey = null;
     g.waitingListGeneration = 0;
+    g.waitingListNeedsRefresh = false;
     g.fetchConversations = extractFunction(messagesHTML, 'fetchConversations');
     g.waitingActions = new Set();
     g.beginWaitingAction = extractFunction(messagesHTML, 'beginWaitingAction');
@@ -551,7 +554,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.badgeLabel = (t) => (t === 'creator_reply' ? 'Creator Reply' : t);
     g.escapeHtml = (t) => String(t);
     g.appendLoadMoreError = () => {};
-    const container = { innerHTML: '', scrollTop: 0 };
+    const container = { innerHTML: '', scrollTop: 0, style: {} };
     g.document = { getElementById: () => container };
     g.setConversationWaiting = extractFunction(messagesHTML, 'setConversationWaiting');
     g.renderConversationList = extractFunction(messagesHTML, 'renderConversationList');
@@ -703,8 +706,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
   function stubComposer() {
     const extra = ['compose-input', 'compose-sha256', 'send-btn'];
     const listDocument = globalThis.document;
-    const el = { value: ' hello ', disabled: false, focus() {}, innerHTML: '', scrollTop: 0 };
-    globalThis.document = { getElementById: (id) => (extra.includes(id) ? el : { innerHTML: '', scrollTop: 0 }) };
+    const el = { value: ' hello ', disabled: false, focus() {}, innerHTML: '', scrollTop: 0, style: {} };
+    globalThis.document = { getElementById: (id) => (extra.includes(id) ? el : { innerHTML: '', scrollTop: 0, style: {} }) };
     globalThis.appendOutgoingBubble = () => ({ isConnected: false });
     return () => { globalThis.document = listDocument; };
   }
@@ -857,54 +860,113 @@ describe('messages UI — handled rows and people-chip previews', () => {
   }
 
   for (const action of ['reply', 'mark', 'undo']) {
-    it(`waits for an in-flight ${action} and its state before paging Waiting conversations`, async () => {
-      const { markNoReplyNeeded, undoNoReplyNeeded } = setup({
-        filter: 'waiting', rows: [row({ waiting: action !== 'undo' }), row({ participant_pubkey: 'B' })],
+    for (const appendPage of [false, true]) {
+      it(`waits for an in-flight ${action} and its state before ${appendPage ? 'paging' : 'refreshing'} Waiting conversations`, async () => {
+        const { markNoReplyNeeded, undoNoReplyNeeded } = setup({
+          filter: 'waiting', rows: [row({ waiting: action !== 'undo' }), row({ participant_pubkey: 'B' })],
+        });
+        const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+          'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+        for (const k of extra) saved[k] = globalThis[k];
+        let operation;
+        let append;
+        let releaseAction;
+        const release = () => releaseAction?.({ ok: true, json: async () => ({ waiting: action === 'undo' }) });
+        try {
+          const g = globalThis;
+          g.CONVERSATIONS_PAGE_SIZE = 2;
+          g.conversationsGen = 0;
+          g.conversationsOffset = action === 'undo' ? 1 : 2;
+          g.fetchProfiles = async () => {};
+          g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+          if (action === 'reply') stubComposer();
+          const requests = [];
+          g.fetch = async (url, opts = {}) => {
+            if (opts.method || url.endsWith('/state')) {
+              // The reply has reached the server, but its state read is delayed.
+              // Mark/Undo can likewise reach D1 before their response arrives.
+              if (action === 'reply' ? !opts.method : Boolean(opts.method)) {
+                return new Promise(resolve => { releaseAction = resolve; });
+              }
+              return { ok: true, json: async () => ({ waiting: action === 'undo' }) };
+            }
+            requests.push(url);
+            const offset = Number(new URL(url, 'https://example.test').searchParams.get('offset'));
+            const keys = action === 'undo' ? ['A', 'B', 'C', 'D', 'E'] : ['B', 'C', 'D', 'E'];
+            return { ok: true, json: async () => keys.slice(offset, offset + 2).map(key => row({ participant_pubkey: key })) };
+          };
+          operation = action === 'reply' ? extractFunction(messagesHTML, 'sendMessage')()
+            : action === 'mark' ? markNoReplyNeeded() : undoNoReplyNeeded();
+          await flush();
+          append = g.fetchConversations({ append: appendPage });
+          await flush();
+          expect(requests).toEqual([]);
+          release();
+          await operation;
+          await append;
+          expect(g.conversations.map(c => c.participant_pubkey))
+            .toEqual(appendPage ? ['A', 'B', 'C', 'D'] : action === 'undo' ? ['A', 'B'] : ['B', 'C']);
+          expect(new URL(requests[0], 'https://example.test').searchParams.get('offset'))
+            .toBe(appendPage ? action === 'undo' ? '2' : '1' : '0');
+        } finally {
+          release();
+          await operation;
+          await append;
+          restore();
+        }
       });
+    }
+  }
+
+  for (const stateResult of ['superseded', 'failed']) {
+    it(`recovers Waiting paging when post-reply state is ${stateResult}`, async () => {
+      setup({ filter: 'waiting', rows: [row(), row({ participant_pubkey: 'B' })] });
       const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
         'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
       for (const k of extra) saved[k] = globalThis[k];
-      let operation;
+      let send;
       let append;
-      let releaseAction;
-      const release = () => releaseAction?.({ ok: true, json: async () => ({ waiting: action === 'undo' }) });
+      let reopened;
+      const states = [];
+      const stateResponse = { ok: true, json: async () => ({ waiting: false }) };
       try {
         const g = globalThis;
         g.CONVERSATIONS_PAGE_SIZE = 2;
         g.conversationsGen = 0;
-        g.conversationsOffset = action === 'undo' ? 1 : 2;
+        g.conversationsOffset = 2;
         g.fetchProfiles = async () => {};
         g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
-        if (action === 'reply') stubComposer();
+        stubComposer();
         const requests = [];
         g.fetch = async (url, opts = {}) => {
-          if (opts.method || url.endsWith('/state')) {
-            // The reply has reached the server, but its state read is delayed.
-            // Mark/Undo can likewise reach D1 before their response arrives.
-            if (action === 'reply' ? !opts.method : Boolean(opts.method)) {
-              return new Promise(resolve => { releaseAction = resolve; });
-            }
-            return { ok: true, json: async () => ({ waiting: action === 'undo' }) };
-          }
+          if (opts.method) return { ok: true };
+          if (url.endsWith('/state')) return new Promise(resolve => states.push(resolve));
           requests.push(url);
           const offset = Number(new URL(url, 'https://example.test').searchParams.get('offset'));
-          const keys = action === 'undo' ? ['A', 'B', 'C', 'D', 'E'] : ['B', 'C', 'D', 'E'];
-          return { ok: true, json: async () => keys.slice(offset, offset + 2).map(key => row({ participant_pubkey: key })) };
+          return { ok: true, json: async () => ['B', 'C', 'D', 'E'].slice(offset, offset + 2)
+            .map(key => row({ participant_pubkey: key })) };
         };
-        operation = action === 'reply' ? extractFunction(messagesHTML, 'sendMessage')()
-          : action === 'mark' ? markNoReplyNeeded() : undoNoReplyNeeded();
+        send = extractFunction(messagesHTML, 'sendMessage')();
         await flush();
+        if (stateResult === 'superseded') reopened = g.loadReplyState('A');
+        states[0](stateResult === 'failed' ? { ok: false, status: 503 } : stateResponse);
+        await send;
         append = g.fetchConversations({ append: true });
-        await flush();
-        expect(requests).toEqual([]);
-        release();
-        await operation;
+        if (stateResult === 'superseded') {
+          await flush();
+          expect(requests).toEqual([]);
+          states[1](stateResponse);
+          await reopened;
+        }
         await append;
-        expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
-        expect(new URL(requests[0], 'https://example.test').searchParams.get('offset')).toBe(action === 'undo' ? '2' : '1');
+        expect(new URL(requests[0], 'https://example.test').searchParams.get('offset'))
+          .toBe(stateResult === 'failed' ? '0' : '1');
+        expect(g.conversations.map(c => c.participant_pubkey))
+          .toEqual(stateResult === 'failed' ? ['B', 'C'] : ['A', 'B', 'C', 'D']);
       } finally {
-        release();
-        await operation;
+        for (const resolve of states) resolve(stateResponse);
+        await send;
+        await reopened;
         await append;
         restore();
       }

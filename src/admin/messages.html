@@ -688,6 +688,7 @@
     // A Waiting page must be retried if a local state change moves its boundary
     // while the request is in flight; its server snapshot can be from either side.
     let waitingListGeneration = 0;
+    let waitingListNeedsRefresh = false;
 
     // Filter chips. Keys match the server's ?filter= values; '' is All and sends
     // no param. Tooltips are the agreed T&S copy.
@@ -997,7 +998,7 @@
     async function fetchReplyState(pubkey) {
       const gen = invalidateReplyState(pubkey);
       const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
-      if (!res.ok) return null;
+      if (!res.ok) throw new Error('Failed to load conversation state');
       const data = await res.json();
       return replyStateGenerations.get(pubkey) === gen ? data : null;
     }
@@ -1005,18 +1006,23 @@
     // Row-only refresh for a thread that is not (or no longer) open: never
     // touches the header, which belongs to the open thread.
     async function refreshRowWaiting(pubkey) {
+      const finishWaitingAction = beginWaitingAction();
       try {
         const data = await fetchReplyState(pubkey);
         if (!data) return;
         setConversationWaiting(pubkey, Boolean(data.waiting));
       } catch (err) {
+        waitingListNeedsRefresh = true;
         console.error('refreshRowWaiting error:', err); // the next refresh corrects the row
+      } finally {
+        finishWaitingAction();
       }
     }
 
     async function loadReplyState(pubkey) {
       if (selectedPubkey !== pubkey) return; // moderator moved on; leave the open thread's header alone
       showReplyState({ waiting: false, marked: false });
+      const finishWaitingAction = beginWaitingAction();
       try {
         const data = await fetchReplyState(pubkey);
         if (!data) return;
@@ -1028,7 +1034,10 @@
         showReplyState({ waiting, marked });
         setConversationWaiting(pubkey, waiting);
       } catch (err) {
+        waitingListNeedsRefresh = true;
         console.error('loadReplyState error:', err);
+      } finally {
+        finishWaitingAction();
       }
     }
 
@@ -1047,6 +1056,7 @@
         markedPubkey = target;
         showReplyState({ waiting: false, marked: true });
       } catch (err) {
+        waitingListNeedsRefresh = true;
         if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = false;
         alert('Failed to mark no reply needed: ' + err.message);
         console.error('markNoReplyNeeded error:', err);
@@ -1074,6 +1084,7 @@
         }
         await loadReplyState(target);
       } catch (err) {
+        waitingListNeedsRefresh = true;
         alert('Failed to undo: ' + err.message);
         console.error('undoNoReplyNeeded error:', err);
       } finally {
@@ -1090,7 +1101,6 @@
       // Fresh load (initial paint or a refresh) resets pagination back to the
       // first page; append keeps walking backward from where we left off.
       if (!append) {
-        conversationsOffset = 0;
         conversationsHasMore = true;
         conversationsError = false; // a fresh load starts clean
         // The first successful render replaces the list's innerHTML, which
@@ -1110,6 +1120,13 @@
         // reaches this page. Wait for that whole action before using an offset.
         if (activeFilter === 'waiting' && waitingActions.size) await waitForWaitingActions();
         if (gen !== conversationsGen) return;
+        // A pending Undo may have moved the old list's offset while we waited.
+        // A fresh request always starts at zero, after that action has settled.
+        if (!append) conversationsOffset = 0;
+        if (activeFilter === 'waiting' && waitingListNeedsRefresh) {
+          waitingListNeedsRefresh = false;
+          return await fetchConversations();
+        }
         const waitingGen = waitingListGeneration;
         // The filter is read synchronously with the offset; a chip switch bumps
         // conversationsGen (fresh load), so a slow response for the old chip is
@@ -1120,6 +1137,10 @@
         const data = await res.json();
         if (activeFilter === 'waiting' && waitingActions.size) await waitForWaitingActions();
         if (gen !== conversationsGen) return; // superseded by a fresh load — discard
+        if (activeFilter === 'waiting' && waitingListNeedsRefresh) {
+          waitingListNeedsRefresh = false;
+          return await fetchConversations();
+        }
         if (activeFilter === 'waiting' && waitingGen !== waitingListGeneration) {
           // A mark, Undo or reply changed the Waiting set after this request
           // began. Retry at the corrected offset instead of guessing whether
@@ -1512,6 +1533,7 @@
         if (selectedPubkey === targetPubkey) await loadReplyState(targetPubkey);
         else await refreshRowWaiting(targetPubkey);
       } catch (err) {
+        waitingListNeedsRefresh = true;
         // Revert: remove the optimistic bubble if still present, and restore the
         // typed text only if we're still on the same thread (the composer is a
         // single shared element — don't dump this thread's text into another).
