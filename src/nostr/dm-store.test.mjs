@@ -1370,6 +1370,15 @@ describe('DM Store - conversation filters against real D1', () => {
     }
   });
 
+  it('getConversations groups dm_log once for every filter', async () => {
+    for (const filter of [undefined, ...CONVERSATION_FILTERS]) {
+      let sql = '';
+      const spy = { prepare: (text) => { sql = text; return { bind: () => ({ all: async () => ({ results: [] }) }) }; } };
+      await getConversations(spy, { filter });
+      expect(sql.match(/GROUP BY/g), String(filter)).toHaveLength(1);
+    }
+  });
+
   it('getFilterCounts is all zeros on an empty dm_log', async () => {
     expect(await getFilterCounts(db)).toEqual({ all: 0, waiting: 0, person: 0, reports: 0, notices: 0, outcomes: 0, warnings: 0 });
   });

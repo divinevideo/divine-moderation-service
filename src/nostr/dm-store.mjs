@@ -280,11 +280,11 @@ const FILTER_CONDITIONS = {
  * builder for all three readers keeps their definitions identical.
  *
  * `latest` is one grouped pass over dm_log: the latest row id and message
- * count (as getConversations always had), the latest typed row and the latest
- * moderator_reply, and how many rows of each automated type the conversation
- * ever had. Only moderator_reply counts as our reply: moderation_notice,
- * report_outcome and community_warning are sent automatically and must not
- * clear "Waiting on us".
+ * count (as getConversations always had), the latest typed row, the latest
+ * moderator_reply and the latest incoming row, and how many rows of each
+ * automated type the conversation ever had. Only moderator_reply counts as
+ * our reply: moderation_notice, report_outcome and community_warning are sent
+ * automatically and must not clear "Waiting on us".
  *
  * `flags` adds the "No reply needed" mark and computes `waiting`: the latest
  * typed row is within the window and strictly later than both our latest
@@ -314,6 +314,9 @@ function conversationFlagsCte({ conversationId } = {}) {
         -- row's content is joined in getConversations for the people-chip preview.
         MAX(CASE WHEN direction = 'incoming' AND message_type = 'creator_reply' AND created_at >= ? THEN id END) AS last_typed_id,
         MAX(CASE WHEN message_type = 'moderator_reply' THEN created_at END) AS last_reply_at,
+        -- Latest INCOMING row, for the unread flag: a moderator's own outgoing
+        -- reply must not mark their own inbox as unread to themselves.
+        MAX(CASE WHEN direction = 'incoming' THEN created_at END) AS latest_incoming_at,
         SUM(CASE WHEN message_type = 'conversation_report' THEN 1 ELSE 0 END) AS report_count,
         SUM(CASE WHEN message_type = 'moderation_notice' THEN 1 ELSE 0 END) AS notice_count,
         SUM(CASE WHEN message_type = 'report_outcome' THEN 1 ELSE 0 END) AS outcome_count,
@@ -359,11 +362,9 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
   //
   // No extra index is needed. The flags read direction, message_type and
   // created_at, so this pass reads full rows rather than just
-  // idx_dm_conversation; but latest_incoming below already reads full rows
-  // for its direction filter and MAX(created_at). The `latest` CTE was a
-  // covering-index scan before and now reads full rows, so the access pattern
-  // is heavier; that is acceptable because the scan is bounded by the
-  // moderation account's message volume and retention. The filter
+  // idx_dm_conversation. It also yields latest_incoming_at for the unread
+  // flag, which used to take a second full-row GROUP BY of its own, so the
+  // query still reads dm_log once. The filter
   // WHERE and the ORDER BY run over the reduced one-row-per-conversation set
   // (bounded by the moderation account's conversation count), so neither
   // warrants its own index. id DESC is a deterministic tiebreaker for rows
@@ -371,18 +372,7 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
   const flags = conversationFlagsCte();
   const filterWhere = filter ? `WHERE ${FILTER_CONDITIONS[filter]}` : '';
   const rows = await db.prepare(`
-    WITH ${flags.sql},
-    latest_incoming AS (
-      -- The most recent INCOMING message per conversation, used for the
-      -- unread computation below. Deliberately separate from the "latest"
-      -- CTE above (which is the most recent message in either direction,
-      -- used for the row's display columns): a moderator's own outgoing
-      -- reply must not mark their own inbox as unread to themselves.
-      SELECT conversation_id, MAX(created_at) AS latest_incoming_at
-      FROM dm_log
-      WHERE direction = 'incoming'
-      GROUP BY conversation_id
-    )
+    WITH ${flags.sql}
     SELECT
       dl.conversation_id,
       dl.created_at as last_message_at,
@@ -397,18 +387,17 @@ export async function getConversations(db, { limit = 20, offset = 0, moderatorPu
       lt.created_at AS last_typed_at,
       lt.content AS last_typed_message,
       CASE
-        WHEN li.latest_incoming_at IS NULL THEN 0
+        WHEN flags.latest_incoming_at IS NULL THEN 0
         WHEN rs.read_at IS NULL THEN 1
         -- Both timestamps use SQLite/D1 CURRENT_TIMESTAMP, which has
         -- one-second resolution. A message logged in the same second as
         -- mark-read is treated as read until a later incoming message arrives.
-        WHEN li.latest_incoming_at > rs.read_at THEN 1
+        WHEN flags.latest_incoming_at > rs.read_at THEN 1
         ELSE 0
       END AS unread
     FROM flags
     JOIN dm_log dl ON dl.id = flags.max_id
     LEFT JOIN dm_log lt ON lt.id = flags.last_typed_id
-    LEFT JOIN latest_incoming li ON li.conversation_id = flags.conversation_id
     LEFT JOIN dm_conversation_read_state rs ON rs.conversation_id = flags.conversation_id
     ${filterWhere}
     ORDER BY last_message_at DESC, dl.id DESC
