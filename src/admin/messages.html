@@ -975,7 +975,9 @@
 
     function showReplyState({ waiting, marked }) {
       document.getElementById('no-reply-btn').style.display = waiting ? '' : 'none';
-      document.getElementById('no-reply-btn').disabled = false;
+      // Live only once the open thread has rendered: a click before then would
+      // send seen_through_id 0 and the mark couldn't take. loadThread enables it.
+      document.getElementById('no-reply-btn').disabled = !(threadSeen && threadSeen.pubkey === selectedPubkey);
       document.getElementById('no-reply-done').style.display = marked ? '' : 'none';
     }
 
@@ -1409,6 +1411,7 @@
         if (child.id !== 'thread-loading') child.remove();
       });
       threadSeen = null; // nothing is on screen until the new thread renders
+      document.getElementById('no-reply-btn').disabled = true; // re-enabled once it renders
 
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey));
@@ -1418,6 +1421,7 @@
         loading.style.display = 'none';
         renderThread(messages);
         threadSeen = { pubkey, maxId: messages.reduce((max, msg) => Math.max(max, Number(msg.id) || 0), 0) };
+        if (pubkey === selectedPubkey) document.getElementById('no-reply-btn').disabled = false;
       } catch (err) {
         loading.style.display = 'none';
         container.innerHTML += '<div class="empty-state">Failed to load messages</div>';

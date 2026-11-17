@@ -699,6 +699,64 @@ describe('messages UI — handled rows and people-chip previews', () => {
     }
   });
 
+  // A click before the thread renders would send seen_through_id 0, so the
+  // mark lands before every typed message and the click seems to do nothing.
+  it('the No reply needed button stays disabled until the open thread has rendered', () => {
+    const keys = ['document', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const btn = { style: {}, disabled: false };
+      globalThis.document = { getElementById: (id) => (id === 'no-reply-btn' ? btn : { style: {} }) };
+      const showReplyState = extractFunction(messagesHTML, 'showReplyState');
+      globalThis.selectedPubkey = 'A';
+      globalThis.threadSeen = null;
+      showReplyState({ waiting: true, marked: false });
+      expect(btn.disabled).toBe(true);
+      globalThis.threadSeen = { pubkey: 'B', maxId: 4 };
+      showReplyState({ waiting: true, marked: false });
+      expect(btn.disabled).toBe(true);
+      globalThis.threadSeen = { pubkey: 'A', maxId: 4 };
+      showReplyState({ waiting: true, marked: false });
+      expect(btn.disabled).toBe(false);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  it('loading a thread disables the button until it renders, and a failed load or another thread keeps it disabled', async () => {
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const btn = { style: {}, disabled: true };
+      const el = { style: {}, children: [], innerHTML: '' };
+      globalThis.document = { getElementById: (id) => (id === 'no-reply-btn' ? btn : el) };
+      globalThis.renderThread = () => {};
+      const loadThread = extractFunction(messagesHTML, 'loadThread');
+      let disabledWhileLoading;
+      globalThis.fetch = async () => {
+        disabledWhileLoading = btn.disabled;
+        return { ok: true, json: async () => [{ id: 3 }] };
+      };
+      globalThis.selectedPubkey = 'A';
+      btn.disabled = false; // e.g. a reload after a mark that left it waiting
+      await loadThread('A');
+      expect(disabledWhileLoading).toBe(true);
+      expect(btn.disabled).toBe(false);
+      btn.disabled = true;
+      globalThis.selectedPubkey = 'B'; // moved on before A's thread arrived
+      await loadThread('A');
+      expect(btn.disabled).toBe(true);
+      globalThis.selectedPubkey = 'A';
+      globalThis.fetch = async () => ({ ok: false });
+      await loadThread('A');
+      expect(btn.disabled).toBe(true);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
   it('mark sends the newest message id the open thread showed, and 0 for another thread', async () => {
     for (const [seen, expected] of [[{ pubkey: 'A', maxId: 7 }, 7], [{ pubkey: 'B', maxId: 9 }, 0], [null, 0]]) {
       const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
