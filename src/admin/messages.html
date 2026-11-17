@@ -116,6 +116,35 @@
       border-color: #2563eb;
     }
 
+    .filter-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+
+    .filter-chip {
+      padding: 3px 9px;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 12px;
+      color: #aaa;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .filter-chip:hover {
+      background: #252525;
+      color: #fff;
+    }
+
+    .filter-chip.active {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #fff;
+    }
+
     .search-status {
       font-size: 11px;
       color: #888;
@@ -150,6 +179,15 @@
 
     .conversation-item:hover {
       background: #1a1a1a;
+    }
+
+    .conversation-item.handled {
+      opacity: 0.5;
+    }
+
+    .conversation-item.handled:hover,
+    .conversation-item.handled.active {
+      opacity: 0.85;
     }
 
     .conversation-item.active {
@@ -290,6 +328,45 @@
       border-bottom: 1px solid #222;
       background: #0f0f0f;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .reply-state {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: #888;
+      flex-shrink: 0;
+    }
+
+    .reply-state button {
+      padding: 4px 10px;
+      background: #333;
+      border: none;
+      border-radius: 4px;
+      color: #fff;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .reply-state button:hover:not(:disabled) {
+      background: #444;
+    }
+
+    .reply-state button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .reply-state button.link-btn {
+      padding: 0;
+      background: none;
+      color: #6ea8fe;
+      text-decoration: underline;
     }
 
     .thread-header .thread-pubkey {
@@ -526,6 +603,7 @@
         <span>Conversations</span>
         <input type="text" id="search-input" placeholder="Search name, pubkey, npub, or nip-05 (Enter to look up)"
           oninput="onSearchInput(this.value)">
+        <div id="filter-chips" class="filter-chips"></div>
         <div id="search-status" class="search-status"></div>
       </div>
       <div class="conversation-items" id="conversation-items">
@@ -550,6 +628,10 @@
       <div id="thread-content" style="display: none; flex-direction: column; height: 100%;">
         <div class="thread-header">
           <span class="thread-pubkey" id="thread-pubkey"></span>
+          <div class="reply-state">
+            <button type="button" id="no-reply-btn" style="display:none;" onclick="markNoReplyNeeded()">No reply needed</button>
+            <span id="no-reply-done" style="display:none;">Marked no reply needed · <button type="button" class="link-btn" onclick="undoNoReplyNeeded()">Undo</button></span>
+          </div>
         </div>
         <div class="thread-messages" id="thread-messages">
           <div class="loading-state" id="thread-loading" style="display: none;">
@@ -578,6 +660,17 @@
 
   <script>
     let selectedPubkey = null;
+    // Conversation whose No reply needed mark was set in this page session, so
+    // Undo survives a reload of reply state while the mark is still active.
+    let markedPubkey = null;
+    // The thread last rendered and its newest message id. No reply needed sends
+    // that id so the mark can't cover a message the sync logged after the
+    // thread loaded: the open thread does not refresh itself.
+    let threadSeen = null;
+    // Row-only and header reads share a generation per conversation. A late
+    // response must not undo a newer action's waiting flag or paging offset.
+    const replyStateGenerations = new Map();
+    const waitingActions = new Set();
     let conversations = [];
     let profileCache = {};
 
@@ -596,6 +689,27 @@
     // A load-more (append) page failed. Surfaced as an inline retry row at the
     // list bottom so a failed page isn't mistaken for the end of history (#207).
     let conversationsError = false;
+    // A Waiting page must be retried if a local state change moves its boundary
+    // while the request is in flight; its server snapshot can be from either side.
+    let waitingListGeneration = 0;
+    let waitingListNeedsRefresh = false;
+
+    // Filter chips. Keys match the server's ?filter= values; '' is All and sends
+    // no param. Tooltips are the agreed T&S copy.
+    const FILTER_CHIPS = [
+      { key: '', label: 'All', tip: 'Every conversation.' },
+      { key: 'waiting', label: 'Waiting on us', tip: "Someone typed to us in the last 30 days and nobody on the team has replied since. Our automatic messages don't count as a reply. Messages from before 13 August aren't counted." },
+      { key: 'person', label: 'A person wrote', tip: 'Everyone who has typed to us since 13 August, answered or not. For the ones that need a reply, use Waiting on us.' },
+      { key: 'reports', label: 'Reports', tip: 'Has at least one automatic report from the app.' },
+      { key: 'notices', label: 'Notices', tip: 'Has at least one moderation notice we sent.' },
+      { key: 'outcomes', label: 'Outcomes', tip: 'Has at least one report outcome we sent.' },
+      { key: 'warnings', label: 'Warnings', tip: 'Has at least one community warning we sent.' },
+    ];
+    const FILTER_STORAGE_KEY = 'messagesFilter';
+    let activeFilter = '';
+    let filterCounts = null;
+    // Drops an out-of-order counts response (several refresh triggers can overlap).
+    let filterCountsGen = 0;
     // Invalidates an in-flight identifier lookup when the moderator searches
     // again, keeps typing, or opens a different conversation.
     let conversationSearchGen = 0;
@@ -788,6 +902,228 @@
       filterConversations(value);
     }
 
+    // --- Filter chips ---
+
+    function restoreFilter() {
+      try {
+        // Per tab: a new tab, or a followed link, starts on All (the default).
+        const saved = sessionStorage.getItem(FILTER_STORAGE_KEY);
+        if (FILTER_CHIPS.some(c => c.key === saved)) return saved;
+      } catch (e) {
+        // storage blocked; fall through to All
+      }
+      return '';
+    }
+
+    function renderFilterChips() {
+      const el = document.getElementById('filter-chips');
+      if (!el) return;
+      el.innerHTML = FILTER_CHIPS.map(c => {
+        const n = filterCounts && typeof filterCounts[c.key || 'all'] === 'number'
+          ? ' (' + filterCounts[c.key || 'all'] + ')' : '';
+        return '<button type="button" class="filter-chip' + (c.key === activeFilter ? ' active' : '') + '"'
+          + ' title="' + escapeHtml(c.tip) + '"'
+          + ' onclick="setFilter(\'' + c.key + '\')">' + escapeHtml(c.label + n) + '</button>';
+      }).join('');
+    }
+
+    function setFilter(key) {
+      if (key === activeFilter) return;
+      activeFilter = key;
+      try { sessionStorage.setItem(FILTER_STORAGE_KEY, key); } catch (e) { /* non-fatal */ }
+      renderFilterChips();
+      // Drop the old chip's rows so they don't sit under the new chip while the
+      // fresh load (which resets paging and supersedes anything in flight) runs.
+      conversations = [];
+      document.getElementById('conversation-items').innerHTML =
+        '<div class="loading-state" id="conv-loading"><div class="spinner"></div><span>Loading conversations...</span></div>';
+      // The inbox sync logs messages every five minutes, so counts from page
+      // load can be stale; refresh them with the list so the chip agrees with
+      // what it opens.
+      fetchFilterCounts();
+      fetchConversations().then(() => maybeAutoFillConversations());
+    }
+
+    async function fetchFilterCounts() {
+      const gen = ++filterCountsGen;
+      try {
+        const res = await fetch('/admin/api/messages/counts');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (gen !== filterCountsGen) return;
+        filterCounts = data;
+        renderFilterChips();
+      } catch (err) {
+        console.error('fetchFilterCounts error:', err);
+      }
+    }
+
+    // --- Reply state (shared "No reply needed" mark) ---
+
+    function beginWaitingAction() {
+      let complete;
+      const pending = new Promise(resolve => { complete = resolve; });
+      waitingActions.add(pending);
+      return () => {
+        waitingActions.delete(pending);
+        complete();
+      };
+    }
+
+    async function waitForWaitingActions() {
+      while (waitingActions.size) await Promise.all(waitingActions);
+    }
+
+    function showReplyState({ waiting, marked }) {
+      document.getElementById('no-reply-btn').style.display = waiting ? '' : 'none';
+      // Live only once the open thread has rendered: a click before then would
+      // send seen_through_id 0 and the mark couldn't take. loadThread enables it.
+      document.getElementById('no-reply-btn').disabled = !(threadSeen && threadSeen.pubkey === selectedPubkey);
+      document.getElementById('no-reply-done').style.display = marked ? '' : 'none';
+    }
+
+    // Keep the loaded row in step with the server's waiting state so the Waiting
+    // on us list can grey a handled row. Grey itself is derived at render time.
+    function setConversationWaiting(pubkey, waiting) {
+      const conv = conversations.find(c => (c.participant_pubkey || c.pubkey) === pubkey);
+      if (!conv) {
+        // Not loaded, but it may sit inside the Waiting page being fetched (the
+        // open thread just after a chip switch, or one opened from search), so
+        // make that page retry. Its position is unknown, so the offset stays.
+        if (activeFilter === 'waiting') waitingListGeneration++;
+        return;
+      }
+      const was = conv.waiting !== false; // a loaded row with no flag came from the Waiting set
+      const now = Boolean(waiting);
+      conv.waiting = now;
+      // Only Waiting on us depends on the flag: its set and paging, and the grey.
+      // Every thread open reads state, so skip the full re-render otherwise.
+      if (activeFilter !== 'waiting' || was === now) return;
+      // The server's Waiting set shrinks when a row is handled, so the next page
+      // starts one earlier (and one later again if Undo makes it wait).
+      waitingListGeneration++;
+      conversationsOffset = Math.max(0, conversationsOffset + (now ? 1 : -1));
+      renderConversations();
+    }
+
+    function invalidateReplyState(pubkey) {
+      const gen = (replyStateGenerations.get(pubkey) || 0) + 1;
+      replyStateGenerations.set(pubkey, gen);
+      return gen;
+    }
+
+    async function fetchReplyState(pubkey) {
+      const gen = invalidateReplyState(pubkey);
+      const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
+      if (!res.ok) throw new Error('Failed to load conversation state');
+      const data = await res.json();
+      return replyStateGenerations.get(pubkey) === gen ? data : null;
+    }
+
+    // Row-only refresh for a thread that is not (or no longer) open: never
+    // touches the header, which belongs to the open thread.
+    async function refreshRowWaiting(pubkey) {
+      const finishWaitingAction = beginWaitingAction();
+      try {
+        const data = await fetchReplyState(pubkey);
+        if (!data) return;
+        setConversationWaiting(pubkey, Boolean(data.waiting));
+      } catch (err) {
+        waitingListNeedsRefresh = true;
+        console.error('refreshRowWaiting error:', err); // the next refresh corrects the row
+      } finally {
+        finishWaitingAction();
+      }
+    }
+
+    async function loadReplyState(pubkey) {
+      if (selectedPubkey !== pubkey) return; // moderator moved on; leave the open thread's header alone
+      showReplyState({ waiting: false, marked: false });
+      const finishWaitingAction = beginWaitingAction();
+      try {
+        const data = await fetchReplyState(pubkey);
+        if (!data) return;
+        const waiting = Boolean(data.waiting);
+        // The row belongs to pubkey whether or not it is still open; only the
+        // header must stay untouched once the moderator has moved on.
+        if (selectedPubkey !== pubkey) { setConversationWaiting(pubkey, waiting); return; }
+        const marked = markedPubkey === pubkey && data.no_reply_needed_at != null && !waiting;
+        showReplyState({ waiting, marked });
+        setConversationWaiting(pubkey, waiting);
+      } catch (err) {
+        waitingListNeedsRefresh = true;
+        console.error('loadReplyState error:', err);
+      } finally {
+        finishWaitingAction();
+      }
+    }
+
+    async function markNoReplyNeeded() {
+      const target = selectedPubkey;
+      if (!target) return;
+      document.getElementById('no-reply-btn').disabled = true;
+      const finishWaitingAction = beginWaitingAction();
+      // Mark only through what this thread showed; 0 if it never rendered.
+      const seenThroughId = threadSeen && threadSeen.pubkey === target ? threadSeen.maxId : 0;
+      try {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ seen_through_id: seenThroughId }),
+        });
+        if (!res.ok) throw new Error('Failed to mark no reply needed');
+        const data = await res.json();
+        invalidateReplyState(target);
+        fetchFilterCounts();
+        // Still waiting means the person wrote after the thread loaded.
+        const waiting = Boolean(data.waiting);
+        setConversationWaiting(target, waiting);
+        if (selectedPubkey !== target) return;
+        if (waiting) {
+          showReplyState({ waiting: true, marked: false });
+          loadThread(target); // show the message the mark left waiting
+          return;
+        }
+        markedPubkey = target;
+        showReplyState({ waiting: false, marked: true });
+      } catch (err) {
+        waitingListNeedsRefresh = true;
+        // Same gate as showReplyState: live only once the open thread has rendered.
+        if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = !(threadSeen && threadSeen.pubkey === selectedPubkey);
+        alert('Failed to mark no reply needed: ' + err.message);
+        console.error('markNoReplyNeeded error:', err);
+      } finally {
+        finishWaitingAction();
+      }
+    }
+
+    async function undoNoReplyNeeded() {
+      const target = selectedPubkey;
+      if (!target) return;
+      const finishWaitingAction = beginWaitingAction();
+      try {
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'DELETE' });
+        if (!res.ok) throw new Error('Failed to undo');
+        invalidateReplyState(target);
+        if (markedPubkey === target) markedPubkey = null;
+        fetchFilterCounts();
+        if (selectedPubkey !== target) {
+          // Thread not open, so no reload below will run. Undo only restores
+          // waiting if the person's message is still newer than any reply, so
+          // ask the server rather than assuming.
+          await refreshRowWaiting(target);
+          return;
+        }
+        await loadReplyState(target);
+      } catch (err) {
+        waitingListNeedsRefresh = true;
+        alert('Failed to undo: ' + err.message);
+        console.error('undoNoReplyNeeded error:', err);
+      } finally {
+        finishWaitingAction();
+      }
+    }
+
     // --- Fetch conversations ---
 
     async function fetchConversations({ append = false } = {}) {
@@ -797,7 +1133,6 @@
       // Fresh load (initial paint or a refresh) resets pagination back to the
       // first page; append keeps walking backward from where we left off.
       if (!append) {
-        conversationsOffset = 0;
         conversationsHasMore = true;
         conversationsError = false; // a fresh load starts clean
         // The first successful render replaces the list's innerHTML, which
@@ -806,23 +1141,52 @@
         if (loading) loading.style.display = 'flex';
       }
       // A fresh load supersedes anything in flight; an append rides the current
-      // generation and bails after its await if a fresh load bumped it. The
-      // offset in the URL below is read synchronously (no await before it), so
-      // each invocation fetches the page it intended.
+      // generation and bails after its await if a fresh load bumped it.
+      // A Waiting request may pause for a local action below; it rechecks this
+      // generation and reads the corrected offset after that action settles.
       const gen = append ? conversationsGen : ++conversationsGen;
       conversationsLoading = true;
 
       try {
-        const res = await fetch('/admin/api/messages?limit=' + CONVERSATIONS_PAGE_SIZE + '&offset=' + conversationsOffset);
+        // A local write can reach D1 before its response or state refresh
+        // reaches this page. Wait for that whole action before using an offset.
+        if (activeFilter === 'waiting' && waitingActions.size) await waitForWaitingActions();
+        if (gen !== conversationsGen) return;
+        // A pending Undo may have moved the old list's offset while we waited.
+        // A fresh request always starts at zero, after that action has settled.
+        if (!append) conversationsOffset = 0;
+        if (activeFilter === 'waiting' && waitingListNeedsRefresh) {
+          waitingListNeedsRefresh = false;
+          return await fetchConversations();
+        }
+        const waitingGen = waitingListGeneration;
+        // The filter is read synchronously with the offset; a chip switch bumps
+        // conversationsGen (fresh load), so a slow response for the old chip is
+        // discarded below and can't paint over the new one.
+        const res = await fetch('/admin/api/messages?limit=' + CONVERSATIONS_PAGE_SIZE + '&offset=' + conversationsOffset
+          + (activeFilter ? '&filter=' + encodeURIComponent(activeFilter) : ''));
         if (!res.ok) throw new Error('Failed to fetch conversations');
         const data = await res.json();
+        if (activeFilter === 'waiting' && waitingActions.size) await waitForWaitingActions();
         if (gen !== conversationsGen) return; // superseded by a fresh load — discard
+        if (activeFilter === 'waiting' && waitingListNeedsRefresh) {
+          waitingListNeedsRefresh = false;
+          return await fetchConversations();
+        }
+        if (activeFilter === 'waiting' && waitingGen !== waitingListGeneration) {
+          // A mark, Undo or reply changed the Waiting set after this request
+          // began. Retry at the corrected offset instead of guessing whether
+          // the server took its snapshot before or after that change.
+          return await fetchConversations({ append });
+        }
         const page = data.conversations || data || [];
 
         // Dedupe on append: offset paging over an activity-ordered list can
         // re-surface a row that moved up between page fetches.
         conversations = append ? dedupeConversations(conversations.concat(page)) : page;
-        conversationsOffset += page.length;
+        // A fresh page sets the offset outright: a waiting change that landed
+        // mid-fetch adjusted the replaced list's offset and must not carry over.
+        conversationsOffset = append ? conversationsOffset + page.length : page.length;
         conversationsError = false; // a page came back — clear any prior retry row
         // A short page means the server has no more rows past this point.
         conversationsHasMore = page.length === CONVERSATIONS_PAGE_SIZE;
@@ -910,7 +1274,8 @@
       const preserveScroll = !currentConversationSearch().trim();
 
       if (!list.length) {
-        container.innerHTML = '<div class="empty-state">No conversations yet</div>';
+        container.innerHTML = '<div class="empty-state">'
+          + (activeFilter ? 'No conversations match this filter.' : 'No conversations yet') + '</div>';
         // Unreachable today (a pending append error implies a non-empty
         // unfiltered list), but keep the retry row reachable if that invariant
         // ever changes — otherwise a failure could silently look like the end.
@@ -920,14 +1285,18 @@
 
       container.innerHTML = list.map(conv => {
         const pubkey = conv.participant_pubkey || conv.pubkey || '';
-        const preview = (conv.latest_message || conv.preview || '').slice(0, 80);
-        const ts = conv.last_message_at || conv.updated_at || conv.created_at;
-        const msgType = conv.message_type || conv.latest_message_type || '';
+        // On the people chips, show what the person typed, not a later automated notice.
+        const showTyped = (activeFilter === 'waiting' || activeFilter === 'person') && conv.last_typed_message != null;
+        const preview = (showTyped ? conv.last_typed_message : (conv.latest_message || conv.preview || '')).slice(0, 80);
+        const ts = showTyped ? conv.last_typed_at : (conv.last_message_at || conv.updated_at || conv.created_at);
+        const msgType = showTyped ? 'creator_reply' : (conv.message_type || conv.latest_message_type || '');
+        // Derived, never stored: only Waiting on us greys a row that has been handled.
+        const handled = activeFilter === 'waiting' && conv.waiting === false;
         const unread = Boolean(conv.unread);
         const isActive = pubkey === selectedPubkey;
 
         return `
-          <div class="conversation-item ${isActive ? 'active' : ''}" onclick="selectConversation('${pubkey}')">
+          <div class="conversation-item ${isActive ? 'active' : ''}${handled ? ' handled' : ''}"${handled ? ' title="No longer waiting on us"' : ''} onclick="selectConversation('${pubkey}')">
             <div class="pubkey">
               ${unread ? '<span class="unread-dot"></span>' : ''}
               ${avatarHtml(pubkey)}
@@ -992,6 +1361,7 @@
         const searchStatus = document.getElementById('search-status');
         if (searchStatus) searchStatus.textContent = '';
       }
+      if (markedPubkey !== pubkey) markedPubkey = null;
       selectedPubkey = pubkey;
 
       // Optimistically clear the unread dot for this row, then tell the
@@ -1030,6 +1400,7 @@
       document.getElementById('compose-input').value = '';
       document.getElementById('compose-sha256').value = '';
 
+      loadReplyState(pubkey);
       await loadThread(pubkey);
     }
 
@@ -1041,15 +1412,23 @@
       Array.from(container.children).forEach(child => {
         if (child.id !== 'thread-loading') child.remove();
       });
+      threadSeen = null; // nothing is on screen until the new thread renders
+      document.getElementById('no-reply-btn').disabled = true; // re-enabled once it renders
 
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey));
         if (!res.ok) throw new Error('Failed to load thread');
         const data = await res.json();
+        // The moderator opened another thread meanwhile: its own load owns the
+        // view, so don't render this one under its header or touch threadSeen.
+        if (pubkey !== selectedPubkey) return;
         const messages = data.messages || data || [];
         loading.style.display = 'none';
         renderThread(messages);
+        threadSeen = { pubkey, maxId: messages.reduce((max, msg) => Math.max(max, Number(msg.id) || 0), 0) };
+        if (pubkey === selectedPubkey) document.getElementById('no-reply-btn').disabled = false;
       } catch (err) {
+        if (pubkey !== selectedPubkey) return; // a thread the moderator has left
         loading.style.display = 'none';
         container.innerHTML += '<div class="empty-state">Failed to load messages</div>';
         console.error('loadThread error:', err);
@@ -1166,6 +1545,7 @@
       sha256Input.value = '';
       sendBtn.disabled = true;
 
+      const finishWaitingAction = beginWaitingAction();
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(targetPubkey), {
           method: 'POST',
@@ -1187,7 +1567,13 @@
           const meta = pendingBubble.querySelector('.bubble-meta');
           if (meta) meta.innerHTML = '<span>' + relativeTime(new Date().toISOString()) + '</span>';
         }
+        // Our reply changes who is waiting: refresh the counts and, if this
+        // thread is still open, its button; otherwise just the replied-to row.
+        fetchFilterCounts();
+        if (selectedPubkey === targetPubkey) await loadReplyState(targetPubkey);
+        else await refreshRowWaiting(targetPubkey);
       } catch (err) {
+        waitingListNeedsRefresh = true;
         // Revert: remove the optimistic bubble if still present, and restore the
         // typed text only if we're still on the same thread (the composer is a
         // single shared element — don't dump this thread's text into another).
@@ -1205,6 +1591,7 @@
         alert('Failed to send message: ' + err.message);
         console.error('sendMessage error:', err);
       } finally {
+        finishWaitingAction();
         sendBtn.disabled = false;
         input.focus();
       }
@@ -1219,9 +1606,11 @@
       } catch (e) {
         // sync endpoint may not exist yet; ignore
       }
+      fetchFilterCounts();
       await fetchConversations();
       maybeAutoFillConversations();
       if (selectedPubkey) {
+        loadReplyState(selectedPubkey);
         await loadThread(selectedPubkey);
       }
     }
@@ -1334,6 +1723,10 @@
       const urlParams = new URLSearchParams(window.location.search);
       const preselectedPubkey = urlParams.get('pubkey');
 
+      // A followed ?pubkey= link opens on All so the linked conversation is listed.
+      activeFilter = preselectedPubkey ? '' : restoreFilter();
+      renderFilterChips();
+      fetchFilterCounts();
       await fetchConversations();
       maybeAutoFillConversations();
       loadTemplates();

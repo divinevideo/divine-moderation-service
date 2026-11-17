@@ -206,6 +206,21 @@ function jsonResponse(status, data, headers = {}) {
   });
 }
 
+// Resolve /admin/api/messages/{pubkey}/{action} (split on '/') to the
+// moderator's conversation with that pubkey, for the per-conversation admin
+// routes. Returns { conversationId }, or { error } holding the response to
+// send: 400 for a malformed pubkey, 500 when no signing key is configured.
+async function resolveMessagesConversation(parts, env) {
+  if (parts.length !== 6 || !isValidPubkey(parts[4])) {
+    return { error: jsonError('Valid pubkey (64-char hex) required', 400) };
+  }
+  const { computeConversationId } = await import('./nostr/dm-store.mjs');
+  const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+  const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
+  if (!moderatorPubkey) return { error: jsonError('Moderator signing key not configured', 500) };
+  return { conversationId: computeConversationId(moderatorPubkey, parts[4].toLowerCase()) };
+}
+
 function corsResponse(response) {
   const headers = new Headers(response.headers);
   headers.set('Access-Control-Allow-Origin', '*');
@@ -4054,19 +4069,90 @@ async function runMigration() {
 
       const limit = parseInt(url.searchParams.get('limit') || '20');
       const offset = parseInt(url.searchParams.get('offset') || '0');
-      const { getConversations, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
+      const { getConversations, initDmStateTables, CONVERSATION_FILTERS } = await import('./nostr/dm-store.mjs');
       const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
-      // getConversations LEFT JOINs dm_conversation_read_state for the unread
-      // flag. Ensure it here rather than relying on migration 012 having been
-      // applied: the deploy job runs on merge, `d1 migrations apply` does not.
-      await initDmReadStateTable(env.BLOSSOM_DB);
+      // Absent or empty filter means All (undefined); anything else must be a
+      // known key. getConversations throws on unknown values, so reject here.
+      const filterParam = url.searchParams.get('filter');
+      const filter = filterParam === null || filterParam === '' ? undefined : filterParam;
+      if (filter !== undefined && !CONVERSATION_FILTERS.includes(filter)) {
+        return new Response(JSON.stringify({ error: 'Unknown filter', allowed: CONVERSATION_FILTERS }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      // getConversations LEFT JOINs dm_conversation_read_state (unread flag)
+      // and dm_conversation_reply_state (No reply needed mark). Ensure both
+      // here rather than relying on the migrations having been applied: the
+      // deploy job runs on merge, `d1 migrations apply` does not.
+      // One batch, so a list page pays one round trip for both.
+      await initDmStateTables(env.BLOSSOM_DB);
       // Pass moderatorPubkey so rows are augmented with participant_pubkey
       // (the non-moderator side) + latest_message/message_type aliases that
       // the admin messages UI expects. Without this, every conversation
       // renders as "(unknown)" because the raw column names don't match.
       const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
-      const conversations = await getConversations(env.BLOSSOM_DB, { limit, offset, moderatorPubkey });
+      const conversations = await getConversations(env.BLOSSOM_DB, { limit, offset, moderatorPubkey, filter });
       return new Response(JSON.stringify(conversations), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin API: Filter chip counts. Must stay above the thread route below:
+    // that route matches any five-segment GET without validating the segment,
+    // so /counts would be served as an empty thread.
+    if (url.pathname === '/admin/api/messages/counts' && request.method === 'GET') {
+      const authError = await requireAuth(request, env);
+      if (authError) return authError;
+
+      const { getFilterCounts, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
+      // Counts use the same flags as the list; those read only the reply-state table.
+      await initDmReplyStateTable(env.BLOSSOM_DB);
+      const counts = await getFilterCounts(env.BLOSSOM_DB);
+      return new Response(JSON.stringify(counts), { headers: { 'Content-Type': 'application/json' } });
+    }
+
+    // Admin API: Per-conversation state ("Waiting on us" flag + "No reply
+    // needed" mark) and the shared mark toggle. Six segments, so these cannot
+    // collide with the five-segment thread GET/reply POST; the final segment
+    // keeps them distinct from each other and from /read.
+    {
+      const stateParts = url.pathname.split('/');
+      const stateAction = stateParts.length === 6 && url.pathname.startsWith('/admin/api/messages/')
+        ? stateParts[5] : null;
+      const isState = stateAction === 'state' && request.method === 'GET';
+      const isNoReply = stateAction === 'no-reply-needed' && (request.method === 'POST' || request.method === 'DELETE');
+      if (isState || isNoReply) {
+        const authError = await requireAuth(request, env);
+        if (authError) return authError;
+
+        const resolved = await resolveMessagesConversation(stateParts, env);
+        if (resolved.error) return resolved.error;
+        const { conversationId } = resolved;
+        // The admin page sends the newest message id its open thread showed, so
+        // the mark can't cover a message logged after the thread was loaded.
+        // Optional: without it the mark is as of now.
+        let seenThroughId;
+        if (request.method === 'POST') {
+          // No body means no id. A body that isn't a JSON object is rejected
+          // rather than read as "no id", which would quietly mark as of now.
+          const text = await request.text();
+          let body = null;
+          if (text.trim()) {
+            try { body = JSON.parse(text); } catch { body = undefined; }
+            if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+              return jsonError('Body must be a JSON object', 400);
+            }
+          }
+          if (body && body.seen_through_id !== undefined) {
+            if (!Number.isSafeInteger(body.seen_through_id) || body.seen_through_id < 0) {
+              return jsonError('seen_through_id must be a non-negative integer', 400);
+            }
+            seenThroughId = body.seen_through_id;
+          }
+        }
+        const { getConversationState, markNoReplyNeeded, clearNoReplyNeeded, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
+        await initDmReplyStateTable(env.BLOSSOM_DB);
+        if (request.method === 'POST') await markNoReplyNeeded(env.BLOSSOM_DB, conversationId, { seenThroughId });
+        if (request.method === 'DELETE') await clearNoReplyNeeded(env.BLOSSOM_DB, conversationId);
+        const state = await getConversationState(env.BLOSSOM_DB, conversationId);
+        return jsonResponse(200, isNoReply ? { success: true, ...state } : state);
+      }
     }
 
     // Admin API: Get full DM thread by pubkey
@@ -4113,21 +4199,12 @@ async function runMigration() {
       const authError = await requireAuth(request, env);
       if (authError) return authError;
 
-      const parts = url.pathname.split('/');
-      if (parts.length !== 6 || !isValidPubkey(parts[4])) {
-        return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-      }
-      const pubkey = parts[4].toLowerCase();
-      const { computeConversationId, markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
-      const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
-      const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
-      if (!moderatorPubkey) {
-        return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-      }
+      const resolved = await resolveMessagesConversation(url.pathname.split('/'), env);
+      if (resolved.error) return resolved.error;
+      const { markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
       await initDmReadStateTable(env.BLOSSOM_DB);
-      const conversationId = computeConversationId(moderatorPubkey, pubkey);
-      await markConversationRead(env.BLOSSOM_DB, conversationId);
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      await markConversationRead(env.BLOSSOM_DB, resolved.conversationId);
+      return jsonResponse(200, { success: true });
     }
 
     // Admin API: Resolve a recipient (hex / npub / verified nip-05) to a hex pubkey.
@@ -5616,8 +5693,8 @@ async function runMigration() {
           const dayMs = 24 * 60 * 60 * 1000;
           if (Date.now() - last >= dayMs) {
             const { pruneExpiredDmLog } = await import('./nostr/dm-store.mjs');
-            const { deletedMessages, deletedReadStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
-            console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s)`);
+            const { deletedMessages, deletedReadStates, deletedReplyStates } = await pruneExpiredDmLog(env.BLOSSOM_DB);
+            console.log(`[DM-RETENTION] Pruned ${deletedMessages} dm_log row(s), ${deletedReadStates} orphaned read-state row(s), ${deletedReplyStates} orphaned reply-state row(s)`);
             // private_report_intake follows the same one-year decision: it pairs
             // a reporter with the account they reported, as the report's
             // dm_log row does. Only delivered and rejected rows go; a pending

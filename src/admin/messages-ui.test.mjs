@@ -13,13 +13,15 @@ function extractFunction(src, name) {
   const start = src.indexOf('function ' + name + '(');
   if (start === -1) throw new Error('function not found: ' + name);
   let depth = 0;
-  let i = src.indexOf('{', start);
+  // Start at the body's brace, not a destructured parameter's ({ a = 1 } = {}).
+  let i = src.indexOf(') {', start) + 2;
   for (; i < src.length; i++) {
     if (src[i] === '{') depth++;
     else if (src[i] === '}' && --depth === 0) { i++; break; }
   }
+  const isAsync = src.slice(Math.max(0, start - 6), start) === 'async ';
   // eslint-disable-next-line no-new-func
-  return new Function('return (' + src.slice(start, i) + ')')();
+  return new Function('return (' + (isAsync ? 'async ' : '') + src.slice(start, i) + ')')();
 }
 
 describe('messages UI — new message compose hooks', () => {
@@ -304,7 +306,7 @@ describe('messages UI — failed load-more recovery (#207)', () => {
     // Not a tautology: pin each clear to its own branch so deleting either one
     // fails this test even though the literal appears elsewhere.
     expect(messagesHTML).toMatch(/conversationsHasMore = true;\s*\n\s*conversationsError = false;/);
-    expect(messagesHTML).toMatch(/conversationsOffset \+= page\.length;\s*\n\s*conversationsError = false;/);
+    expect(messagesHTML).toMatch(/conversationsOffset = append \? conversationsOffset \+ page\.length : page\.length;\s*\n\s*conversationsError = false;/);
   });
 });
 
@@ -374,4 +376,959 @@ describe('messages UI — reporter-included message', () => {
   it('keeps the excerpt\'s own line breaks', () => {
     expect(messagesHTML).toMatch(/\.unverified-excerpt-text\s*\{[^}]*white-space:\s*pre-wrap/);
   });
+});
+
+// Slice a function's source (sync or async) up to its closing brace at the
+// page's 4-space indent.
+function sliceFn(prefix) {
+  const start = messagesHTML.indexOf(prefix);
+  if (start === -1) throw new Error('function not found: ' + prefix);
+  return messagesHTML.slice(start, messagesHTML.indexOf('\n    }\n', start) + 6);
+}
+
+describe('messages UI — filter chips and No reply needed', () => {
+  it('FILTER_CHIPS lists the seven chips in order with these labels', () => {
+    const m = messagesHTML.match(/const FILTER_CHIPS = \[([\s\S]*?)\n    \];/);
+    expect(m).not.toBeNull();
+    const chips = [...m[1].matchAll(/key: '([a-z]*)', label: '([^']*)'/g)].map(x => [x[1], x[2]]);
+    expect(chips).toEqual([
+      ['', 'All'],
+      ['waiting', 'Waiting on us'],
+      ['person', 'A person wrote'],
+      ['reports', 'Reports'],
+      ['notices', 'Notices'],
+      ['outcomes', 'Outcomes'],
+      ['warnings', 'Warnings'],
+    ]);
+  });
+
+  it('chip tooltips carry the agreed copy', () => {
+    for (const copy of [
+      "Someone typed to us in the last 30 days and nobody on the team has replied since. Our automatic messages don't count as a reply. Messages from before 13 August aren't counted.",
+      'Everyone who has typed to us since 13 August, answered or not. For the ones that need a reply, use Waiting on us.',
+      'Has at least one automatic report from the app.',
+      'Has at least one moderation notice we sent.',
+      'Has at least one report outcome we sent.',
+      'Has at least one community warning we sent.',
+    ]) {
+      expect(messagesHTML).toContain(copy);
+    }
+  });
+
+  it('fetchConversations sends the active filter, and nothing for All', () => {
+    expect(messagesHTML).toContain("'&filter=' + encodeURIComponent(activeFilter)");
+    expect(messagesHTML).toMatch(/activeFilter \? '&filter=' \+ encodeURIComponent\(activeFilter\) : ''/);
+  });
+
+  it('setFilter starts a fresh load and ignores re-selecting the active chip', () => {
+    const fn = sliceFn('function setFilter(');
+    expect(fn).toMatch(/if \(key === activeFilter\) return;/);
+    expect(fn).toContain('fetchConversations()');
+    expect(fn).not.toContain('append');
+    expect(fn).toContain('maybeAutoFillConversations()');
+  });
+
+  it('restoreFilter falls back to All for an unknown key or a throwing store', () => {
+    const FILTER_CHIPS = [{ key: '' }, { key: 'waiting' }, { key: 'person' }];
+    const text = sliceFn('function restoreFilter(');
+    // Per tab (sessionStorage), so a new tab or a followed link starts on All.
+    const make = (ls) => new Function('FILTER_CHIPS', 'FILTER_STORAGE_KEY', 'sessionStorage', 'localStorage', 'return (' + text + ')')(FILTER_CHIPS, 'k', ls, { getItem: () => 'waiting' });
+    expect(make({ getItem: () => 'bogus' })()).toBe('');
+    expect(make({ getItem: () => { throw new Error('blocked'); } })()).toBe('');
+    expect(make({ getItem: () => 'waiting' })()).toBe('waiting');
+    expect(make({ getItem: () => null })()).toBe('');
+  });
+
+  it('reply-state handlers drop stale responses', () => {
+    for (const name of ['loadReplyState', 'markNoReplyNeeded', 'undoNoReplyNeeded']) {
+      const fn = sliceFn('async function ' + name + '(');
+      expect(fn, name).toMatch(/selectedPubkey !== (pubkey|target)/);
+    }
+  });
+
+  it('counts refresh after refresh, send and no-reply changes', () => {
+    for (const name of ['refreshAll', 'sendMessage', 'markNoReplyNeeded', 'undoNoReplyNeeded']) {
+      expect(sliceFn('async function ' + name + '('), name).toContain('fetchFilterCounts()');
+    }
+  });
+
+  it('switching chips refreshes the counts along with the list', () => {
+    let counts = 0;
+    let lists = 0;
+    let stored;
+    const setFilter = new Function('return (' + sliceFn('function setFilter(') + ')')();
+    const saved = {};
+    const stubs = {
+      activeFilter: '', sessionStorage: { setItem: (k, v) => { stored = v; } }, renderFilterChips() {}, conversations: [],
+      document: { getElementById: () => ({ innerHTML: '' }) },
+      fetchFilterCounts: () => { counts++; },
+      fetchConversations: () => { lists++; return Promise.resolve(); },
+      maybeAutoFillConversations() {}, FILTER_STORAGE_KEY: 'k',
+    };
+    for (const [k, v] of Object.entries(stubs)) { saved[k] = globalThis[k]; globalThis[k] = v; }
+    try {
+      setFilter('waiting');
+      expect([counts, lists]).toEqual([1, 1]);
+      expect(stored).toBe('waiting'); // remembered for this tab only
+      setFilter('waiting'); // re-selecting the active chip does nothing
+      expect([counts, lists]).toEqual([1, 1]);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete globalThis[k]; else globalThis[k] = v; }
+    }
+  });
+
+  it('the thread header has the No reply needed button and undo copy', () => {
+    expect(messagesHTML).toContain('id="no-reply-btn"');
+    expect(messagesHTML).toContain('No reply needed');
+    expect(messagesHTML).toContain('Marked no reply needed');
+    expect(messagesHTML).toContain('Undo');
+    expect(messagesHTML).toContain('No conversations match this filter.');
+  });
+
+  it('init restores the saved filter before the first load', () => {
+    const init = messagesHTML.slice(messagesHTML.indexOf('async function init()'));
+    expect(init.indexOf('restoreFilter()')).toBeGreaterThan(-1);
+    expect(init.indexOf('restoreFilter()')).toBeLessThan(init.indexOf('fetchConversations()'));
+    // A followed ?pubkey= link opens on All, so the linked conversation is in the list.
+    expect(init).toMatch(/activeFilter = preselectedPubkey \? '' : restoreFilter\(\);/);
+    expect(init).toContain('fetchFilterCounts()');
+  });
+});
+
+describe('messages UI — reply state behavior', () => {
+  const saved = {};
+  function setup({ selected, marked, state }) {
+    const calls = [];
+    for (const k of ['selectedPubkey', 'markedPubkey', 'showReplyState', 'setConversationWaiting', 'fetch', 'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingActions', 'beginWaitingAction', 'waitingListNeedsRefresh']) saved[k] = globalThis[k];
+    globalThis.selectedPubkey = selected;
+    globalThis.markedPubkey = marked;
+    globalThis.showReplyState = (arg) => calls.push(arg);
+    globalThis.setConversationWaiting = () => {};
+    globalThis.fetch = async () => ({ ok: true, json: async () => state });
+    globalThis.replyStateGenerations = new Map();
+    globalThis.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
+    globalThis.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
+    globalThis.waitingActions = new Set();
+    globalThis.beginWaitingAction = extractFunction(messagesHTML, 'beginWaitingAction');
+    return { calls, loadReplyState: extractFunction(messagesHTML, 'loadReplyState') };
+  }
+  function restore() {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete globalThis[k]; else globalThis[k] = saved[k];
+    }
+  }
+
+  it('does not touch the header when another conversation is open', async () => {
+    const { calls, loadReplyState } = setup({ selected: 'B', marked: null, state: { waiting: true } });
+    try {
+      await loadReplyState('A');
+      expect(calls).toEqual([]);
+    } finally { restore(); }
+  });
+
+  it('keeps Undo visible on reload while the mark is active', async () => {
+    const { calls, loadReplyState } = setup({
+      selected: 'A', marked: 'A', state: { waiting: false, no_reply_needed_at: '2026-11-16T00:00:00Z' },
+    });
+    try {
+      await loadReplyState('A');
+      expect(calls.at(-1)).toEqual({ waiting: false, marked: true });
+    } finally { restore(); }
+  });
+
+  it('does not show Undo for a mark made on a different conversation', async () => {
+    const { calls, loadReplyState } = setup({
+      selected: 'A', marked: 'B', state: { waiting: false, no_reply_needed_at: '2026-11-16T00:00:00Z' },
+    });
+    try {
+      await loadReplyState('A');
+      expect(calls.at(-1)).toEqual({ waiting: false, marked: false });
+    } finally { restore(); }
+  });
+});
+
+describe('messages UI — handled rows and people-chip previews', () => {
+  const names = ['activeFilter', 'selectedPubkey', 'markedPubkey', 'conversations', 'showReplyState', 'renderConversations',
+    'fetchFilterCounts', 'fetch', 'alert', 'document', 'currentConversationSearch', 'avatarHtml', 'displayName',
+    'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
+    'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble',
+    'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingListGeneration', 'fetchConversations',
+    'waitingActions', 'beginWaitingAction', 'waitForWaitingActions', 'waitingListNeedsRefresh',
+    'threadSeen', 'loadThread'];
+  const saved = {};
+  function setup({ filter = '', rows = [], selected = 'A' } = {}) {
+    for (const k of names) saved[k] = globalThis[k];
+    const g = globalThis;
+    g.activeFilter = filter;
+    g.selectedPubkey = selected;
+    g.markedPubkey = null;
+    g.threadSeen = null;
+    g.loadThread = () => {};
+    g.waitingListGeneration = 0;
+    g.waitingListNeedsRefresh = false;
+    g.fetchConversations = extractFunction(messagesHTML, 'fetchConversations');
+    g.waitingActions = new Set();
+    g.beginWaitingAction = extractFunction(messagesHTML, 'beginWaitingAction');
+    g.waitForWaitingActions = extractFunction(messagesHTML, 'waitForWaitingActions');
+    g.replyStateGenerations = new Map();
+    g.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
+    g.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
+    g.conversations = rows;
+    g.showReplyState = () => {};
+    g.fetchFilterCounts = () => {};
+    g.alert = () => {};
+    g.currentConversationSearch = () => '';
+    g.avatarHtml = () => '';
+    g.displayName = (p) => p;
+    g.relativeTime = (t) => 'T:' + t;
+    g.badgeClass = () => 'b';
+    g.badgeLabel = (t) => (t === 'creator_reply' ? 'Creator Reply' : t);
+    g.escapeHtml = (t) => String(t);
+    g.appendLoadMoreError = () => {};
+    const container = { innerHTML: '', scrollTop: 0, style: {} };
+    g.document = { getElementById: () => container };
+    g.setConversationWaiting = extractFunction(messagesHTML, 'setConversationWaiting');
+    g.renderConversationList = extractFunction(messagesHTML, 'renderConversationList');
+    g.renderConversations = () => g.renderConversationList(g.conversations);
+    g.loadReplyState = extractFunction(messagesHTML, 'loadReplyState');
+    g.refreshRowWaiting = extractFunction(messagesHTML, 'refreshRowWaiting');
+    g.conversationsOffset = 10;
+    const respond = (state) => { g.fetch = async () => ({ ok: true, json: async () => state }); };
+    respond({ waiting: false });
+    return {
+      respond,
+      render: () => { g.renderConversationList(g.conversations); return container.innerHTML; },
+      markNoReplyNeeded: extractFunction(messagesHTML, 'markNoReplyNeeded'),
+      undoNoReplyNeeded: extractFunction(messagesHTML, 'undoNoReplyNeeded'),
+    };
+  }
+  function restore() {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete globalThis[k]; else globalThis[k] = saved[k];
+    }
+  }
+  const row = (over = {}) => ({
+    participant_pubkey: 'A', latest_message: 'Your video was removed', message_type: 'moderation_notice',
+    last_message_at: 'LAST', last_typed_message: 'That was a news clip', last_typed_at: 'TYPED', waiting: true, ...over,
+  });
+
+  it("people chips preview the person's latest typed message", () => {
+    for (const filter of ['waiting', 'person']) {
+      const { render } = setup({ filter, rows: [row()] });
+      try {
+        const html = render();
+        expect(html, filter).toContain('That was a news clip');
+        expect(html, filter).toContain('Creator Reply');
+        expect(html, filter).toContain('T:TYPED');
+        expect(html, filter).not.toContain('Your video was removed');
+      } finally { restore(); }
+    }
+  });
+
+  it('other chips keep the last message', () => {
+    for (const filter of ['', 'notices']) {
+      const { render } = setup({ filter, rows: [row()] });
+      try {
+        const html = render();
+        expect(html, filter).toContain('Your video was removed');
+        expect(html, filter).toContain('T:LAST');
+        expect(html, filter).not.toContain('That was a news clip');
+      } finally { restore(); }
+    }
+  });
+
+  it('falls back to the last message when last_typed_message is null', () => {
+    const { render } = setup({ filter: 'person', rows: [row({ last_typed_message: null, last_typed_at: null })] });
+    try {
+      const html = render();
+      expect(html).toContain('Your video was removed');
+      expect(html).toContain('T:LAST');
+    } finally { restore(); }
+  });
+
+  it('a row greys on Waiting on us only when it is no longer waiting', () => {
+    const cases = [['waiting', false, true], ['waiting', true, false], ['', false, false], ['person', false, false]];
+    for (const [filter, waiting, greyed] of cases) {
+      const { render } = setup({ filter, rows: [row({ waiting })] });
+      try {
+        const html = render();
+        expect(html.includes('handled'), `${filter}/${waiting}`).toBe(greyed);
+        expect(html.includes('title="No longer waiting on us"'), `${filter}/${waiting} title`).toBe(greyed);
+      } finally { restore(); }
+    }
+  });
+
+  it('mark, undo and a later waiting state flip the grey', async () => {
+    const { render, respond, markNoReplyNeeded, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      await markNoReplyNeeded();
+      expect(render()).toContain('handled');
+
+      respond({ waiting: true });
+      await undoNoReplyNeeded();
+      expect(render()).not.toContain('handled');
+
+      respond({ waiting: false });
+      await globalThis.loadReplyState('A');
+      expect(render()).toContain('handled');
+
+      respond({ waiting: true });
+      await globalThis.loadReplyState('A');
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('loadThread records the newest message id it rendered, and clears it while loading or on failure', async () => {
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const el = { style: {}, children: [], innerHTML: '' };
+      globalThis.document = { getElementById: () => el };
+      globalThis.renderThread = () => {};
+      const loadThread = extractFunction(messagesHTML, 'loadThread');
+      globalThis.selectedPubkey = 'A';
+      globalThis.threadSeen = { pubkey: 'OLD', maxId: 99 };
+      let seenWhileLoading;
+      globalThis.fetch = async () => {
+        seenWhileLoading = globalThis.threadSeen;
+        return { ok: true, json: async () => [{ id: 3 }, { id: 9 }, { id: 5 }] };
+      };
+      await loadThread('A');
+      expect(seenWhileLoading).toBe(null);
+      expect(globalThis.threadSeen).toEqual({ pubkey: 'A', maxId: 9 });
+      globalThis.fetch = async () => ({ ok: false });
+      await loadThread('A');
+      expect(globalThis.threadSeen).toBe(null);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  // Open A (slow), then B: A's late response must not render A's messages
+  // under B's header or point threadSeen at A while B's button is live.
+  it('loadThread ignores a late response for a thread the moderator has left', async () => {
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const btn = { style: {}, disabled: true };
+      const el = { style: {}, children: [], innerHTML: '' };
+      globalThis.document = { getElementById: (id) => (id === 'no-reply-btn' ? btn : el) };
+      const renders = [];
+      globalThis.renderThread = (messages) => renders.push(messages);
+      const loadThread = extractFunction(messagesHTML, 'loadThread');
+      for (const response of [{ ok: true, json: async () => [{ id: 3 }] }, { ok: false }]) {
+        let respond;
+        globalThis.fetch = () => new Promise(resolve => { respond = resolve; });
+        globalThis.selectedPubkey = 'A';
+        const slowA = loadThread('A');
+        // B opens and renders while A's request is still out.
+        globalThis.selectedPubkey = 'B';
+        globalThis.threadSeen = { pubkey: 'B', maxId: 7 };
+        btn.disabled = false;
+        el.innerHTML = '';
+        respond(response);
+        await slowA;
+        expect(renders).toEqual([]);
+        expect(el.innerHTML).not.toContain('Failed');
+        expect(globalThis.threadSeen).toEqual({ pubkey: 'B', maxId: 7 });
+        expect(btn.disabled).toBe(false);
+      }
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  // A click before the thread renders would send seen_through_id 0, so the
+  // mark lands before every typed message and the click seems to do nothing.
+  it('the No reply needed button stays disabled until the open thread has rendered', () => {
+    const keys = ['document', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const btn = { style: {}, disabled: false };
+      globalThis.document = { getElementById: (id) => (id === 'no-reply-btn' ? btn : { style: {} }) };
+      const showReplyState = extractFunction(messagesHTML, 'showReplyState');
+      globalThis.selectedPubkey = 'A';
+      globalThis.threadSeen = null;
+      showReplyState({ waiting: true, marked: false });
+      expect(btn.disabled).toBe(true);
+      globalThis.threadSeen = { pubkey: 'B', maxId: 4 };
+      showReplyState({ waiting: true, marked: false });
+      expect(btn.disabled).toBe(true);
+      globalThis.threadSeen = { pubkey: 'A', maxId: 4 };
+      showReplyState({ waiting: true, marked: false });
+      expect(btn.disabled).toBe(false);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  it('loading a thread disables the button until it renders, and a failed load or another thread keeps it disabled', async () => {
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const btn = { style: {}, disabled: true };
+      const el = { style: {}, children: [], innerHTML: '' };
+      globalThis.document = { getElementById: (id) => (id === 'no-reply-btn' ? btn : el) };
+      globalThis.renderThread = () => {};
+      const loadThread = extractFunction(messagesHTML, 'loadThread');
+      let disabledWhileLoading;
+      globalThis.fetch = async () => {
+        disabledWhileLoading = btn.disabled;
+        return { ok: true, json: async () => [{ id: 3 }] };
+      };
+      globalThis.selectedPubkey = 'A';
+      btn.disabled = false; // e.g. a reload after a mark that left it waiting
+      await loadThread('A');
+      expect(disabledWhileLoading).toBe(true);
+      expect(btn.disabled).toBe(false);
+      btn.disabled = true;
+      globalThis.selectedPubkey = 'B'; // moved on before A's thread arrived
+      await loadThread('A');
+      expect(btn.disabled).toBe(true);
+      globalThis.selectedPubkey = 'A';
+      globalThis.fetch = async () => ({ ok: false });
+      await loadThread('A');
+      expect(btn.disabled).toBe(true);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  it('mark sends the newest message id the open thread showed, and 0 for another thread', async () => {
+    for (const [seen, expected] of [[{ pubkey: 'A', maxId: 7 }, 7], [{ pubkey: 'B', maxId: 9 }, 0], [null, 0]]) {
+      const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+      try {
+        globalThis.threadSeen = seen;
+        let sent;
+        globalThis.fetch = async (url, opts = {}) => {
+          sent = JSON.parse(opts.body);
+          return { ok: true, json: async () => ({ success: true, waiting: false, no_reply_needed_at: 'NOW' }) };
+        };
+        await markNoReplyNeeded();
+        expect(sent, JSON.stringify(seen)).toEqual({ seen_through_id: expected });
+      } finally { restore(); }
+    }
+  });
+
+  it('mark that leaves the conversation waiting keeps the row and reloads the thread', async () => {
+    const { render, respond, markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const reloaded = [];
+      const shown = [];
+      globalThis.loadThread = (pubkey) => { reloaded.push(pubkey); };
+      globalThis.showReplyState = (state) => { shown.push(state); };
+      globalThis.threadSeen = { pubkey: 'A', maxId: 7 };
+      respond({ success: true, waiting: true, no_reply_needed_at: 'BEFORE_NEW_MESSAGE' });
+      await markNoReplyNeeded();
+      expect(render()).not.toContain('handled');
+      expect(globalThis.conversationsOffset).toBe(10);
+      expect(globalThis.markedPubkey).toBe(null);
+      expect(shown.at(-1)).toEqual({ waiting: true, marked: false });
+      expect(reloaded).toEqual(['A']);
+    } finally { restore(); }
+  });
+
+  it('re-renders the list only when a row changes waiting on Waiting on us', () => {
+    const cases = [['waiting', true, true, 0], ['waiting', true, false, 1], ['person', true, false, 0], ['', false, true, 0]];
+    for (const [filter, from, to, renders] of cases) {
+      setup({ filter, rows: [row({ waiting: from })] });
+      try {
+        let count = 0;
+        globalThis.renderConversations = () => { count++; };
+        globalThis.setConversationWaiting('A', to);
+        expect(count, `${filter}: ${from} -> ${to}`).toBe(renders);
+        expect(globalThis.conversations[0].waiting, `${filter}: ${from} -> ${to}`).toBe(to);
+      } finally { restore(); }
+    }
+  });
+
+  it('a stale reply-state response does not touch the row', async () => {
+    const { render } = setup({ filter: 'waiting', rows: [row()], selected: 'B' });
+    try {
+      await globalThis.loadReplyState('A');
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  // A failed mark must not re-enable the button while the thread isn't rendered
+  // (a Refresh reloading it), or the next click sends seen_through_id 0.
+  it('a failed mark re-enables the button only when the open thread has rendered', async () => {
+    const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const g = globalThis;
+      g.fetch = async () => ({ ok: false });
+      const btn = g.document.getElementById('no-reply-btn');
+      g.threadSeen = null;
+      await markNoReplyNeeded();
+      expect(btn.disabled).toBe(true);
+      g.threadSeen = { pubkey: 'A', maxId: 3 };
+      await markNoReplyNeeded();
+      expect(btn.disabled).toBe(false);
+    } finally { restore(); }
+  });
+
+  it('a pre-mark state response cannot restore waiting or advance the next-page offset', async () => {
+    for (const reader of ['loadReplyState', 'refreshRowWaiting']) {
+      const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+      try {
+        let resolveState;
+        globalThis.fetch = async (url, opts = {}) => opts.method === 'POST'
+          ? { ok: true, json: async () => ({ success: true, waiting: false, no_reply_needed_at: 'NOW' }) }
+          : new Promise(resolve => { resolveState = resolve; });
+        const pending = globalThis[reader]('A');
+        await markNoReplyNeeded();
+        expect(globalThis.conversationsOffset, reader).toBe(9);
+        resolveState({ ok: true, json: async () => ({ waiting: true }) });
+        await pending;
+        expect(globalThis.conversations[0].waiting, reader).toBe(false);
+        expect(globalThis.conversationsOffset, reader).toBe(9);
+      } finally { restore(); }
+    }
+  });
+
+  it('an older header request cannot overwrite a newer row-state response', async () => {
+    setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const pendingResponses = [];
+      globalThis.fetch = () => new Promise(resolve => pendingResponses.push(resolve));
+      const older = globalThis.loadReplyState('A');
+      const newer = globalThis.refreshRowWaiting('A');
+      pendingResponses[1]({ ok: true, json: async () => ({ waiting: false }) });
+      await newer;
+      pendingResponses[0]({ ok: true, json: async () => ({ waiting: true }) });
+      await older;
+      expect(globalThis.conversations[0].waiting).toBe(false);
+      expect(globalThis.conversationsOffset).toBe(9);
+    } finally { restore(); }
+  });
+
+  // fetch stub keyed by method: `onPost` / `onDelete` / `onGet` run before the response.
+  function routedFetch({ onPost, onDelete, onGet, state }) {
+    globalThis.fetch = async (url, opts = {}) => {
+      const method = opts.method || 'GET';
+      if (method === 'POST') onPost?.();
+      else if (method === 'DELETE') onDelete?.();
+      else onGet?.();
+      return { ok: true, json: async () => (method === 'GET' ? state : {}) };
+    };
+  }
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  // Shared composer stubs for sendMessage; returns the swap-back for the list document.
+  function stubComposer() {
+    const extra = ['compose-input', 'compose-sha256', 'send-btn'];
+    const listDocument = globalThis.document;
+    const el = { value: ' hello ', disabled: false, focus() {}, innerHTML: '', scrollTop: 0, style: {} };
+    globalThis.document = { getElementById: (id) => (extra.includes(id) ? el : { innerHTML: '', scrollTop: 0, style: {} }) };
+    globalThis.appendOutgoingBubble = () => ({ isConnected: false });
+    return () => { globalThis.document = listDocument; };
+  }
+
+  it('a reply greys the row even when the moderator opens another conversation mid-send', async () => {
+    const { render } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const back = stubComposer();
+      routedFetch({ onPost: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: false } });
+      await extractFunction(messagesHTML, 'sendMessage')();
+      await flush();
+      back();
+      expect(render()).toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('a reply sent from the still-open thread greys the row and updates the header', async () => {
+    const { render } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const shown = [];
+      globalThis.showReplyState = (s) => shown.push(s);
+      const back = stubComposer();
+      routedFetch({ state: { waiting: false } });
+      await extractFunction(messagesHTML, 'sendMessage')();
+      await flush();
+      back();
+      expect(render()).toContain('handled');
+      expect(shown.at(-1)).toMatchObject({ waiting: false });
+    } finally { restore(); }
+  });
+
+  it('undo with the thread moved on after the DELETE un-greys the row', async () => {
+    const { render, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row({ waiting: false })] });
+    try {
+      routedFetch({ onDelete: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: true } });
+      await undoNoReplyNeeded();
+      await flush();
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('undo with the thread open, moved on during the state fetch, still un-greys the row', async () => {
+    const { render, undoNoReplyNeeded } = setup({ filter: 'waiting', rows: [row({ waiting: false })] });
+    try {
+      routedFetch({ onGet: () => { globalThis.selectedPubkey = 'B'; }, state: { waiting: true } });
+      await undoNoReplyNeeded();
+      await flush();
+      expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('on Waiting, handling a row moves the next-page offset back and undo moves it forward', () => {
+    const { } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      globalThis.setConversationWaiting('A', false);
+      expect(globalThis.conversationsOffset).toBe(9);
+      globalThis.setConversationWaiting('A', false); // no-op repeat
+      expect(globalThis.conversationsOffset).toBe(9);
+      globalThis.setConversationWaiting('A', true);
+      expect(globalThis.conversationsOffset).toBe(10);
+      globalThis.setConversationWaiting('A', true); // no-op repeat
+      expect(globalThis.conversationsOffset).toBe(10);
+    } finally { restore(); }
+  });
+
+  it('the offset never goes below zero', () => {
+    setup({ filter: 'waiting', rows: [row()] });
+    try {
+      globalThis.conversationsOffset = 0;
+      globalThis.setConversationWaiting('A', false);
+      expect(globalThis.conversationsOffset).toBe(0);
+    } finally { restore(); }
+  });
+
+  it('other chips and unloaded rows never move the offset', () => {
+    for (const filter of ['', 'notices', 'person']) {
+      setup({ filter, rows: [row()] });
+      try {
+        globalThis.setConversationWaiting('A', false);
+        globalThis.setConversationWaiting('A', true);
+        expect(globalThis.conversationsOffset, filter).toBe(10);
+      } finally { restore(); }
+    }
+    setup({ filter: 'waiting', rows: [row()] });
+    try {
+      globalThis.setConversationWaiting('ZZZ', false);
+      expect(globalThis.conversationsOffset).toBe(10);
+    } finally { restore(); }
+  });
+
+  // An Undo (or a mark) that resolves while a Refresh is fetching adjusts the
+  // offset of the list being replaced. The fresh page starts the offset over,
+  // so that adjustment must not carry into the next page's offset.
+  it('a waiting change landing mid-Refresh does not shift the next page offset', async () => {
+    setup({ filter: 'waiting', rows: [row({ waiting: false })] });
+    const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+      'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+    for (const k of extra) saved[k] = globalThis[k];
+    try {
+      const g = globalThis;
+      g.CONVERSATIONS_PAGE_SIZE = 50;
+      g.conversationsGen = 0;
+      g.fetchProfiles = async () => {};
+      g.document = { getElementById: () => ({ innerHTML: '', scrollTop: 0, style: {} }) };
+      g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+      const page = Array.from({ length: 50 }, (_, i) => row({ participant_pubkey: 'P' + i }));
+      g.fetch = async () => {
+        g.setConversationWaiting('A', true); // Undo resolves on the old list mid-fetch
+        return { ok: true, json: async () => ({ conversations: page }) };
+      };
+      await extractFunction(messagesHTML, 'fetchConversations')();
+      expect(g.conversationsOffset).toBe(50);
+    } finally { restore(); }
+  });
+
+  for (const append of [false, true]) {
+    it(`retries a ${append ? 'next' : 'fresh'} Waiting page when handling a row changes its boundary in flight`, async () => {
+      setup({ filter: 'waiting', rows: [row(), row({ participant_pubkey: 'B' })] });
+      const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+        'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+      for (const k of extra) saved[k] = globalThis[k];
+      try {
+        const g = globalThis;
+        g.CONVERSATIONS_PAGE_SIZE = 2;
+        g.conversationsGen = 0;
+        g.conversationsOffset = 2;
+        g.fetchProfiles = async () => {};
+        g.document = { getElementById: () => ({ innerHTML: '', scrollTop: 0, style: {} }) };
+        g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+        const requests = [];
+        g.fetch = async (url) => {
+          requests.push(url);
+          if (requests.length === 1) {
+            g.setConversationWaiting('A', false);
+            // Refresh can return a snapshot from before the mark. An append
+            // can instead run after the mark with its now-obsolete offset.
+            const keys = append ? ['D', 'E'] : ['A', 'B'];
+            return { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+          }
+          const keys = append ? ['C', 'D'] : ['B', 'C'];
+          return { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+        };
+        await extractFunction(messagesHTML, 'fetchConversations')({ append });
+        expect(requests.map(url => new URL(url, 'https://example.test').searchParams.get('offset')))
+          .toEqual(append ? ['2', '1'] : ['0', '0']);
+        expect(g.conversations.map(c => c.participant_pubkey)).toEqual(append ? ['A', 'B', 'C', 'D'] : ['B', 'C']);
+        expect(g.conversationsOffset).toBe(append ? 3 : 2);
+      } finally { restore(); }
+    });
+  }
+
+  for (const action of ['reply', 'mark', 'undo']) {
+    for (const appendPage of [false, true]) {
+      it(`waits for an in-flight ${action} and its state before ${appendPage ? 'paging' : 'refreshing'} Waiting conversations`, async () => {
+        const { markNoReplyNeeded, undoNoReplyNeeded } = setup({
+          filter: 'waiting', rows: [row({ waiting: action !== 'undo' }), row({ participant_pubkey: 'B' })],
+        });
+        const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+          'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+        for (const k of extra) saved[k] = globalThis[k];
+        let operation;
+        let append;
+        let releaseAction;
+        const release = () => releaseAction?.({ ok: true, json: async () => ({ waiting: action === 'undo' }) });
+        try {
+          const g = globalThis;
+          g.CONVERSATIONS_PAGE_SIZE = 2;
+          g.conversationsGen = 0;
+          g.conversationsOffset = action === 'undo' ? 1 : 2;
+          g.fetchProfiles = async () => {};
+          g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+          if (action === 'reply') stubComposer();
+          const requests = [];
+          g.fetch = async (url, opts = {}) => {
+            if (opts.method || url.endsWith('/state')) {
+              // The reply has reached the server, but its state read is delayed.
+              // Mark/Undo can likewise reach D1 before their response arrives.
+              if (action === 'reply' ? !opts.method : Boolean(opts.method)) {
+                return new Promise(resolve => { releaseAction = resolve; });
+              }
+              return { ok: true, json: async () => ({ waiting: action === 'undo' }) };
+            }
+            requests.push(url);
+            const offset = Number(new URL(url, 'https://example.test').searchParams.get('offset'));
+            const keys = action === 'undo' ? ['A', 'B', 'C', 'D', 'E'] : ['B', 'C', 'D', 'E'];
+            return { ok: true, json: async () => keys.slice(offset, offset + 2).map(key => row({ participant_pubkey: key })) };
+          };
+          operation = action === 'reply' ? extractFunction(messagesHTML, 'sendMessage')()
+            : action === 'mark' ? markNoReplyNeeded() : undoNoReplyNeeded();
+          await flush();
+          append = g.fetchConversations({ append: appendPage });
+          await flush();
+          expect(requests).toEqual([]);
+          release();
+          await operation;
+          await append;
+          expect(g.conversations.map(c => c.participant_pubkey))
+            .toEqual(appendPage ? ['A', 'B', 'C', 'D'] : action === 'undo' ? ['A', 'B'] : ['B', 'C']);
+          expect(new URL(requests[0], 'https://example.test').searchParams.get('offset'))
+            .toBe(appendPage ? action === 'undo' ? '2' : '1' : '0');
+        } finally {
+          release();
+          await operation;
+          await append;
+          restore();
+        }
+      });
+    }
+  }
+
+  for (const stateResult of ['superseded', 'failed']) {
+    it(`recovers Waiting paging when post-reply state is ${stateResult}`, async () => {
+      setup({ filter: 'waiting', rows: [row(), row({ participant_pubkey: 'B' })] });
+      const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+        'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+      for (const k of extra) saved[k] = globalThis[k];
+      let send;
+      let append;
+      let reopened;
+      const states = [];
+      const stateResponse = { ok: true, json: async () => ({ waiting: false }) };
+      try {
+        const g = globalThis;
+        g.CONVERSATIONS_PAGE_SIZE = 2;
+        g.conversationsGen = 0;
+        g.conversationsOffset = 2;
+        g.fetchProfiles = async () => {};
+        g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+        stubComposer();
+        const requests = [];
+        g.fetch = async (url, opts = {}) => {
+          if (opts.method) return { ok: true };
+          if (url.endsWith('/state')) return new Promise(resolve => states.push(resolve));
+          requests.push(url);
+          const offset = Number(new URL(url, 'https://example.test').searchParams.get('offset'));
+          return { ok: true, json: async () => ['B', 'C', 'D', 'E'].slice(offset, offset + 2)
+            .map(key => row({ participant_pubkey: key })) };
+        };
+        send = extractFunction(messagesHTML, 'sendMessage')();
+        await flush();
+        if (stateResult === 'superseded') reopened = g.loadReplyState('A');
+        states[0](stateResult === 'failed' ? { ok: false, status: 503 } : stateResponse);
+        await send;
+        append = g.fetchConversations({ append: true });
+        if (stateResult === 'superseded') {
+          await flush();
+          expect(requests).toEqual([]);
+          states[1](stateResponse);
+          await reopened;
+        }
+        await append;
+        expect(new URL(requests[0], 'https://example.test').searchParams.get('offset'))
+          .toBe(stateResult === 'failed' ? '0' : '1');
+        expect(g.conversations.map(c => c.participant_pubkey))
+          .toEqual(stateResult === 'failed' ? ['B', 'C'] : ['A', 'B', 'C', 'D']);
+      } finally {
+        for (const resolve of states) resolve(stateResponse);
+        await send;
+        await reopened;
+        await append;
+        restore();
+      }
+    });
+  }
+
+  // Shared setup for a two-row Waiting list, one page of two, offset 2.
+  function setupWaitingPaging({ rows = [row(), row({ participant_pubkey: 'B' })], selected = 'A' } = {}) {
+    const handles = setup({ filter: 'waiting', rows, selected });
+    const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+      'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+    for (const k of extra) saved[k] = globalThis[k];
+    const g = globalThis;
+    g.CONVERSATIONS_PAGE_SIZE = 2;
+    g.conversationsGen = 0;
+    g.conversationsOffset = 2;
+    g.fetchProfiles = async () => {};
+    g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+    return handles;
+  }
+  const offsetOf = (url) => new URL(url, 'https://example.test').searchParams.get('offset');
+
+  // A mark that starts after a page request went out can reach D1 before the
+  // list query does. If the page were accepted before the mark finished, its
+  // server snapshot already lacks the handled row, so it starts one late and C
+  // is skipped. The page must wait for the mark, then retry at the new offset.
+  // What POST /no-reply-needed returns once the mark is stored.
+  const markedResponse = { ok: true, json: async () => ({ success: true, waiting: false, no_reply_needed_at: 'NOW' }) };
+
+  it('holds a returned Waiting page until a mark that began mid-request finishes', async () => {
+    const { markNoReplyNeeded } = setupWaitingPaging();
+    let mark;
+    let page;
+    let releaseMark;
+    try {
+      const g = globalThis;
+      const requests = [];
+      let firstPage;
+      g.fetch = async (url, opts = {}) => {
+        if (opts.method === 'POST') return new Promise(resolve => { releaseMark = resolve; });
+        if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
+        requests.push(url);
+        const keys = ['B', 'C', 'D', 'E'].slice(Number(offsetOf(url)), Number(offsetOf(url)) + 2);
+        const res = { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+        if (requests.length === 1) return new Promise(resolve => { firstPage = () => resolve(res); });
+        return res;
+      };
+      page = g.fetchConversations({ append: true });
+      await flush();
+      mark = markNoReplyNeeded();
+      await flush();
+      firstPage(); // the server ran the list query after the mark landed
+      await flush();
+      expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B']);
+      releaseMark(markedResponse);
+      await mark;
+      await page;
+      expect(requests.map(offsetOf)).toEqual(['2', '1']);
+      expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
+    } finally {
+      releaseMark?.(markedResponse);
+      await mark;
+      await page;
+      restore();
+    }
+  });
+
+  it('holds Waiting paging while a reply is still being sent', async () => {
+    setupWaitingPaging();
+    let send;
+    let page;
+    let releaseSend;
+    try {
+      const g = globalThis;
+      stubComposer();
+      const requests = [];
+      g.fetch = async (url, opts = {}) => {
+        if (opts.method === 'POST') return new Promise(resolve => { releaseSend = resolve; });
+        if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
+        requests.push(url);
+        const keys = ['B', 'C', 'D', 'E'].slice(Number(offsetOf(url)), Number(offsetOf(url)) + 2);
+        return { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+      };
+      send = extractFunction(messagesHTML, 'sendMessage')();
+      await flush();
+      page = g.fetchConversations({ append: true });
+      await flush();
+      expect(requests).toEqual([]);
+      releaseSend({ ok: true, json: async () => ({}) });
+      await send;
+      await page;
+      expect(requests.map(offsetOf)).toEqual(['1']);
+      expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
+    } finally {
+      releaseSend?.({ ok: true, json: async () => ({}) });
+      await send;
+      await page;
+      restore();
+    }
+  });
+
+  // A conversation that isn't loaded yet can still sit inside the page being
+  // fetched: the open thread right after switching to Waiting on us, or a
+  // thread opened from search while the next page loads. Marking it mid-request
+  // must make that page retry, or a pre-mark snapshot shows it as still waiting
+  // and the next page starts one late.
+  for (const append of [false, true]) {
+    it(`retries a ${append ? 'next' : 'fresh'} Waiting page when an unloaded row in it is marked mid-request`, async () => {
+      const { markNoReplyNeeded } = setupWaitingPaging(append
+        ? { selected: 'C' }
+        : { rows: [], selected: 'C' });
+      let mark;
+      let page;
+      let firstPage;
+      try {
+        const g = globalThis;
+        if (!append) g.conversationsOffset = 0;
+        let marked = false;
+        const requests = [];
+        g.fetch = async (url, opts = {}) => {
+          if (opts.method === 'POST') { marked = true; return markedResponse; }
+          if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
+          requests.push(url);
+          const offset = Number(offsetOf(url));
+          const snapshot = requests.length === 1 || !marked
+            ? ['A', 'B', 'C', 'D', 'E', 'F'] : ['A', 'B', 'D', 'E', 'F'];
+          const set = append ? snapshot : snapshot.filter(k => k !== 'A' && k !== 'B');
+          const res = { ok: true, json: async () => set.slice(offset, offset + 2).map(key => row({ participant_pubkey: key })) };
+          if (requests.length === 1) return new Promise(resolve => { firstPage = () => resolve(res); });
+          return res;
+        };
+        page = g.fetchConversations({ append });
+        await flush();
+        mark = markNoReplyNeeded();
+        await mark;
+        firstPage(); // the list query ran before the mark committed
+        await page;
+        expect(requests.map(offsetOf)).toEqual(append ? ['2', '2'] : ['0', '0']);
+        expect(g.conversations.map(c => c.participant_pubkey)).toEqual(append ? ['A', 'B', 'D', 'E'] : ['D', 'E']);
+        expect(g.conversationsOffset).toBe(append ? 4 : 2);
+      } finally {
+        await mark;
+        firstPage?.();
+        await page;
+        restore();
+      }
+    });
+  }
 });

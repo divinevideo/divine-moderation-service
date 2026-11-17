@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { computeConversationId, ensureDmLogExcerptColumn, logDm, getConversations, getConversation, getConversationByPubkey, initDmLogTable, markConversationRead, pruneExpiredDmLog } from './dm-store.mjs';
+import { computeConversationId, ensureDmLogExcerptColumn, logDm, getConversations, getConversation, getConversationByPubkey, getConversationState, getFilterCounts, initDmLogTable, markConversationRead, markNoReplyNeeded, clearNoReplyNeeded, pruneExpiredDmLog, CONVERSATION_FILTERS } from './dm-store.mjs';
 
 /**
  * Create a mock D1 database that tracks calls and stores data in-memory
@@ -601,6 +601,7 @@ describe('DM Store - unread / markConversationRead against real D1', () => {
     await initDmLogTable(db);
     await db.prepare('DELETE FROM dm_log').run();
     await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
   });
 
   async function backdateMessage(nostrEventId, timestamp) {
@@ -793,6 +794,8 @@ describe('DM Store - pruneExpiredDmLog against real D1', () => {
     await initDmLogTable(db);
     await db.prepare('DELETE FROM dm_log').run();
     await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    // The reply-state tests count exact deletions, so start without leftovers.
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
   });
 
   async function backdateMessage(nostrEventId, timestamp) {
@@ -888,9 +891,129 @@ describe('DM Store - pruneExpiredDmLog against real D1', () => {
 
     const result = await pruneExpiredDmLog(db);
 
-    expect(result).toEqual({ deletedMessages: 0, deletedReadStates: 0 });
+    expect(result).toEqual({ deletedMessages: 0, deletedReadStates: 0, deletedReplyStates: 0 });
     const remaining = await db.prepare('SELECT COUNT(*) AS n FROM dm_log').first();
     expect(remaining.n).toBe(1);
+  });
+
+  it('deletes the reply-state row for a conversation whose only message expired', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-r1',
+    });
+    await backdateMessage('evt-old-r1', '2000-01-01 00:00:00');
+    await markNoReplyNeeded(db, conversationId);
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedReplyStates).toBe(1);
+    const row = await db.prepare('SELECT * FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(row).toBeNull();
+  });
+
+  it('keeps the reply-state row for a conversation with a surviving message', async () => {
+    const conversationId = computeConversationId(MODERATOR, CREATOR_B);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_B,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-r2',
+    });
+    await backdateMessage('evt-old-r2', '2000-01-01 00:00:00');
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_B,
+      recipientPubkey: MODERATOR,
+      content: 'fresh',
+      nostrEventId: 'evt-new-r2',
+    });
+    await markNoReplyNeeded(db, conversationId);
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedReplyStates).toBe(0);
+    const row = await db.prepare('SELECT * FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(row).not.toBeNull();
+  });
+
+  it('runs when neither state table exists yet', async () => {
+    // CI deploys on merge without applying migrations, so the retention sweep
+    // can be the first thing to touch these tables on a fresh environment.
+    const conversationId = computeConversationId(MODERATOR, CREATOR_A);
+    await logDm(db, {
+      conversationId,
+      direction: 'incoming',
+      senderPubkey: CREATOR_A,
+      recipientPubkey: MODERATOR,
+      content: 'ancient',
+      nostrEventId: 'evt-old-r3',
+    });
+    await backdateMessage('evt-old-r3', '2000-01-01 00:00:00');
+    await db.prepare('DROP TABLE dm_conversation_read_state').run();
+    await db.prepare('DROP TABLE dm_conversation_reply_state').run();
+
+    const result = await pruneExpiredDmLog(db);
+
+    expect(result.deletedMessages).toBe(1);
+    const remaining = await db.prepare('SELECT COUNT(*) AS n FROM dm_log').first();
+    expect(remaining.n).toBe(0);
+  });
+});
+
+describe('DM Store - no reply needed against real D1', () => {
+  const db = env.BLOSSOM_DB;
+  const conversationId = computeConversationId('f'.repeat(64), 'a'.repeat(64));
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
+  });
+
+  async function markValue() {
+    const row = await db.prepare('SELECT no_reply_needed_at FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    return row ? row.no_reply_needed_at : null;
+  }
+
+  it('markNoReplyNeeded writes a CURRENT_TIMESTAMP-format mark', async () => {
+    await markNoReplyNeeded(db, conversationId);
+    expect(await markValue()).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  });
+
+  it('markNoReplyNeeded does not move the mark backwards', async () => {
+    await markNoReplyNeeded(db, conversationId);
+    await db.prepare('UPDATE dm_conversation_reply_state SET no_reply_needed_at = ? WHERE conversation_id = ?').bind('2999-01-01 00:00:00', conversationId).run();
+
+    await markNoReplyNeeded(db, conversationId);
+
+    expect(await markValue()).toBe('2999-01-01 00:00:00');
+  });
+
+  it('clearNoReplyNeeded removes the mark', async () => {
+    await markNoReplyNeeded(db, conversationId);
+    await clearNoReplyNeeded(db, conversationId);
+    const count = await db.prepare('SELECT COUNT(*) AS n FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(conversationId).first();
+    expect(count.n).toBe(0);
+  });
+
+  it('clearNoReplyNeeded is safe on a conversation with no row', async () => {
+    await expect(clearNoReplyNeeded(db, conversationId)).resolves.toBeUndefined();
+  });
+
+  it('initDmLogTable creates dm_conversation_reply_state', async () => {
+    await db.prepare('DROP TABLE dm_conversation_reply_state').run();
+    await initDmLogTable(db);
+    const row = await db.prepare(`SELECT name FROM sqlite_master WHERE name = 'dm_conversation_reply_state'`).first();
+    expect(row).not.toBeNull();
   });
 });
 
@@ -1016,5 +1139,288 @@ describe('DM Store - unverified excerpt column against real D1', () => {
     const [row] = await getConversation(db, conversationId);
     expect(row.content).toBe('Thanks, we are looking into it.');
     expect(row).not.toHaveProperty('unverified_excerpt');
+  });
+});
+
+describe('DM Store - conversation filters against real D1', () => {
+  const db = env.BLOSSOM_DB;
+
+  const MODERATOR = 'f'.repeat(64);
+  const creator = (n) => 'a'.repeat(62) + String(n).padStart(2, '0');
+  const convFor = (n) => computeConversationId(MODERATOR, creator(n));
+
+  beforeEach(async () => {
+    await initDmLogTable(db);
+    await db.prepare('DELETE FROM dm_log').run();
+    await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
+  });
+
+  // Log one message, then pin its created_at: logDm always stamps
+  // CURRENT_TIMESTAMP, and these tests are about timestamps.
+  async function seed(conv, sender, recipient, direction, messageType, createdAt, eventId) {
+    await logDm(db, {
+      conversationId: conv,
+      direction,
+      senderPubkey: sender,
+      recipientPubkey: recipient,
+      messageType,
+      content: `${messageType} ${eventId}`,
+      nostrEventId: eventId,
+    });
+    await db.prepare('UPDATE dm_log SET created_at = ? WHERE nostr_event_id = ?').bind(createdAt, eventId).run();
+  }
+
+  // A timestamp N days before D1's own clock, in CURRENT_TIMESTAMP format.
+  async function recent(daysAgo) {
+    const row = await db.prepare(`SELECT datetime('now', ?) AS t`).bind(`-${daysAgo} days`).first();
+    return row.t;
+  }
+
+  // Shorthands over seed() for the two sides of a conversation.
+  const fromCreator = (n, messageType, createdAt, eventId) =>
+    seed(convFor(n), creator(n), MODERATOR, 'incoming', messageType, createdAt, eventId);
+  const fromUs = (n, messageType, createdAt, eventId) =>
+    seed(convFor(n), MODERATOR, creator(n), 'outgoing', messageType, createdAt, eventId);
+
+  async function idsFor(filter) {
+    const rows = await getConversations(db, { limit: 100, offset: 0, filter });
+    return rows.map((row) => row.conversation_id);
+  }
+
+  async function rowFor(conversationId) {
+    const rows = await getConversations(db, { limit: 100, offset: 0 });
+    return rows.find((row) => row.conversation_id === conversationId);
+  }
+
+  it('a creator_reply one second before the cutoff is not a typed row', async () => {
+    await fromCreator(1, 'creator_reply', '2026-08-12 23:59:59', 'e1');
+    expect(await idsFor('person')).not.toContain(convFor(1));
+  });
+
+  it('a creator_reply at the cutoff is a typed row', async () => {
+    await fromCreator(1, 'creator_reply', '2026-08-13 00:00:00', 'e1');
+    expect(await idsFor('person')).toContain(convFor(1));
+  });
+
+  it('automated messages after a typed row do not clear waiting', async () => {
+    const automated = ['moderation_notice', 'report_outcome', 'community_warning'];
+    for (const [i, messageType] of automated.entries()) {
+      await fromCreator(i + 1, 'creator_reply', await recent(2), `typed-${i}`);
+      await fromUs(i + 1, messageType, await recent(1), `auto-${i}`);
+    }
+
+    const waiting = await idsFor('waiting');
+    const withModerator = await getConversations(db, { limit: 100, offset: 0, moderatorPubkey: MODERATOR });
+    for (const n of [1, 2, 3]) {
+      expect(waiting).toContain(convFor(n));
+      expect((await rowFor(convFor(n))).waiting).toBe(true);
+      expect(withModerator.find((row) => row.conversation_id === convFor(n)).waiting).toBe(true);
+    }
+  });
+
+  it('an outgoing moderator_reply after the typed row clears waiting, and a later typed row restores it', async () => {
+    await fromCreator(1, 'creator_reply', await recent(3), 'typed-1');
+    await fromUs(1, 'moderator_reply', await recent(2), 'reply-1');
+
+    expect(await idsFor('waiting')).not.toContain(convFor(1));
+    expect((await rowFor(convFor(1))).waiting).toBe(false);
+
+    await fromCreator(1, 'creator_reply', await recent(1), 'typed-2');
+
+    expect(await idsFor('waiting')).toContain(convFor(1));
+    expect((await rowFor(convFor(1))).waiting).toBe(true);
+  });
+
+  it('a typed row 31 days old is not waiting; 29 days old is', async () => {
+    await fromCreator(1, 'creator_reply', await recent(31), 'old');
+    await fromCreator(2, 'creator_reply', await recent(29), 'young');
+
+    const waiting = await idsFor('waiting');
+    expect(waiting).not.toContain(convFor(1));
+    expect(waiting).toContain(convFor(2));
+    // Still "a person wrote", just outside the window.
+    expect(await idsFor('person')).toContain(convFor(1));
+  });
+
+  it('a typed row in the same second as the reply is not waiting', async () => {
+    const sameSecond = await recent(1);
+    await fromCreator(1, 'creator_reply', sameSecond, 'typed');
+    await fromUs(1, 'moderator_reply', sameSecond, 'reply');
+
+    expect(await idsFor('waiting')).not.toContain(convFor(1));
+  });
+
+  it('no reply needed clears waiting; a later typed row restores it; clearNoReplyNeeded restores it', async () => {
+    const conv = convFor(1);
+    await fromCreator(1, 'creator_reply', await recent(3), 'typed-1');
+    expect(await idsFor('waiting')).toContain(conv);
+
+    await markNoReplyNeeded(db, conv);
+    expect(await idsFor('waiting')).not.toContain(conv);
+
+    // Pretend the mark was made two days ago, so a typed row after it can exist.
+    await db.prepare('UPDATE dm_conversation_reply_state SET no_reply_needed_at = ? WHERE conversation_id = ?').bind(await recent(2), conv).run();
+    await fromCreator(1, 'creator_reply', await recent(1), 'typed-2');
+    expect(await idsFor('waiting')).toContain(conv);
+
+    await markNoReplyNeeded(db, conv);
+    expect(await idsFor('waiting')).not.toContain(conv);
+
+    await clearNoReplyNeeded(db, conv);
+    expect(await idsFor('waiting')).toContain(conv);
+  });
+
+  it('reports / notices / outcomes / warnings match conversations that ever contained that type', async () => {
+    const cases = [
+      ['reports', 'conversation_report', fromCreator],
+      ['notices', 'moderation_notice', fromUs],
+      ['outcomes', 'report_outcome', fromUs],
+      ['warnings', 'community_warning', fromUs],
+    ];
+    for (const [i, [, messageType, from]] of cases.entries()) {
+      const n = i + 1;
+      await from(n, messageType, await recent(5), `early-${n}`);
+      await fromCreator(n, 'creator_reply', await recent(1), `later-${n}`);
+    }
+    // A conversation with none of the four types.
+    await fromCreator(9, 'creator_reply', await recent(1), 'plain');
+
+    for (const [i, [filter]] of cases.entries()) {
+      const n = i + 1;
+      expect(await idsFor(filter), filter).toEqual([convFor(n)]);
+      // The matching type is not the latest message.
+      expect((await rowFor(convFor(n))).last_message_type).toBe('creator_reply');
+    }
+  });
+
+  it('rows carry the latest typed message even when an automated message came later', async () => {
+    const typedAt = await recent(4);
+    await fromCreator(1, 'creator_reply', typedAt, 'typed');
+    await fromUs(1, 'moderation_notice', await recent(3), 'notice');
+
+    const row = await rowFor(convFor(1));
+    expect(row.last_message).toBe('moderation_notice notice');
+    expect(row.last_typed_message).toBe('creator_reply typed');
+    expect(row.last_typed_at).toBe(typedAt);
+  });
+
+  it('last_typed_message is null when the conversation has no typed row since the cutoff', async () => {
+    await fromCreator(1, 'creator_reply', '2026-08-12 23:59:59', 'pre-cutoff');
+    await fromUs(2, 'moderation_notice', await recent(2), 'notice');
+
+    for (const n of [1, 2]) {
+      const row = await rowFor(convFor(n));
+      expect(row.last_typed_message).toBeNull();
+      expect(row.last_typed_at).toBeNull();
+    }
+  });
+
+  it('the latest of several typed rows wins', async () => {
+    await fromCreator(1, 'creator_reply', await recent(5), 'first');
+    await fromCreator(1, 'creator_reply', await recent(2), 'second');
+    await fromUs(1, 'moderation_notice', await recent(1), 'notice');
+
+    expect((await rowFor(convFor(1))).last_typed_message).toBe('creator_reply second');
+  });
+
+  it('no filter returns every conversation, unchanged order', async () => {
+    await fromCreator(1, 'creator_reply', '2026-10-01 10:00:00', 'c1');
+    await fromCreator(2, 'conversation_report', '2026-10-03 10:00:00', 'c2');
+    await fromUs(3, 'moderation_notice', '2026-10-02 10:00:00', 'c3');
+    // Same second as conversation 3, logged later: the id DESC tiebreaker puts it first.
+    await fromCreator(4, 'creator_reply', '2026-10-02 10:00:00', 'c4');
+
+    const expected = [convFor(2), convFor(4), convFor(3), convFor(1)];
+    expect(await idsFor(undefined)).toEqual(expected);
+    const omitted = await getConversations(db, { limit: 100, offset: 0 });
+    expect(omitted.map((row) => row.conversation_id)).toEqual(expected);
+  });
+
+  it('getConversations throws on an unknown filter', async () => {
+    await expect(getConversations(db, { filter: 'bogus' })).rejects.toThrow('Unknown conversation filter: bogus');
+  });
+
+  it('counts equal paged results for every filter', async () => {
+    await fromCreator(1, 'creator_reply', await recent(1), 'c1'); // waiting, person
+    await fromCreator(2, 'creator_reply', await recent(3), 'c2-typed'); // person (replied)
+    await fromUs(2, 'moderator_reply', await recent(2), 'c2-reply');
+    await fromCreator(3, 'conversation_report', await recent(4), 'c3'); // reports
+    await fromUs(4, 'moderation_notice', await recent(4), 'c4'); // notices
+    await fromUs(5, 'report_outcome', await recent(4), 'c5-outcome'); // outcomes, waiting, person
+    await fromCreator(5, 'creator_reply', await recent(1), 'c5-typed');
+    await fromUs(6, 'community_warning', await recent(4), 'c6'); // warnings
+    await fromCreator(7, 'creator_reply', '2026-08-01 00:00:00', 'c7'); // none: before the cutoff
+    await fromCreator(8, 'creator_reply', await recent(2), 'c8'); // person, marked no reply needed
+    await markNoReplyNeeded(db, convFor(8));
+
+    const counts = await getFilterCounts(db);
+    expect(counts).toEqual({ all: 8, waiting: 2, person: 4, reports: 1, notices: 1, outcomes: 1, warnings: 1 });
+
+    async function pagedLength(filter) {
+      let total = 0;
+      for (let offset = 0; ; offset += 2) {
+        const page = await getConversations(db, { limit: 2, offset, filter });
+        total += page.length;
+        if (page.length < 2) return total;
+      }
+    }
+
+    expect(await pagedLength(undefined)).toBe(counts.all);
+    for (const filter of CONVERSATION_FILTERS) {
+      expect(await pagedLength(filter), filter).toBe(counts[filter]);
+    }
+  });
+
+  it('getConversations groups dm_log once for every filter', async () => {
+    for (const filter of [undefined, ...CONVERSATION_FILTERS]) {
+      let sql = '';
+      const spy = { prepare: (text) => { sql = text; return { bind: () => ({ all: async () => ({ results: [] }) }) }; } };
+      await getConversations(spy, { filter });
+      expect(sql.match(/GROUP BY/g), String(filter)).toHaveLength(1);
+    }
+  });
+
+  it('getFilterCounts is all zeros on an empty dm_log', async () => {
+    expect(await getFilterCounts(db)).toEqual({ all: 0, waiting: 0, person: 0, reports: 0, notices: 0, outcomes: 0, warnings: 0 });
+  });
+
+  it('markNoReplyNeeded through a seen message leaves a typed message logged after it waiting', async () => {
+    const seenAt = await recent(2);
+    const unseenAt = await recent(1);
+    await fromCreator(1, 'creator_reply', seenAt, 'seen');
+    await fromCreator(1, 'creator_reply', unseenAt, 'unseen');
+    const idOf = async (eventId) =>
+      (await db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(eventId).first()).id;
+    const justBefore = (await db.prepare(`SELECT datetime(?, '-1 second') AS t`).bind(unseenAt).first()).t;
+
+    await markNoReplyNeeded(db, convFor(1), { seenThroughId: await idOf('seen') });
+    expect(await getConversationState(db, convFor(1))).toEqual({ waiting: true, no_reply_needed_at: justBefore });
+
+    await markNoReplyNeeded(db, convFor(1), { seenThroughId: await idOf('unseen') });
+    expect((await getConversationState(db, convFor(1))).waiting).toBe(false);
+  });
+
+  it('getConversationState still reports a mark on a conversation with no rows', async () => {
+    await markNoReplyNeeded(db, convFor(1));
+    const mark = await db.prepare('SELECT no_reply_needed_at FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(convFor(1)).first();
+    expect(await getConversationState(db, convFor(1))).toEqual({ waiting: false, no_reply_needed_at: mark.no_reply_needed_at });
+  });
+
+  it('getConversationState for a conversation with no rows', async () => {
+    expect(await getConversationState(db, convFor(1))).toEqual({ waiting: false, no_reply_needed_at: null });
+  });
+
+  it('getConversationState agrees with the row\'s waiting flag', async () => {
+    await fromCreator(1, 'creator_reply', await recent(1), 'c1');
+    await fromCreator(2, 'creator_reply', await recent(1), 'c2');
+    await markNoReplyNeeded(db, convFor(2));
+    const mark = await db.prepare('SELECT no_reply_needed_at FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(convFor(2)).first();
+
+    expect(await getConversationState(db, convFor(1))).toEqual({ waiting: true, no_reply_needed_at: null });
+    expect((await rowFor(convFor(1))).waiting).toBe(true);
+
+    expect(await getConversationState(db, convFor(2))).toEqual({ waiting: false, no_reply_needed_at: mark.no_reply_needed_at });
+    expect((await rowFor(convFor(2))).waiting).toBe(false);
   });
 });
