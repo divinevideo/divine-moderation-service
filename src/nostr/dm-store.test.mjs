@@ -1374,6 +1374,22 @@ describe('DM Store - conversation filters against real D1', () => {
     expect(await getFilterCounts(db)).toEqual({ all: 0, waiting: 0, person: 0, reports: 0, notices: 0, outcomes: 0, warnings: 0 });
   });
 
+  it('markNoReplyNeeded through a seen message leaves a typed message logged after it waiting', async () => {
+    const seenAt = await recent(2);
+    const unseenAt = await recent(1);
+    await fromCreator(1, 'creator_reply', seenAt, 'seen');
+    await fromCreator(1, 'creator_reply', unseenAt, 'unseen');
+    const idOf = async (eventId) =>
+      (await db.prepare('SELECT id FROM dm_log WHERE nostr_event_id = ?').bind(eventId).first()).id;
+    const justBefore = (await db.prepare(`SELECT datetime(?, '-1 second') AS t`).bind(unseenAt).first()).t;
+
+    await markNoReplyNeeded(db, convFor(1), { seenThroughId: await idOf('seen') });
+    expect(await getConversationState(db, convFor(1))).toEqual({ waiting: true, no_reply_needed_at: justBefore });
+
+    await markNoReplyNeeded(db, convFor(1), { seenThroughId: await idOf('unseen') });
+    expect((await getConversationState(db, convFor(1))).waiting).toBe(false);
+  });
+
   it('getConversationState for a conversation with no rows', async () => {
     expect(await getConversationState(db, convFor(1))).toEqual({ waiting: false, no_reply_needed_at: null });
   });

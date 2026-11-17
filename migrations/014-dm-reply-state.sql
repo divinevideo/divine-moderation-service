@@ -6,8 +6,9 @@
 -- message. The mark is shared across moderators, so there is one row per
 -- conversation, not one per moderator. A missing row means no mark.
 --
--- `no_reply_needed_at` is always written via SQL `CURRENT_TIMESTAMP` (see
--- markNoReplyNeeded in dm-store.mjs), so it shares `dm_log.created_at`'s
+-- `no_reply_needed_at` is always written by SQL, as `CURRENT_TIMESTAMP` or
+-- `datetime()` over a `dm_log.created_at` (see markNoReplyNeeded in
+-- dm-store.mjs), so it shares `dm_log.created_at`'s
 -- "YYYY-MM-DD HH:MM:SS" UTC text format and stays safely comparable with a
 -- plain `>`. A client-generated ISO-8601 string would sort differently under
 -- a lexicographic TEXT comparison ('T'/'Z' characters) and silently break

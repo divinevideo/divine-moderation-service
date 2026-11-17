@@ -154,19 +154,34 @@ export async function markConversationRead(db, conversationId) {
 }
 
 /**
- * Mark a conversation "No reply needed" as of now. One shared mark per
- * conversation, not per moderator. Monotonic like markConversationRead: a
- * second call never moves the mark backwards.
+ * Mark a conversation "No reply needed". One shared mark per conversation,
+ * not per moderator. Monotonic like markConversationRead: a second call never
+ * moves the mark backwards.
+ *
+ * With `seenThroughId` (the newest dm_log id the moderator's open thread
+ * showed), the mark covers only what they saw: if a typed message was logged
+ * after that row, the mark lands one second before it, so that message keeps
+ * the conversation waiting. The inbox sync logs new messages every five
+ * minutes (and on Refresh) and the open thread does not refresh itself, so
+ * marking "now" could cover a message nobody read. Without it, the mark is as
+ * of now.
  * @param {D1Database} db
  * @param {string} conversationId
+ * @param {{ seenThroughId?: number }} [options]
  */
-export async function markNoReplyNeeded(db, conversationId) {
+export async function markNoReplyNeeded(db, conversationId, { seenThroughId } = {}) {
+  // A NULL ?2 matches no row, so the subquery is NULL and the mark is now.
   await db.prepare(`
     INSERT INTO dm_conversation_reply_state (conversation_id, no_reply_needed_at)
-    VALUES (?, CURRENT_TIMESTAMP)
-    ON CONFLICT(conversation_id) DO UPDATE SET no_reply_needed_at = CURRENT_TIMESTAMP
-    WHERE CURRENT_TIMESTAMP > dm_conversation_reply_state.no_reply_needed_at
-  `).bind(conversationId).run();
+    VALUES (?1, COALESCE(
+      (SELECT datetime(MIN(created_at), '-1 second') FROM dm_log
+        WHERE conversation_id = ?1 AND id > ?2
+          AND direction = 'incoming' AND message_type = 'creator_reply' AND created_at >= ?3),
+      CURRENT_TIMESTAMP
+    ))
+    ON CONFLICT(conversation_id) DO UPDATE SET no_reply_needed_at = excluded.no_reply_needed_at
+    WHERE excluded.no_reply_needed_at > dm_conversation_reply_state.no_reply_needed_at
+  `).bind(conversationId, seenThroughId ?? null, TYPED_MESSAGE_CUTOFF).run();
 }
 
 /**

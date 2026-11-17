@@ -4110,6 +4110,28 @@ async function runMigration() {
           return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
         const pubkey = stateParts[4].toLowerCase();
+        // The admin page sends the newest message id its open thread showed, so
+        // the mark can't cover a message logged after the thread was loaded.
+        // Optional: without it the mark is as of now.
+        let seenThroughId;
+        if (request.method === 'POST') {
+          // No body means no id. A body that isn't a JSON object is rejected
+          // rather than read as "no id", which would quietly mark as of now.
+          const text = await request.text();
+          let body = null;
+          if (text.trim()) {
+            try { body = JSON.parse(text); } catch { body = undefined; }
+            if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+              return new Response(JSON.stringify({ error: 'Body must be a JSON object' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+          }
+          if (body && body.seen_through_id !== undefined) {
+            if (!Number.isSafeInteger(body.seen_through_id) || body.seen_through_id < 0) {
+              return new Response(JSON.stringify({ error: 'seen_through_id must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+            seenThroughId = body.seen_through_id;
+          }
+        }
         const { computeConversationId, getConversationState, markNoReplyNeeded, clearNoReplyNeeded, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
         const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
         const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
@@ -4118,7 +4140,7 @@ async function runMigration() {
         }
         await initDmReplyStateTable(env.BLOSSOM_DB);
         const conversationId = computeConversationId(moderatorPubkey, pubkey);
-        if (request.method === 'POST') await markNoReplyNeeded(env.BLOSSOM_DB, conversationId);
+        if (request.method === 'POST') await markNoReplyNeeded(env.BLOSSOM_DB, conversationId, { seenThroughId });
         if (request.method === 'DELETE') await clearNoReplyNeeded(env.BLOSSOM_DB, conversationId);
         const state = await getConversationState(env.BLOSSOM_DB, conversationId);
         const body = isNoReply ? { success: true, ...state } : state;

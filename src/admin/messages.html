@@ -663,6 +663,10 @@
     // Conversation whose No reply needed mark was set in this page session, so
     // Undo survives a reload of reply state while the mark is still active.
     let markedPubkey = null;
+    // The thread last rendered and its newest message id. No reply needed sends
+    // that id so the mark can't cover a message the sync logged after the
+    // thread loaded: the open thread does not refresh itself.
+    let threadSeen = null;
     // Row-only and header reads share a generation per conversation. A late
     // response must not undo a newer action's waiting flag or paging offset.
     const replyStateGenerations = new Map();
@@ -1052,13 +1056,27 @@
       if (!target) return;
       document.getElementById('no-reply-btn').disabled = true;
       const finishWaitingAction = beginWaitingAction();
+      // Mark only through what this thread showed; 0 if it never rendered.
+      const seenThroughId = threadSeen && threadSeen.pubkey === target ? threadSeen.maxId : 0;
       try {
-        const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'POST' });
+        const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ seen_through_id: seenThroughId }),
+        });
         if (!res.ok) throw new Error('Failed to mark no reply needed');
+        const data = await res.json();
         invalidateReplyState(target);
         fetchFilterCounts();
-        setConversationWaiting(target, false);
+        // Still waiting means the person wrote after the thread loaded.
+        const waiting = Boolean(data.waiting);
+        setConversationWaiting(target, waiting);
         if (selectedPubkey !== target) return;
+        if (waiting) {
+          showReplyState({ waiting: true, marked: false });
+          loadThread(target); // show the message the mark left waiting
+          return;
+        }
         markedPubkey = target;
         showReplyState({ waiting: false, marked: true });
       } catch (err) {
@@ -1386,6 +1404,7 @@
       Array.from(container.children).forEach(child => {
         if (child.id !== 'thread-loading') child.remove();
       });
+      threadSeen = null; // nothing is on screen until the new thread renders
 
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey));
@@ -1394,6 +1413,7 @@
         const messages = data.messages || data || [];
         loading.style.display = 'none';
         renderThread(messages);
+        threadSeen = { pubkey, maxId: messages.reduce((max, msg) => Math.max(max, Number(msg.id) || 0), 0) };
       } catch (err) {
         loading.style.display = 'none';
         container.innerHTML += '<div class="empty-state">Failed to load messages</div>';

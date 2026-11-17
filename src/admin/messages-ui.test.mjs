@@ -525,7 +525,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
     'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
     'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble',
     'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingListGeneration', 'fetchConversations',
-    'waitingActions', 'beginWaitingAction', 'waitForWaitingActions', 'waitingListNeedsRefresh'];
+    'waitingActions', 'beginWaitingAction', 'waitForWaitingActions', 'waitingListNeedsRefresh',
+    'threadSeen', 'loadThread'];
   const saved = {};
   function setup({ filter = '', rows = [], selected = 'A' } = {}) {
     for (const k of names) saved[k] = globalThis[k];
@@ -533,6 +534,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.activeFilter = filter;
     g.selectedPubkey = selected;
     g.markedPubkey = null;
+    g.threadSeen = null;
+    g.loadThread = () => {};
     g.waitingListGeneration = 0;
     g.waitingListNeedsRefresh = false;
     g.fetchConversations = extractFunction(messagesHTML, 'fetchConversations');
@@ -647,6 +650,66 @@ describe('messages UI — handled rows and people-chip previews', () => {
     } finally { restore(); }
   });
 
+  it('loadThread records the newest message id it rendered, and clears it while loading or on failure', async () => {
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const el = { style: {}, children: [], innerHTML: '' };
+      globalThis.document = { getElementById: () => el };
+      globalThis.renderThread = () => {};
+      const loadThread = extractFunction(messagesHTML, 'loadThread');
+      globalThis.threadSeen = { pubkey: 'OLD', maxId: 99 };
+      let seenWhileLoading;
+      globalThis.fetch = async () => {
+        seenWhileLoading = globalThis.threadSeen;
+        return { ok: true, json: async () => [{ id: 3 }, { id: 9 }, { id: 5 }] };
+      };
+      await loadThread('A');
+      expect(seenWhileLoading).toBe(null);
+      expect(globalThis.threadSeen).toEqual({ pubkey: 'A', maxId: 9 });
+      globalThis.fetch = async () => ({ ok: false });
+      await loadThread('A');
+      expect(globalThis.threadSeen).toBe(null);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  it('mark sends the newest message id the open thread showed, and 0 for another thread', async () => {
+    for (const [seen, expected] of [[{ pubkey: 'A', maxId: 7 }, 7], [{ pubkey: 'B', maxId: 9 }, 0], [null, 0]]) {
+      const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+      try {
+        globalThis.threadSeen = seen;
+        let sent;
+        globalThis.fetch = async (url, opts = {}) => {
+          sent = JSON.parse(opts.body);
+          return { ok: true, json: async () => ({ success: true, waiting: false, no_reply_needed_at: 'NOW' }) };
+        };
+        await markNoReplyNeeded();
+        expect(sent, JSON.stringify(seen)).toEqual({ seen_through_id: expected });
+      } finally { restore(); }
+    }
+  });
+
+  it('mark that leaves the conversation waiting keeps the row and reloads the thread', async () => {
+    const { render, respond, markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const reloaded = [];
+      const shown = [];
+      globalThis.loadThread = (pubkey) => { reloaded.push(pubkey); };
+      globalThis.showReplyState = (state) => { shown.push(state); };
+      globalThis.threadSeen = { pubkey: 'A', maxId: 7 };
+      respond({ success: true, waiting: true, no_reply_needed_at: 'BEFORE_NEW_MESSAGE' });
+      await markNoReplyNeeded();
+      expect(render()).not.toContain('handled');
+      expect(globalThis.conversationsOffset).toBe(10);
+      expect(globalThis.markedPubkey).toBe(null);
+      expect(shown.at(-1)).toEqual({ waiting: true, marked: false });
+      expect(reloaded).toEqual(['A']);
+    } finally { restore(); }
+  });
+
   it('a stale reply-state response does not touch the row', async () => {
     const { render } = setup({ filter: 'waiting', rows: [row()], selected: 'B' });
     try {
@@ -661,7 +724,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
       try {
         let resolveState;
         globalThis.fetch = async (url, opts = {}) => opts.method === 'POST'
-          ? { ok: true }
+          ? { ok: true, json: async () => ({ success: true, waiting: false, no_reply_needed_at: 'NOW' }) }
           : new Promise(resolve => { resolveState = resolve; });
         const pending = globalThis[reader]('A');
         await markNoReplyNeeded();
@@ -993,6 +1056,9 @@ describe('messages UI — handled rows and people-chip previews', () => {
   // list query does. If the page were accepted before the mark finished, its
   // server snapshot already lacks the handled row, so it starts one late and C
   // is skipped. The page must wait for the mark, then retry at the new offset.
+  // What POST /no-reply-needed returns once the mark is stored.
+  const markedResponse = { ok: true, json: async () => ({ success: true, waiting: false, no_reply_needed_at: 'NOW' }) };
+
   it('holds a returned Waiting page until a mark that began mid-request finishes', async () => {
     const { markNoReplyNeeded } = setupWaitingPaging();
     let mark;
@@ -1018,13 +1084,13 @@ describe('messages UI — handled rows and people-chip previews', () => {
       firstPage(); // the server ran the list query after the mark landed
       await flush();
       expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B']);
-      releaseMark({ ok: true });
+      releaseMark(markedResponse);
       await mark;
       await page;
       expect(requests.map(offsetOf)).toEqual(['2', '1']);
       expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
     } finally {
-      releaseMark?.({ ok: true });
+      releaseMark?.(markedResponse);
       await mark;
       await page;
       restore();
@@ -1084,7 +1150,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
         let marked = false;
         const requests = [];
         g.fetch = async (url, opts = {}) => {
-          if (opts.method === 'POST') { marked = true; return { ok: true }; }
+          if (opts.method === 'POST') { marked = true; return markedResponse; }
           if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
           requests.push(url);
           const offset = Number(offsetOf(url));

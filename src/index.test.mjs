@@ -8101,6 +8101,52 @@ describe('DM filter routes', () => {
       expect((await res.json()).error).toBeTruthy();
     });
   }
+
+  const markWithBody = (body, db) => worker.fetch(
+    new Request(BASE + '/' + HEX + '/no-reply-needed', {
+      ...authed('POST'),
+      headers: { ...authed('POST').headers, 'Content-Type': 'application/json' },
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    }),
+    env(db ? { BLOSSOM_DB: db } : {}),
+  );
+
+  it('POST /no-reply-needed hands seen_through_id to the mark', async () => {
+    const db = createDbMock();
+    const prepare = db.prepare.bind(db);
+    let bound;
+    db.prepare = (sql) => {
+      const statement = prepare(sql);
+      if (!/INSERT INTO dm_conversation_reply_state/i.test(sql)) return statement;
+      const bind = statement.bind.bind(statement);
+      statement.bind = (...args) => { bound = args; return bind(...args); };
+      return statement;
+    };
+    expect((await markWithBody({ seen_through_id: 42 }, db)).status).toBe(200);
+    expect(bound[1]).toBe(42);
+  });
+
+  for (const body of ['{"seen_through_id": 4', '[]', 'null']) {
+    it('POST /no-reply-needed rejects the body ' + body + ' with 400', async () => {
+      const res = await markWithBody(body);
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/JSON object/);
+    });
+  }
+
+  it('POST /no-reply-needed accepts the seen_through_id the page sends', async () => {
+    const res = await markWithBody({ seen_through_id: 42 });
+    expect(res.status).toBe(200);
+    expect((await res.json()).success).toBe(true);
+  });
+
+  for (const bad of [-1, 1.5, '42', null]) {
+    it('POST /no-reply-needed rejects seen_through_id ' + JSON.stringify(bad) + ' with 400', async () => {
+      const res = await markWithBody({ seen_through_id: bad });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/seen_through_id/);
+    });
+  }
 });
 
 describe('GET /admin/api/dm-templates', () => {
