@@ -794,6 +794,8 @@ describe('DM Store - pruneExpiredDmLog against real D1', () => {
     await initDmLogTable(db);
     await db.prepare('DELETE FROM dm_log').run();
     await db.prepare('DELETE FROM dm_conversation_read_state').run();
+    // The reply-state tests count exact deletions, so start without leftovers.
+    await db.prepare('DELETE FROM dm_conversation_reply_state').run();
   });
 
   async function backdateMessage(nostrEventId, timestamp) {
