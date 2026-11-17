@@ -993,13 +993,13 @@
       const was = conv.waiting !== false; // a loaded row with no flag came from the Waiting set
       const now = Boolean(waiting);
       conv.waiting = now;
+      // Only Waiting on us depends on the flag: its set and paging, and the grey.
+      // Every thread open reads state, so skip the full re-render otherwise.
+      if (activeFilter !== 'waiting' || was === now) return;
       // The server's Waiting set shrinks when a row is handled, so the next page
-      // starts one earlier (and one later again if Undo makes it wait). Only on
-      // Waiting on us: other chips' sets don't depend on waiting.
-      if (activeFilter === 'waiting' && was !== now) {
-        waitingListGeneration++;
-        conversationsOffset = Math.max(0, conversationsOffset + (now ? 1 : -1));
-      }
+      // starts one earlier (and one later again if Undo makes it wait).
+      waitingListGeneration++;
+      conversationsOffset = Math.max(0, conversationsOffset + (now ? 1 : -1));
       renderConversations();
     }
 

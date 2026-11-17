@@ -733,6 +733,20 @@ describe('messages UI — handled rows and people-chip previews', () => {
     } finally { restore(); }
   });
 
+  it('re-renders the list only when a row changes waiting on Waiting on us', () => {
+    const cases = [['waiting', true, true, 0], ['waiting', true, false, 1], ['person', true, false, 0], ['', false, true, 0]];
+    for (const [filter, from, to, renders] of cases) {
+      setup({ filter, rows: [row({ waiting: from })] });
+      try {
+        let count = 0;
+        globalThis.renderConversations = () => { count++; };
+        globalThis.setConversationWaiting('A', to);
+        expect(count, `${filter}: ${from} -> ${to}`).toBe(renders);
+        expect(globalThis.conversations[0].waiting, `${filter}: ${from} -> ${to}`).toBe(to);
+      } finally { restore(); }
+    }
+  });
+
   it('a stale reply-state response does not touch the row', async () => {
     const { render } = setup({ filter: 'waiting', rows: [row()], selected: 'B' });
     try {
