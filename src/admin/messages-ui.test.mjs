@@ -972,4 +972,96 @@ describe('messages UI — handled rows and people-chip previews', () => {
       }
     });
   }
+
+  // Shared setup for a two-row Waiting list, one page of two, offset 2.
+  function setupWaitingPaging() {
+    const handles = setup({ filter: 'waiting', rows: [row(), row({ participant_pubkey: 'B' })] });
+    const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+      'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+    for (const k of extra) saved[k] = globalThis[k];
+    const g = globalThis;
+    g.CONVERSATIONS_PAGE_SIZE = 2;
+    g.conversationsGen = 0;
+    g.conversationsOffset = 2;
+    g.fetchProfiles = async () => {};
+    g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+    return handles;
+  }
+  const offsetOf = (url) => new URL(url, 'https://example.test').searchParams.get('offset');
+
+  // A mark that starts after a page request went out can reach D1 before the
+  // list query does. If the page were accepted before the mark finished, its
+  // server snapshot already lacks the handled row, so it starts one late and C
+  // is skipped. The page must wait for the mark, then retry at the new offset.
+  it('holds a returned Waiting page until a mark that began mid-request finishes', async () => {
+    const { markNoReplyNeeded } = setupWaitingPaging();
+    let mark;
+    let page;
+    let releaseMark;
+    try {
+      const g = globalThis;
+      const requests = [];
+      let firstPage;
+      g.fetch = async (url, opts = {}) => {
+        if (opts.method === 'POST') return new Promise(resolve => { releaseMark = resolve; });
+        if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
+        requests.push(url);
+        const keys = ['B', 'C', 'D', 'E'].slice(Number(offsetOf(url)), Number(offsetOf(url)) + 2);
+        const res = { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+        if (requests.length === 1) return new Promise(resolve => { firstPage = () => resolve(res); });
+        return res;
+      };
+      page = g.fetchConversations({ append: true });
+      await flush();
+      mark = markNoReplyNeeded();
+      await flush();
+      firstPage(); // the server ran the list query after the mark landed
+      await flush();
+      expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B']);
+      releaseMark({ ok: true });
+      await mark;
+      await page;
+      expect(requests.map(offsetOf)).toEqual(['2', '1']);
+      expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
+    } finally {
+      releaseMark?.({ ok: true });
+      await mark;
+      await page;
+      restore();
+    }
+  });
+
+  it('holds Waiting paging while a reply is still being sent', async () => {
+    setupWaitingPaging();
+    let send;
+    let page;
+    let releaseSend;
+    try {
+      const g = globalThis;
+      stubComposer();
+      const requests = [];
+      g.fetch = async (url, opts = {}) => {
+        if (opts.method === 'POST') return new Promise(resolve => { releaseSend = resolve; });
+        if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
+        requests.push(url);
+        const keys = ['B', 'C', 'D', 'E'].slice(Number(offsetOf(url)), Number(offsetOf(url)) + 2);
+        return { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+      };
+      send = extractFunction(messagesHTML, 'sendMessage')();
+      await flush();
+      page = g.fetchConversations({ append: true });
+      await flush();
+      expect(requests).toEqual([]);
+      releaseSend({ ok: true, json: async () => ({}) });
+      await send;
+      await page;
+      expect(requests.map(offsetOf)).toEqual(['1']);
+      expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
+    } finally {
+      releaseSend?.({ ok: true, json: async () => ({}) });
+      await send;
+      await page;
+      restore();
+    }
+  });
 });
