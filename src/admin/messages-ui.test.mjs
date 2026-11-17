@@ -522,7 +522,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
     'fetchFilterCounts', 'fetch', 'alert', 'document', 'currentConversationSearch', 'avatarHtml', 'displayName',
     'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
     'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble',
-    'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingListGeneration', 'fetchConversations'];
+    'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingListGeneration', 'fetchConversations',
+    'waitingActions', 'beginWaitingAction', 'waitForWaitingActions'];
   const saved = {};
   function setup({ filter = '', rows = [], selected = 'A' } = {}) {
     for (const k of names) saved[k] = globalThis[k];
@@ -532,6 +533,9 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.markedPubkey = null;
     g.waitingListGeneration = 0;
     g.fetchConversations = extractFunction(messagesHTML, 'fetchConversations');
+    g.waitingActions = new Set();
+    g.beginWaitingAction = extractFunction(messagesHTML, 'beginWaitingAction');
+    g.waitForWaitingActions = extractFunction(messagesHTML, 'waitForWaitingActions');
     g.replyStateGenerations = new Map();
     g.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
     g.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
@@ -849,6 +853,61 @@ describe('messages UI — handled rows and people-chip previews', () => {
         expect(g.conversations.map(c => c.participant_pubkey)).toEqual(append ? ['A', 'B', 'C', 'D'] : ['B', 'C']);
         expect(g.conversationsOffset).toBe(append ? 3 : 2);
       } finally { restore(); }
+    });
+  }
+
+  for (const action of ['reply', 'mark', 'undo']) {
+    it(`waits for an in-flight ${action} and its state before paging Waiting conversations`, async () => {
+      const { markNoReplyNeeded, undoNoReplyNeeded } = setup({
+        filter: 'waiting', rows: [row({ waiting: action !== 'undo' }), row({ participant_pubkey: 'B' })],
+      });
+      const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+        'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+      for (const k of extra) saved[k] = globalThis[k];
+      let operation;
+      let append;
+      let releaseAction;
+      const release = () => releaseAction?.({ ok: true, json: async () => ({ waiting: action === 'undo' }) });
+      try {
+        const g = globalThis;
+        g.CONVERSATIONS_PAGE_SIZE = 2;
+        g.conversationsGen = 0;
+        g.conversationsOffset = action === 'undo' ? 1 : 2;
+        g.fetchProfiles = async () => {};
+        g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+        if (action === 'reply') stubComposer();
+        const requests = [];
+        g.fetch = async (url, opts = {}) => {
+          if (opts.method || url.endsWith('/state')) {
+            // The reply has reached the server, but its state read is delayed.
+            // Mark/Undo can likewise reach D1 before their response arrives.
+            if (action === 'reply' ? !opts.method : Boolean(opts.method)) {
+              return new Promise(resolve => { releaseAction = resolve; });
+            }
+            return { ok: true, json: async () => ({ waiting: action === 'undo' }) };
+          }
+          requests.push(url);
+          const offset = Number(new URL(url, 'https://example.test').searchParams.get('offset'));
+          const keys = action === 'undo' ? ['A', 'B', 'C', 'D', 'E'] : ['B', 'C', 'D', 'E'];
+          return { ok: true, json: async () => keys.slice(offset, offset + 2).map(key => row({ participant_pubkey: key })) };
+        };
+        operation = action === 'reply' ? extractFunction(messagesHTML, 'sendMessage')()
+          : action === 'mark' ? markNoReplyNeeded() : undoNoReplyNeeded();
+        await flush();
+        append = g.fetchConversations({ append: true });
+        await flush();
+        expect(requests).toEqual([]);
+        release();
+        await operation;
+        await append;
+        expect(g.conversations.map(c => c.participant_pubkey)).toEqual(['A', 'B', 'C', 'D']);
+        expect(new URL(requests[0], 'https://example.test').searchParams.get('offset')).toBe(action === 'undo' ? '2' : '1');
+      } finally {
+        release();
+        await operation;
+        await append;
+        restore();
+      }
     });
   }
 });

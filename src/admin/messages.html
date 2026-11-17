@@ -666,6 +666,7 @@
     // Row-only and header reads share a generation per conversation. A late
     // response must not undo a newer action's waiting flag or paging offset.
     const replyStateGenerations = new Map();
+    const waitingActions = new Set();
     let conversations = [];
     let profileCache = {};
 
@@ -949,6 +950,20 @@
 
     // --- Reply state (shared "No reply needed" mark) ---
 
+    function beginWaitingAction() {
+      let complete;
+      const pending = new Promise(resolve => { complete = resolve; });
+      waitingActions.add(pending);
+      return () => {
+        waitingActions.delete(pending);
+        complete();
+      };
+    }
+
+    async function waitForWaitingActions() {
+      while (waitingActions.size) await Promise.all(waitingActions);
+    }
+
     function showReplyState({ waiting, marked }) {
       document.getElementById('no-reply-btn').style.display = waiting ? '' : 'none';
       document.getElementById('no-reply-btn').disabled = false;
@@ -1021,6 +1036,7 @@
       const target = selectedPubkey;
       if (!target) return;
       document.getElementById('no-reply-btn').disabled = true;
+      const finishWaitingAction = beginWaitingAction();
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'POST' });
         if (!res.ok) throw new Error('Failed to mark no reply needed');
@@ -1034,12 +1050,15 @@
         if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = false;
         alert('Failed to mark no reply needed: ' + err.message);
         console.error('markNoReplyNeeded error:', err);
+      } finally {
+        finishWaitingAction();
       }
     }
 
     async function undoNoReplyNeeded() {
       const target = selectedPubkey;
       if (!target) return;
+      const finishWaitingAction = beginWaitingAction();
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'DELETE' });
         if (!res.ok) throw new Error('Failed to undo');
@@ -1057,6 +1076,8 @@
       } catch (err) {
         alert('Failed to undo: ' + err.message);
         console.error('undoNoReplyNeeded error:', err);
+      } finally {
+        finishWaitingAction();
       }
     }
 
@@ -1078,14 +1099,18 @@
         if (loading) loading.style.display = 'flex';
       }
       // A fresh load supersedes anything in flight; an append rides the current
-      // generation and bails after its await if a fresh load bumped it. The
-      // offset in the URL below is read synchronously (no await before it), so
-      // each invocation fetches the page it intended.
+      // generation and bails after its await if a fresh load bumped it.
+      // A Waiting request may pause for a local action below; it rechecks this
+      // generation and reads the corrected offset after that action settles.
       const gen = append ? conversationsGen : ++conversationsGen;
-      const waitingGen = waitingListGeneration;
       conversationsLoading = true;
 
       try {
+        // A local write can reach D1 before its response or state refresh
+        // reaches this page. Wait for that whole action before using an offset.
+        if (activeFilter === 'waiting' && waitingActions.size) await waitForWaitingActions();
+        if (gen !== conversationsGen) return;
+        const waitingGen = waitingListGeneration;
         // The filter is read synchronously with the offset; a chip switch bumps
         // conversationsGen (fresh load), so a slow response for the old chip is
         // discarded below and can't paint over the new one.
@@ -1093,6 +1118,7 @@
           + (activeFilter ? '&filter=' + encodeURIComponent(activeFilter) : ''));
         if (!res.ok) throw new Error('Failed to fetch conversations');
         const data = await res.json();
+        if (activeFilter === 'waiting' && waitingActions.size) await waitForWaitingActions();
         if (gen !== conversationsGen) return; // superseded by a fresh load — discard
         if (activeFilter === 'waiting' && waitingGen !== waitingListGeneration) {
           // A mark, Undo or reply changed the Waiting set after this request
@@ -1458,6 +1484,7 @@
       sha256Input.value = '';
       sendBtn.disabled = true;
 
+      const finishWaitingAction = beginWaitingAction();
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(targetPubkey), {
           method: 'POST',
@@ -1482,8 +1509,8 @@
         // Our reply changes who is waiting: refresh the counts and, if this
         // thread is still open, its button; otherwise just the replied-to row.
         fetchFilterCounts();
-        if (selectedPubkey === targetPubkey) loadReplyState(targetPubkey);
-        else refreshRowWaiting(targetPubkey);
+        if (selectedPubkey === targetPubkey) await loadReplyState(targetPubkey);
+        else await refreshRowWaiting(targetPubkey);
       } catch (err) {
         // Revert: remove the optimistic bubble if still present, and restore the
         // typed text only if we're still on the same thread (the composer is a
@@ -1502,6 +1529,7 @@
         alert('Failed to send message: ' + err.message);
         console.error('sendMessage error:', err);
       } finally {
+        finishWaitingAction();
         sendBtn.disabled = false;
         input.focus();
       }
