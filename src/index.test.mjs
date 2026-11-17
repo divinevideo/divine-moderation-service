@@ -153,7 +153,7 @@ function createDbMock({
           if (/AS all_count/i.test(sql)) {
             return { all_count: 0, waiting: 0, person: 0, reports: 0, notices: 0, outcomes: 0, warnings: 0 };
           }
-          if (/AS conversation_id\) target/i.test(sql)) {
+          if (/\(SELECT waiting FROM flags\)/i.test(sql)) {
             return { waiting: null, no_reply_needed_at: null };
           }
           return null;

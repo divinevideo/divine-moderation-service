@@ -456,12 +456,13 @@ export async function getFilterCounts(db) {
  */
 export async function getConversationState(db, conversationId) {
   const flags = conversationFlagsCte({ conversationId });
+  // flags has at most one row here. The mark is read from its own table, not
+  // from flags, because flags has no row for a conversation with no messages.
   const row = await db.prepare(`
     WITH ${flags.sql}
-    SELECT flags.waiting, rps.no_reply_needed_at
-    FROM (SELECT ? AS conversation_id) target
-    LEFT JOIN flags ON flags.conversation_id = target.conversation_id
-    LEFT JOIN dm_conversation_reply_state rps ON rps.conversation_id = target.conversation_id
+    SELECT
+      (SELECT waiting FROM flags) AS waiting,
+      (SELECT no_reply_needed_at FROM dm_conversation_reply_state WHERE conversation_id = ?) AS no_reply_needed_at
   `).bind(...flags.params, conversationId).first();
 
   return {

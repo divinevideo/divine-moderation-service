@@ -1401,6 +1401,12 @@ describe('DM Store - conversation filters against real D1', () => {
     expect((await getConversationState(db, convFor(1))).waiting).toBe(false);
   });
 
+  it('getConversationState still reports a mark on a conversation with no rows', async () => {
+    await markNoReplyNeeded(db, convFor(1));
+    const mark = await db.prepare('SELECT no_reply_needed_at FROM dm_conversation_reply_state WHERE conversation_id = ?').bind(convFor(1)).first();
+    expect(await getConversationState(db, convFor(1))).toEqual({ waiting: false, no_reply_needed_at: mark.no_reply_needed_at });
+  });
+
   it('getConversationState for a conversation with no rows', async () => {
     expect(await getConversationState(db, convFor(1))).toEqual({ waiting: false, no_reply_needed_at: null });
   });
