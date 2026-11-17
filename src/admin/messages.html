@@ -1088,7 +1088,8 @@
         showReplyState({ waiting: false, marked: true });
       } catch (err) {
         waitingListNeedsRefresh = true;
-        if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = false;
+        // Same gate as showReplyState: live only once the open thread has rendered.
+        if (selectedPubkey === target) document.getElementById('no-reply-btn').disabled = !(threadSeen && threadSeen.pubkey === selectedPubkey);
         alert('Failed to mark no reply needed: ' + err.message);
         console.error('markNoReplyNeeded error:', err);
       } finally {

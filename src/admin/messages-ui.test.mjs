@@ -854,6 +854,23 @@ describe('messages UI — handled rows and people-chip previews', () => {
     } finally { restore(); }
   });
 
+  // A failed mark must not re-enable the button while the thread isn't rendered
+  // (a Refresh reloading it), or the next click sends seen_through_id 0.
+  it('a failed mark re-enables the button only when the open thread has rendered', async () => {
+    const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const g = globalThis;
+      g.fetch = async () => ({ ok: false });
+      const btn = g.document.getElementById('no-reply-btn');
+      g.threadSeen = null;
+      await markNoReplyNeeded();
+      expect(btn.disabled).toBe(true);
+      g.threadSeen = { pubkey: 'A', maxId: 3 };
+      await markNoReplyNeeded();
+      expect(btn.disabled).toBe(false);
+    } finally { restore(); }
+  });
+
   it('a pre-mark state response cannot restore waiting or advance the next-page offset', async () => {
     for (const reader of ['loadReplyState', 'refreshRowWaiting']) {
       const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
