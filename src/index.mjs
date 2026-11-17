@@ -206,6 +206,21 @@ function jsonResponse(status, data, headers = {}) {
   });
 }
 
+// Resolve /admin/api/messages/{pubkey}/{action} (split on '/') to the
+// moderator's conversation with that pubkey, for the per-conversation admin
+// routes. Returns { conversationId }, or { error } holding the response to
+// send: 400 for a malformed pubkey, 500 when no signing key is configured.
+async function resolveMessagesConversation(parts, env) {
+  if (parts.length !== 6 || !isValidPubkey(parts[4])) {
+    return { error: jsonError('Valid pubkey (64-char hex) required', 400) };
+  }
+  const { computeConversationId } = await import('./nostr/dm-store.mjs');
+  const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
+  const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
+  if (!moderatorPubkey) return { error: jsonError('Moderator signing key not configured', 500) };
+  return { conversationId: computeConversationId(moderatorPubkey, parts[4].toLowerCase()) };
+}
+
 function corsResponse(response) {
   const headers = new Headers(response.headers);
   headers.set('Access-Control-Allow-Origin', '*');
@@ -4106,10 +4121,9 @@ async function runMigration() {
         const authError = await requireAuth(request, env);
         if (authError) return authError;
 
-        if (!isValidPubkey(stateParts[4])) {
-          return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-        }
-        const pubkey = stateParts[4].toLowerCase();
+        const resolved = await resolveMessagesConversation(stateParts, env);
+        if (resolved.error) return resolved.error;
+        const { conversationId } = resolved;
         // The admin page sends the newest message id its open thread showed, so
         // the mark can't cover a message logged after the thread was loaded.
         // Optional: without it the mark is as of now.
@@ -4122,29 +4136,22 @@ async function runMigration() {
           if (text.trim()) {
             try { body = JSON.parse(text); } catch { body = undefined; }
             if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-              return new Response(JSON.stringify({ error: 'Body must be a JSON object' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+              return jsonError('Body must be a JSON object', 400);
             }
           }
           if (body && body.seen_through_id !== undefined) {
             if (!Number.isSafeInteger(body.seen_through_id) || body.seen_through_id < 0) {
-              return new Response(JSON.stringify({ error: 'seen_through_id must be a non-negative integer' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+              return jsonError('seen_through_id must be a non-negative integer', 400);
             }
             seenThroughId = body.seen_through_id;
           }
         }
-        const { computeConversationId, getConversationState, markNoReplyNeeded, clearNoReplyNeeded, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
-        const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
-        const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
-        if (!moderatorPubkey) {
-          return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-        }
+        const { getConversationState, markNoReplyNeeded, clearNoReplyNeeded, initDmReplyStateTable } = await import('./nostr/dm-store.mjs');
         await initDmReplyStateTable(env.BLOSSOM_DB);
-        const conversationId = computeConversationId(moderatorPubkey, pubkey);
         if (request.method === 'POST') await markNoReplyNeeded(env.BLOSSOM_DB, conversationId, { seenThroughId });
         if (request.method === 'DELETE') await clearNoReplyNeeded(env.BLOSSOM_DB, conversationId);
         const state = await getConversationState(env.BLOSSOM_DB, conversationId);
-        const body = isNoReply ? { success: true, ...state } : state;
-        return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+        return jsonResponse(200, isNoReply ? { success: true, ...state } : state);
       }
     }
 
@@ -4192,21 +4199,12 @@ async function runMigration() {
       const authError = await requireAuth(request, env);
       if (authError) return authError;
 
-      const parts = url.pathname.split('/');
-      if (parts.length !== 6 || !isValidPubkey(parts[4])) {
-        return new Response(JSON.stringify({ error: 'Valid pubkey (64-char hex) required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
-      }
-      const pubkey = parts[4].toLowerCase();
-      const { computeConversationId, markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
-      const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
-      const moderatorPubkey = env.NOSTR_PRIVATE_KEY ? getModeratorPubkey(env) : undefined;
-      if (!moderatorPubkey) {
-        return new Response(JSON.stringify({ error: 'Moderator signing key not configured' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-      }
+      const resolved = await resolveMessagesConversation(url.pathname.split('/'), env);
+      if (resolved.error) return resolved.error;
+      const { markConversationRead, initDmReadStateTable } = await import('./nostr/dm-store.mjs');
       await initDmReadStateTable(env.BLOSSOM_DB);
-      const conversationId = computeConversationId(moderatorPubkey, pubkey);
-      await markConversationRead(env.BLOSSOM_DB, conversationId);
-      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      await markConversationRead(env.BLOSSOM_DB, resolved.conversationId);
+      return jsonResponse(200, { success: true });
     }
 
     // Admin API: Resolve a recipient (hex / npub / verified nip-05) to a hex pubkey.
