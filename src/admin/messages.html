@@ -663,6 +663,9 @@
     // Conversation whose No reply needed mark was set in this page session, so
     // Undo survives a reload of reply state while the mark is still active.
     let markedPubkey = null;
+    // Row-only and header reads share a generation per conversation. A late
+    // response must not undo a newer action's waiting flag or paging offset.
+    const replyStateGenerations = new Map();
     let conversations = [];
     let profileCache = {};
 
@@ -966,13 +969,26 @@
       renderConversations();
     }
 
+    function invalidateReplyState(pubkey) {
+      const gen = (replyStateGenerations.get(pubkey) || 0) + 1;
+      replyStateGenerations.set(pubkey, gen);
+      return gen;
+    }
+
+    async function fetchReplyState(pubkey) {
+      const gen = invalidateReplyState(pubkey);
+      const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
+      if (!res.ok) return null;
+      const data = await res.json();
+      return replyStateGenerations.get(pubkey) === gen ? data : null;
+    }
+
     // Row-only refresh for a thread that is not (or no longer) open: never
     // touches the header, which belongs to the open thread.
     async function refreshRowWaiting(pubkey) {
       try {
-        const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
-        if (!res.ok) return;
-        const data = await res.json();
+        const data = await fetchReplyState(pubkey);
+        if (!data) return;
         setConversationWaiting(pubkey, Boolean(data.waiting));
       } catch (err) {
         console.error('refreshRowWaiting error:', err); // the next refresh corrects the row
@@ -983,9 +999,8 @@
       if (selectedPubkey !== pubkey) return; // moderator moved on; leave the open thread's header alone
       showReplyState({ waiting: false, marked: false });
       try {
-        const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey) + '/state');
-        if (!res.ok) return;
-        const data = await res.json();
+        const data = await fetchReplyState(pubkey);
+        if (!data) return;
         const waiting = Boolean(data.waiting);
         // The row belongs to pubkey whether or not it is still open; only the
         // header must stay untouched once the moderator has moved on.
@@ -1005,6 +1020,7 @@
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'POST' });
         if (!res.ok) throw new Error('Failed to mark no reply needed');
+        invalidateReplyState(target);
         fetchFilterCounts();
         setConversationWaiting(target, false);
         if (selectedPubkey !== target) return;
@@ -1023,6 +1039,7 @@
       try {
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(target) + '/no-reply-needed', { method: 'DELETE' });
         if (!res.ok) throw new Error('Failed to undo');
+        invalidateReplyState(target);
         if (markedPubkey === target) markedPubkey = null;
         fetchFilterCounts();
         if (selectedPubkey !== target) {

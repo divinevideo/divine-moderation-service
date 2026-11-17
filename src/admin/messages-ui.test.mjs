@@ -471,11 +471,15 @@ describe('messages UI — reply state behavior', () => {
   const saved = {};
   function setup({ selected, marked, state }) {
     const calls = [];
-    for (const k of ['selectedPubkey', 'markedPubkey', 'showReplyState', 'fetch']) saved[k] = globalThis[k];
+    for (const k of ['selectedPubkey', 'markedPubkey', 'showReplyState', 'setConversationWaiting', 'fetch', 'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState']) saved[k] = globalThis[k];
     globalThis.selectedPubkey = selected;
     globalThis.markedPubkey = marked;
     globalThis.showReplyState = (arg) => calls.push(arg);
+    globalThis.setConversationWaiting = () => {};
     globalThis.fetch = async () => ({ ok: true, json: async () => state });
+    globalThis.replyStateGenerations = new Map();
+    globalThis.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
+    globalThis.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
     return { calls, loadReplyState: extractFunction(messagesHTML, 'loadReplyState') };
   }
   function restore() {
@@ -517,7 +521,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
   const names = ['activeFilter', 'selectedPubkey', 'markedPubkey', 'conversations', 'showReplyState', 'renderConversations',
     'fetchFilterCounts', 'fetch', 'alert', 'document', 'currentConversationSearch', 'avatarHtml', 'displayName',
     'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
-    'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble'];
+    'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble',
+    'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState'];
   const saved = {};
   function setup({ filter = '', rows = [], selected = 'A' } = {}) {
     for (const k of names) saved[k] = globalThis[k];
@@ -525,6 +530,9 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.activeFilter = filter;
     g.selectedPubkey = selected;
     g.markedPubkey = null;
+    g.replyStateGenerations = new Map();
+    g.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
+    g.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
     g.conversations = rows;
     g.showReplyState = () => {};
     g.fetchFilterCounts = () => {};
@@ -635,6 +643,41 @@ describe('messages UI — handled rows and people-chip previews', () => {
     try {
       await globalThis.loadReplyState('A');
       expect(render()).not.toContain('handled');
+    } finally { restore(); }
+  });
+
+  it('a pre-mark state response cannot restore waiting or advance the next-page offset', async () => {
+    for (const reader of ['loadReplyState', 'refreshRowWaiting']) {
+      const { markNoReplyNeeded } = setup({ filter: 'waiting', rows: [row()] });
+      try {
+        let resolveState;
+        globalThis.fetch = async (url, opts = {}) => opts.method === 'POST'
+          ? { ok: true }
+          : new Promise(resolve => { resolveState = resolve; });
+        const pending = globalThis[reader]('A');
+        await markNoReplyNeeded();
+        expect(globalThis.conversationsOffset, reader).toBe(9);
+        resolveState({ ok: true, json: async () => ({ waiting: true }) });
+        await pending;
+        expect(globalThis.conversations[0].waiting, reader).toBe(false);
+        expect(globalThis.conversationsOffset, reader).toBe(9);
+      } finally { restore(); }
+    }
+  });
+
+  it('an older header request cannot overwrite a newer row-state response', async () => {
+    setup({ filter: 'waiting', rows: [row()] });
+    try {
+      const pendingResponses = [];
+      globalThis.fetch = () => new Promise(resolve => pendingResponses.push(resolve));
+      const older = globalThis.loadReplyState('A');
+      const newer = globalThis.refreshRowWaiting('A');
+      pendingResponses[1]({ ok: true, json: async () => ({ waiting: false }) });
+      await newer;
+      pendingResponses[0]({ ok: true, json: async () => ({ waiting: true }) });
+      await older;
+      expect(globalThis.conversations[0].waiting).toBe(false);
+      expect(globalThis.conversationsOffset).toBe(9);
     } finally { restore(); }
   });
 
