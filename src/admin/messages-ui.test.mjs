@@ -974,8 +974,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
   }
 
   // Shared setup for a two-row Waiting list, one page of two, offset 2.
-  function setupWaitingPaging() {
-    const handles = setup({ filter: 'waiting', rows: [row(), row({ participant_pubkey: 'B' })] });
+  function setupWaitingPaging({ rows = [row(), row({ participant_pubkey: 'B' })], selected = 'A' } = {}) {
+    const handles = setup({ filter: 'waiting', rows, selected });
     const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
       'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
     for (const k of extra) saved[k] = globalThis[k];
@@ -1064,4 +1064,52 @@ describe('messages UI — handled rows and people-chip previews', () => {
       restore();
     }
   });
+
+  // A conversation that isn't loaded yet can still sit inside the page being
+  // fetched: the open thread right after switching to Waiting on us, or a
+  // thread opened from search while the next page loads. Marking it mid-request
+  // must make that page retry, or a pre-mark snapshot shows it as still waiting
+  // and the next page starts one late.
+  for (const append of [false, true]) {
+    it(`retries a ${append ? 'next' : 'fresh'} Waiting page when an unloaded row in it is marked mid-request`, async () => {
+      const { markNoReplyNeeded } = setupWaitingPaging(append
+        ? { selected: 'C' }
+        : { rows: [], selected: 'C' });
+      let mark;
+      let page;
+      let firstPage;
+      try {
+        const g = globalThis;
+        if (!append) g.conversationsOffset = 0;
+        let marked = false;
+        const requests = [];
+        g.fetch = async (url, opts = {}) => {
+          if (opts.method === 'POST') { marked = true; return { ok: true }; }
+          if (url.endsWith('/state')) return { ok: true, json: async () => ({ waiting: false }) };
+          requests.push(url);
+          const offset = Number(offsetOf(url));
+          const snapshot = requests.length === 1 || !marked
+            ? ['A', 'B', 'C', 'D', 'E', 'F'] : ['A', 'B', 'D', 'E', 'F'];
+          const set = append ? snapshot : snapshot.filter(k => k !== 'A' && k !== 'B');
+          const res = { ok: true, json: async () => set.slice(offset, offset + 2).map(key => row({ participant_pubkey: key })) };
+          if (requests.length === 1) return new Promise(resolve => { firstPage = () => resolve(res); });
+          return res;
+        };
+        page = g.fetchConversations({ append });
+        await flush();
+        mark = markNoReplyNeeded();
+        await mark;
+        firstPage(); // the list query ran before the mark committed
+        await page;
+        expect(requests.map(offsetOf)).toEqual(append ? ['2', '2'] : ['0', '0']);
+        expect(g.conversations.map(c => c.participant_pubkey)).toEqual(append ? ['A', 'B', 'D', 'E'] : ['D', 'E']);
+        expect(g.conversationsOffset).toBe(append ? 4 : 2);
+      } finally {
+        await mark;
+        firstPage?.();
+        await page;
+        restore();
+      }
+    });
+  }
 });

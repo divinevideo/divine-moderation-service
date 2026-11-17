@@ -975,7 +975,13 @@
     // on us list can grey a handled row. Grey itself is derived at render time.
     function setConversationWaiting(pubkey, waiting) {
       const conv = conversations.find(c => (c.participant_pubkey || c.pubkey) === pubkey);
-      if (!conv) return;
+      if (!conv) {
+        // Not loaded, but it may sit inside the Waiting page being fetched (the
+        // open thread just after a chip switch, or one opened from search), so
+        // make that page retry. Its position is unknown, so the offset stays.
+        if (activeFilter === 'waiting') waitingListGeneration++;
+        return;
+      }
       const was = conv.waiting !== false; // a loaded row with no flag came from the Waiting set
       const now = Boolean(waiting);
       conv.waiting = now;
