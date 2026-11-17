@@ -679,7 +679,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
   });
 
   it('loadThread records the newest message id it rendered, and clears it while loading or on failure', async () => {
-    const keys = ['document', 'fetch', 'renderThread', 'threadSeen'];
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen', 'selectedPubkey'];
     const kept = {};
     for (const k of keys) kept[k] = globalThis[k];
     try {
@@ -687,6 +687,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
       globalThis.document = { getElementById: () => el };
       globalThis.renderThread = () => {};
       const loadThread = extractFunction(messagesHTML, 'loadThread');
+      globalThis.selectedPubkey = 'A';
       globalThis.threadSeen = { pubkey: 'OLD', maxId: 99 };
       let seenWhileLoading;
       globalThis.fetch = async () => {
@@ -699,6 +700,41 @@ describe('messages UI — handled rows and people-chip previews', () => {
       globalThis.fetch = async () => ({ ok: false });
       await loadThread('A');
       expect(globalThis.threadSeen).toBe(null);
+    } finally {
+      for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
+    }
+  });
+
+  // Open A (slow), then B: A's late response must not render A's messages
+  // under B's header or point threadSeen at A while B's button is live.
+  it('loadThread ignores a late response for a thread the moderator has left', async () => {
+    const keys = ['document', 'fetch', 'renderThread', 'threadSeen', 'selectedPubkey'];
+    const kept = {};
+    for (const k of keys) kept[k] = globalThis[k];
+    try {
+      const btn = { style: {}, disabled: true };
+      const el = { style: {}, children: [], innerHTML: '' };
+      globalThis.document = { getElementById: (id) => (id === 'no-reply-btn' ? btn : el) };
+      const renders = [];
+      globalThis.renderThread = (messages) => renders.push(messages);
+      const loadThread = extractFunction(messagesHTML, 'loadThread');
+      for (const response of [{ ok: true, json: async () => [{ id: 3 }] }, { ok: false }]) {
+        let respond;
+        globalThis.fetch = () => new Promise(resolve => { respond = resolve; });
+        globalThis.selectedPubkey = 'A';
+        const slowA = loadThread('A');
+        // B opens and renders while A's request is still out.
+        globalThis.selectedPubkey = 'B';
+        globalThis.threadSeen = { pubkey: 'B', maxId: 7 };
+        btn.disabled = false;
+        el.innerHTML = '';
+        respond(response);
+        await slowA;
+        expect(renders).toEqual([]);
+        expect(el.innerHTML).not.toContain('Failed');
+        expect(globalThis.threadSeen).toEqual({ pubkey: 'B', maxId: 7 });
+        expect(btn.disabled).toBe(false);
+      }
     } finally {
       for (const k of keys) { if (kept[k] === undefined) delete globalThis[k]; else globalThis[k] = kept[k]; }
     }

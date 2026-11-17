@@ -1418,12 +1418,16 @@
         const res = await fetch('/admin/api/messages/' + encodeURIComponent(pubkey));
         if (!res.ok) throw new Error('Failed to load thread');
         const data = await res.json();
+        // The moderator opened another thread meanwhile: its own load owns the
+        // view, so don't render this one under its header or touch threadSeen.
+        if (pubkey !== selectedPubkey) return;
         const messages = data.messages || data || [];
         loading.style.display = 'none';
         renderThread(messages);
         threadSeen = { pubkey, maxId: messages.reduce((max, msg) => Math.max(max, Number(msg.id) || 0), 0) };
         if (pubkey === selectedPubkey) document.getElementById('no-reply-btn').disabled = false;
       } catch (err) {
+        if (pubkey !== selectedPubkey) return; // a thread the moderator has left
         loading.style.display = 'none';
         container.innerHTML += '<div class="empty-state">Failed to load messages</div>';
         console.error('loadThread error:', err);
