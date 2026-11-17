@@ -13,7 +13,8 @@ function extractFunction(src, name) {
   const start = src.indexOf('function ' + name + '(');
   if (start === -1) throw new Error('function not found: ' + name);
   let depth = 0;
-  let i = src.indexOf('{', start);
+  // Start at the body's brace, not a destructured parameter's ({ a = 1 } = {}).
+  let i = src.indexOf(') {', start) + 2;
   for (; i < src.length; i++) {
     if (src[i] === '{') depth++;
     else if (src[i] === '}' && --depth === 0) { i++; break; }
@@ -305,7 +306,7 @@ describe('messages UI — failed load-more recovery (#207)', () => {
     // Not a tautology: pin each clear to its own branch so deleting either one
     // fails this test even though the literal appears elsewhere.
     expect(messagesHTML).toMatch(/conversationsHasMore = true;\s*\n\s*conversationsError = false;/);
-    expect(messagesHTML).toMatch(/conversationsOffset \+= page\.length;\s*\n\s*conversationsError = false;/);
+    expect(messagesHTML).toMatch(/conversationsOffset = append \? conversationsOffset \+ page\.length : page\.length;\s*\n\s*conversationsError = false;/);
   });
 });
 
@@ -742,6 +743,31 @@ describe('messages UI — handled rows and people-chip previews', () => {
     try {
       globalThis.setConversationWaiting('ZZZ', false);
       expect(globalThis.conversationsOffset).toBe(10);
+    } finally { restore(); }
+  });
+
+  // An Undo (or a mark) that resolves while a Refresh is fetching adjusts the
+  // offset of the list being replaced. The fresh page starts the offset over,
+  // so that adjustment must not carry into the next page's offset.
+  it('a waiting change landing mid-Refresh does not shift the next page offset', async () => {
+    setup({ filter: 'waiting', rows: [row({ waiting: false })] });
+    const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+      'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+    for (const k of extra) saved[k] = globalThis[k];
+    try {
+      const g = globalThis;
+      g.CONVERSATIONS_PAGE_SIZE = 50;
+      g.conversationsGen = 0;
+      g.fetchProfiles = async () => {};
+      g.document = { getElementById: () => ({ innerHTML: '', scrollTop: 0, style: {} }) };
+      g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+      const page = Array.from({ length: 50 }, (_, i) => row({ participant_pubkey: 'P' + i }));
+      g.fetch = async () => {
+        g.setConversationWaiting('A', true); // Undo resolves on the old list mid-fetch
+        return { ok: true, json: async () => ({ conversations: page }) };
+      };
+      await extractFunction(messagesHTML, 'fetchConversations')();
+      expect(g.conversationsOffset).toBe(50);
     } finally { restore(); }
   });
 });

@@ -1077,7 +1077,9 @@
         // Dedupe on append: offset paging over an activity-ordered list can
         // re-surface a row that moved up between page fetches.
         conversations = append ? dedupeConversations(conversations.concat(page)) : page;
-        conversationsOffset += page.length;
+        // A fresh page sets the offset outright: a waiting change that landed
+        // mid-fetch adjusted the replaced list's offset and must not carry over.
+        conversationsOffset = append ? conversationsOffset + page.length : page.length;
         conversationsError = false; // a page came back — clear any prior retry row
         // A short page means the server has no more rows past this point.
         conversationsHasMore = page.length === CONVERSATIONS_PAGE_SIZE;
