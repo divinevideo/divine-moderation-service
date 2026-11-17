@@ -684,6 +684,9 @@
     // A load-more (append) page failed. Surfaced as an inline retry row at the
     // list bottom so a failed page isn't mistaken for the end of history (#207).
     let conversationsError = false;
+    // A Waiting page must be retried if a local state change moves its boundary
+    // while the request is in flight; its server snapshot can be from either side.
+    let waitingListGeneration = 0;
 
     // Filter chips. Keys match the server's ?filter= values; '' is All and sends
     // no param. Tooltips are the agreed T&S copy.
@@ -964,6 +967,7 @@
       // starts one earlier (and one later again if Undo makes it wait). Only on
       // Waiting on us: other chips' sets don't depend on waiting.
       if (activeFilter === 'waiting' && was !== now) {
+        waitingListGeneration++;
         conversationsOffset = Math.max(0, conversationsOffset + (now ? 1 : -1));
       }
       renderConversations();
@@ -1078,6 +1082,7 @@
       // offset in the URL below is read synchronously (no await before it), so
       // each invocation fetches the page it intended.
       const gen = append ? conversationsGen : ++conversationsGen;
+      const waitingGen = waitingListGeneration;
       conversationsLoading = true;
 
       try {
@@ -1089,6 +1094,12 @@
         if (!res.ok) throw new Error('Failed to fetch conversations');
         const data = await res.json();
         if (gen !== conversationsGen) return; // superseded by a fresh load — discard
+        if (activeFilter === 'waiting' && waitingGen !== waitingListGeneration) {
+          // A mark, Undo or reply changed the Waiting set after this request
+          // began. Retry at the corrected offset instead of guessing whether
+          // the server took its snapshot before or after that change.
+          return await fetchConversations({ append });
+        }
         const page = data.conversations || data || [];
 
         // Dedupe on append: offset paging over an activity-ordered list can

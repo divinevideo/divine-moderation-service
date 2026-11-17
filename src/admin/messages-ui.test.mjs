@@ -522,7 +522,7 @@ describe('messages UI — handled rows and people-chip previews', () => {
     'fetchFilterCounts', 'fetch', 'alert', 'document', 'currentConversationSearch', 'avatarHtml', 'displayName',
     'relativeTime', 'badgeClass', 'badgeLabel', 'escapeHtml', 'appendLoadMoreError', 'setConversationWaiting',
     'renderConversationList', 'loadReplyState', 'conversationsOffset', 'refreshRowWaiting', 'appendOutgoingBubble',
-    'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState'];
+    'replyStateGenerations', 'invalidateReplyState', 'fetchReplyState', 'waitingListGeneration', 'fetchConversations'];
   const saved = {};
   function setup({ filter = '', rows = [], selected = 'A' } = {}) {
     for (const k of names) saved[k] = globalThis[k];
@@ -530,6 +530,8 @@ describe('messages UI — handled rows and people-chip previews', () => {
     g.activeFilter = filter;
     g.selectedPubkey = selected;
     g.markedPubkey = null;
+    g.waitingListGeneration = 0;
+    g.fetchConversations = extractFunction(messagesHTML, 'fetchConversations');
     g.replyStateGenerations = new Map();
     g.invalidateReplyState = extractFunction(messagesHTML, 'invalidateReplyState');
     g.fetchReplyState = extractFunction(messagesHTML, 'fetchReplyState');
@@ -813,4 +815,40 @@ describe('messages UI — handled rows and people-chip previews', () => {
       expect(g.conversationsOffset).toBe(50);
     } finally { restore(); }
   });
+
+  for (const append of [false, true]) {
+    it(`retries a ${append ? 'next' : 'fresh'} Waiting page when handling a row changes its boundary in flight`, async () => {
+      setup({ filter: 'waiting', rows: [row(), row({ participant_pubkey: 'B' })] });
+      const extra = ['CONVERSATIONS_PAGE_SIZE', 'conversationsGen', 'conversationsHasMore', 'conversationsError',
+        'conversationsLoading', 'fetchProfiles', 'dedupeConversations'];
+      for (const k of extra) saved[k] = globalThis[k];
+      try {
+        const g = globalThis;
+        g.CONVERSATIONS_PAGE_SIZE = 2;
+        g.conversationsGen = 0;
+        g.conversationsOffset = 2;
+        g.fetchProfiles = async () => {};
+        g.document = { getElementById: () => ({ innerHTML: '', scrollTop: 0, style: {} }) };
+        g.dedupeConversations = extractFunction(messagesHTML, 'dedupeConversations');
+        const requests = [];
+        g.fetch = async (url) => {
+          requests.push(url);
+          if (requests.length === 1) {
+            g.setConversationWaiting('A', false);
+            // Refresh can return a snapshot from before the mark. An append
+            // can instead run after the mark with its now-obsolete offset.
+            const keys = append ? ['D', 'E'] : ['A', 'B'];
+            return { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+          }
+          const keys = append ? ['C', 'D'] : ['B', 'C'];
+          return { ok: true, json: async () => keys.map(key => row({ participant_pubkey: key })) };
+        };
+        await extractFunction(messagesHTML, 'fetchConversations')({ append });
+        expect(requests.map(url => new URL(url, 'https://example.test').searchParams.get('offset')))
+          .toEqual(append ? ['2', '1'] : ['0', '0']);
+        expect(g.conversations.map(c => c.participant_pubkey)).toEqual(append ? ['A', 'B', 'C', 'D'] : ['B', 'C']);
+        expect(g.conversationsOffset).toBe(append ? 3 : 2);
+      } finally { restore(); }
+    });
+  }
 });
