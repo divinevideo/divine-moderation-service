@@ -451,6 +451,29 @@ describe('messages UI — filter chips and No reply needed', () => {
     }
   });
 
+  it('switching chips refreshes the counts along with the list', () => {
+    let counts = 0;
+    let lists = 0;
+    const setFilter = new Function('return (' + sliceFn('function setFilter(') + ')')();
+    const saved = {};
+    const stubs = {
+      activeFilter: '', localStorage: { setItem() {} }, renderFilterChips() {}, conversations: [],
+      document: { getElementById: () => ({ innerHTML: '' }) },
+      fetchFilterCounts: () => { counts++; },
+      fetchConversations: () => { lists++; return Promise.resolve(); },
+      maybeAutoFillConversations() {}, FILTER_STORAGE_KEY: 'k',
+    };
+    for (const [k, v] of Object.entries(stubs)) { saved[k] = globalThis[k]; globalThis[k] = v; }
+    try {
+      setFilter('waiting');
+      expect([counts, lists]).toEqual([1, 1]);
+      setFilter('waiting'); // re-selecting the active chip does nothing
+      expect([counts, lists]).toEqual([1, 1]);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete globalThis[k]; else globalThis[k] = v; }
+    }
+  });
+
   it('the thread header has the No reply needed button and undo copy', () => {
     expect(messagesHTML).toContain('id="no-reply-btn"');
     expect(messagesHTML).toContain('No reply needed');

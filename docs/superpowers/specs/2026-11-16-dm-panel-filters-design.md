@@ -92,7 +92,7 @@ The "A person wrote" chip's description points people at Waiting on us, because 
 
 ## Counts
 
-Each chip shows how many conversations match it ("All" shows the total). Counts come from the server, from the same per-conversation flags the list filter uses, so a chip's count always equals the number of rows that filter can page through. Counts reload on page load, after Refresh/sync, after sending a reply, and after No reply needed or its undo.
+Each chip shows how many conversations match it ("All" shows the total). Counts come from the server, from the same per-conversation flags the list filter uses, so a chip's count always equals the number of rows that filter can page through. Counts reload on page load, on switching chips, after Refresh/sync, after sending a reply, and after No reply needed or its undo.
 
 ## No reply needed
 

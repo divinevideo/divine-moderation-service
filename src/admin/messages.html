@@ -936,6 +936,10 @@
       conversations = [];
       document.getElementById('conversation-items').innerHTML =
         '<div class="loading-state" id="conv-loading"><div class="spinner"></div><span>Loading conversations...</span></div>';
+      // The inbox sync logs messages every five minutes, so counts from page
+      // load can be stale; refresh them with the list so the chip agrees with
+      // what it opens.
+      fetchFilterCounts();
       fetchConversations().then(() => maybeAutoFillConversations());
     }
 
