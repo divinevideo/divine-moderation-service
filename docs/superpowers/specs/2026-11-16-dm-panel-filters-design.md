@@ -128,7 +128,7 @@ Each chip shows how many conversations match it ("All" shows the total). Counts 
 - Reopened-thread state reads stay in that pause until the winning response reconciles the row. If an action or state read fails, the next Waiting page starts fresh at offset zero because the old offset can no longer be trusted.
 - **Row preview in the people chips** (added 2026-11-16 after Matt's review). On Waiting on us and A person wrote, each row shows the person's latest typed message, its time, and a Creator Reply badge, instead of the conversation's last message, because a later automated notice would otherwise hide what the person said. All and the automated chips keep the team's last-message labels. Row order is unchanged (latest activity in either direction).
 - Name search keeps filtering the loaded rows client-side, so within a chip it narrows that chip's loaded rows. Identifier lookup (Enter) still opens the matching conversation whatever chip is active.
-- Remembering the active chip across reloads is optional (localStorage, wrapped in try/catch).
+- The active chip is remembered per browser tab (sessionStorage, wrapped in try/catch), so a new tab starts on All, the default. A followed `?pubkey=` link always opens on All so the linked conversation is in the list (decided 2026-11-17).
 
 ## Known limitations (stated in the UI help text and the PR)
 

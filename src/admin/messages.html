@@ -906,7 +906,8 @@
 
     function restoreFilter() {
       try {
-        const saved = localStorage.getItem(FILTER_STORAGE_KEY);
+        // Per tab: a new tab, or a followed link, starts on All (the default).
+        const saved = sessionStorage.getItem(FILTER_STORAGE_KEY);
         if (FILTER_CHIPS.some(c => c.key === saved)) return saved;
       } catch (e) {
         // storage blocked; fall through to All
@@ -929,7 +930,7 @@
     function setFilter(key) {
       if (key === activeFilter) return;
       activeFilter = key;
-      try { localStorage.setItem(FILTER_STORAGE_KEY, key); } catch (e) { /* non-fatal */ }
+      try { sessionStorage.setItem(FILTER_STORAGE_KEY, key); } catch (e) { /* non-fatal */ }
       renderFilterChips();
       // Drop the old chip's rows so they don't sit under the new chip while the
       // fresh load (which resets paging and supersedes anything in flight) runs.
@@ -1717,7 +1718,8 @@
       const urlParams = new URLSearchParams(window.location.search);
       const preselectedPubkey = urlParams.get('pubkey');
 
-      activeFilter = restoreFilter();
+      // A followed ?pubkey= link opens on All so the linked conversation is listed.
+      activeFilter = preselectedPubkey ? '' : restoreFilter();
       renderFilterChips();
       fetchFilterCounts();
       await fetchConversations();

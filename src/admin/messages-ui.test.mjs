@@ -431,7 +431,8 @@ describe('messages UI — filter chips and No reply needed', () => {
   it('restoreFilter falls back to All for an unknown key or a throwing store', () => {
     const FILTER_CHIPS = [{ key: '' }, { key: 'waiting' }, { key: 'person' }];
     const text = sliceFn('function restoreFilter(');
-    const make = (ls) => new Function('FILTER_CHIPS', 'FILTER_STORAGE_KEY', 'localStorage', 'return (' + text + ')')(FILTER_CHIPS, 'k', ls);
+    // Per tab (sessionStorage), so a new tab or a followed link starts on All.
+    const make = (ls) => new Function('FILTER_CHIPS', 'FILTER_STORAGE_KEY', 'sessionStorage', 'localStorage', 'return (' + text + ')')(FILTER_CHIPS, 'k', ls, { getItem: () => 'waiting' });
     expect(make({ getItem: () => 'bogus' })()).toBe('');
     expect(make({ getItem: () => { throw new Error('blocked'); } })()).toBe('');
     expect(make({ getItem: () => 'waiting' })()).toBe('waiting');
@@ -454,10 +455,11 @@ describe('messages UI — filter chips and No reply needed', () => {
   it('switching chips refreshes the counts along with the list', () => {
     let counts = 0;
     let lists = 0;
+    let stored;
     const setFilter = new Function('return (' + sliceFn('function setFilter(') + ')')();
     const saved = {};
     const stubs = {
-      activeFilter: '', localStorage: { setItem() {} }, renderFilterChips() {}, conversations: [],
+      activeFilter: '', sessionStorage: { setItem: (k, v) => { stored = v; } }, renderFilterChips() {}, conversations: [],
       document: { getElementById: () => ({ innerHTML: '' }) },
       fetchFilterCounts: () => { counts++; },
       fetchConversations: () => { lists++; return Promise.resolve(); },
@@ -467,6 +469,7 @@ describe('messages UI — filter chips and No reply needed', () => {
     try {
       setFilter('waiting');
       expect([counts, lists]).toEqual([1, 1]);
+      expect(stored).toBe('waiting'); // remembered for this tab only
       setFilter('waiting'); // re-selecting the active chip does nothing
       expect([counts, lists]).toEqual([1, 1]);
     } finally {
@@ -486,6 +489,8 @@ describe('messages UI — filter chips and No reply needed', () => {
     const init = messagesHTML.slice(messagesHTML.indexOf('async function init()'));
     expect(init.indexOf('restoreFilter()')).toBeGreaterThan(-1);
     expect(init.indexOf('restoreFilter()')).toBeLessThan(init.indexOf('fetchConversations()'));
+    // A followed ?pubkey= link opens on All, so the linked conversation is in the list.
+    expect(init).toMatch(/activeFilter = preselectedPubkey \? '' : restoreFilter\(\);/);
     expect(init).toContain('fetchFilterCounts()');
   });
 });
