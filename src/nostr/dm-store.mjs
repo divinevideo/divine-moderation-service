@@ -60,6 +60,13 @@ export async function ensureDmLogExcerptColumn(db) {
   }
 }
 
+const DM_READ_STATE_DDL = `
+    CREATE TABLE IF NOT EXISTS dm_conversation_read_state (
+      conversation_id TEXT PRIMARY KEY,
+      read_at TEXT NOT NULL
+    )
+  `;
+
 /**
  * Create the per-conversation read-state table if it doesn't exist.
  *
@@ -72,13 +79,15 @@ export async function ensureDmLogExcerptColumn(db) {
  * @param {D1Database} db
  */
 export async function initDmReadStateTable(db) {
-  await db.prepare(`
-    CREATE TABLE IF NOT EXISTS dm_conversation_read_state (
-      conversation_id TEXT PRIMARY KEY,
-      read_at TEXT NOT NULL
-    )
-  `).run();
+  await db.prepare(DM_READ_STATE_DDL).run();
 }
+
+const DM_REPLY_STATE_DDL = `
+    CREATE TABLE IF NOT EXISTS dm_conversation_reply_state (
+      conversation_id TEXT PRIMARY KEY,
+      no_reply_needed_at TEXT NOT NULL
+    )
+  `;
 
 /**
  * Create the per-conversation "No reply needed" table if it doesn't exist.
@@ -88,12 +97,16 @@ export async function initDmReadStateTable(db) {
  * @param {D1Database} db
  */
 export async function initDmReplyStateTable(db) {
-  await db.prepare(`
-    CREATE TABLE IF NOT EXISTS dm_conversation_reply_state (
-      conversation_id TEXT PRIMARY KEY,
-      no_reply_needed_at TEXT NOT NULL
-    )
-  `).run();
+  await db.prepare(DM_REPLY_STATE_DDL).run();
+}
+
+/**
+ * Ensure both per-conversation state tables in one D1 round trip, for the
+ * paths that use both: the conversation list and the retention prune.
+ * @param {D1Database} db
+ */
+export async function initDmStateTables(db) {
+  await db.batch([db.prepare(DM_READ_STATE_DDL), db.prepare(DM_REPLY_STATE_DDL)]);
 }
 
 export async function findDmByNostrEventId(db, nostrEventId) {
@@ -215,8 +228,7 @@ export async function clearNoReplyNeeded(db, conversationId) {
  * @returns {Promise<{deletedMessages: number, deletedReadStates: number, deletedReplyStates: number}>}
  */
 export async function pruneExpiredDmLog(db) {
-  await initDmReadStateTable(db);
-  await initDmReplyStateTable(db);
+  await initDmStateTables(db);
   const [messagesResult, readStateResult, replyStateResult] = await db.batch([
     db.prepare(`DELETE FROM dm_log WHERE created_at < datetime('now', '-1 years')`),
     db.prepare(`

@@ -8011,6 +8011,19 @@ describe('DM filter routes', () => {
     expect(selectIndex).toBeGreaterThan(createIndex);
   });
 
+  it('GET /admin/api/messages ensures both DM state tables in one batch', async () => {
+    const db = createDbMock();
+    const prepare = db.prepare.bind(db);
+    db.prepare = (sql) => Object.assign(prepare(sql), { sql });
+    const batches = [];
+    db.batch = async (statements) => { batches.push(statements.map((statement) => statement.sql)); return []; };
+    const res = await worker.fetch(new Request(BASE, authed()), env({ BLOSSOM_DB: db }));
+    expect(res.status).toBe(200);
+    const ddl = batches.find((sqls) => sqls.some((sql) => /CREATE TABLE IF NOT EXISTS\s+dm_conversation_read_state/.test(sql)));
+    expect(ddl).toBeDefined();
+    expect(ddl.some((sql) => /CREATE TABLE IF NOT EXISTS\s+dm_conversation_reply_state/.test(sql))).toBe(true);
+  });
+
   it('GET /admin/api/messages passes ?filter through to the conversations query', async () => {
     const run = async (query) => {
       const prepared = [];

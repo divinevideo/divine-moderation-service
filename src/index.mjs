@@ -4069,7 +4069,7 @@ async function runMigration() {
 
       const limit = parseInt(url.searchParams.get('limit') || '20');
       const offset = parseInt(url.searchParams.get('offset') || '0');
-      const { getConversations, initDmReadStateTable, initDmReplyStateTable, CONVERSATION_FILTERS } = await import('./nostr/dm-store.mjs');
+      const { getConversations, initDmStateTables, CONVERSATION_FILTERS } = await import('./nostr/dm-store.mjs');
       const { getModeratorPubkey } = await import('./nostr/dm-reader.mjs');
       // Absent or empty filter means All (undefined); anything else must be a
       // known key. getConversations throws on unknown values, so reject here.
@@ -4082,8 +4082,8 @@ async function runMigration() {
       // and dm_conversation_reply_state (No reply needed mark). Ensure both
       // here rather than relying on the migrations having been applied: the
       // deploy job runs on merge, `d1 migrations apply` does not.
-      await initDmReadStateTable(env.BLOSSOM_DB);
-      await initDmReplyStateTable(env.BLOSSOM_DB);
+      // One batch, so a list page pays one round trip for both.
+      await initDmStateTables(env.BLOSSOM_DB);
       // Pass moderatorPubkey so rows are augmented with participant_pubkey
       // (the non-moderator side) + latest_message/message_type aliases that
       // the admin messages UI expects. Without this, every conversation
