@@ -22,6 +22,7 @@ import {
   COMPOSE_TEMPLATES,
   renderComposeTemplate,
   publishToRelays,
+  formatEndTime,
 } from './dm-sender.mjs';
 import { isContained, parseRelayOverride } from './relay-override.mjs';
 import { createMockKV } from '../test/helpers.mjs';
@@ -1219,5 +1220,141 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
 
     expect(result.sent).toBe(false);
     expect(result.definitive).toBe(false);
+  });
+});
+
+describe('timed suspension messages', () => {
+  const END = '2026-11-24T14:00:00.000Z';
+  // Today's ACCOUNT_SUSPENDED text, captured verbatim from origin/main a50f782.
+  // A caller that sends no end time must keep getting exactly this.
+  const TODAY_SUSPENDED = "Your account has been suspended for violating Divine's content policies.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n\nLearn more about our content policies: divine.video/terms | about.divine.video/faqs/ | divine.video/support";
+
+  it('formats an end time in UTC with the date written out', () => {
+    expect(formatEndTime(END)).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+    expect(formatEndTime('2026-03-05T00:05:00.000Z')).toBe('Thursday 5 March 2026 at 00:05 UTC');
+    expect(formatEndTime('not a date')).toBeNull();
+  });
+
+  it('rounds a part-minute end time up, never stating a minute before the true end', () => {
+    expect(formatEndTime('2026-11-24T13:59:30Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+    expect(formatEndTime('2026-11-24T13:59:00.001Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+    // Rounding up can cross midnight and the year.
+    expect(formatEndTime('2026-12-31T23:59:01Z')).toBe('Friday 1 January 2027 at 00:00 UTC');
+  });
+
+  it('leaves an end time on the whole minute unchanged', () => {
+    expect(formatEndTime('2026-11-24T14:00:00Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+    expect(formatEndTime('2026-11-24T14:00:00.000Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+  });
+
+  it('formats an offset end time as its UTC instant', () => {
+    // 23:30 at -05:00 is 04:30 UTC the next day: the date must roll over too.
+    expect(formatEndTime('2026-12-31T23:30:00-05:00')).toBe('Friday 1 January 2027 at 04:30 UTC');
+  });
+
+  it('refuses strings Date.parse accepts but that are not ISO-8601 instants', () => {
+    // V8 reads 'hello 2' as 1 February 2001 and a zone-less ISO string as local
+    // time. Neither may become a date in a message.
+    expect(formatEndTime('hello 2')).toBeNull();
+    expect(formatEndTime('Tuesday 24 November 2026')).toBeNull();
+    expect(formatEndTime('2026-11-24T14:00:00')).toBeNull();
+    expect(formatEndTime('2026-11-24')).toBeNull();
+  });
+
+  it('refuses an ISO-shaped string whose month does not exist', () => {
+    // Date.parse returns NaN for month 13.
+    expect(formatEndTime('2026-13-01T00:00:00Z')).toBeNull();
+  });
+
+  it('refuses a calendar date that does not exist instead of rolling it over', () => {
+    // V8's Date.parse rolls these forward (30 February becomes 2 March), which
+    // would state a real-looking but wrong date.
+    expect(formatEndTime('2026-02-30T00:00:00Z')).toBeNull();
+    expect(formatEndTime('2026-04-31T00:00:00Z')).toBeNull();
+    expect(formatEndTime('2027-02-29T00:00:00Z')).toBeNull();
+    // The calendar date is checked as written, whatever the offset.
+    expect(formatEndTime('2026-04-31T00:00:00+05:00')).toBeNull();
+  });
+
+  it('accepts 29 February in a leap year', () => {
+    expect(formatEndTime('2028-02-29T12:00:00Z')).toBe('Tuesday 29 February 2028 at 12:00 UTC');
+  });
+
+  it('refuses non-string end times', () => {
+    expect(formatEndTime(1732456800000)).toBeNull();
+    expect(formatEndTime(null)).toBeNull();
+    expect(formatEndTime(undefined)).toBeNull();
+    // An array stringifies to its one element, so only a type check stops it.
+    expect(formatEndTime([END])).toBeNull();
+  });
+
+  it('ACCOUNT_SUSPENDED states the end time when given', () => {
+    const msg = selectTemplate('ACCOUNT_SUSPENDED', null, null, null, null, null, END);
+    expect(msg).toContain('Your account has been suspended until Tuesday 24 November 2026 at 14:00 UTC for violating');
+    expect(msg).toContain('reply to this message to appeal');
+  });
+
+  it("ACCOUNT_SUSPENDED without an end time is byte-identical to today's message", () => {
+    expect(selectTemplate('ACCOUNT_SUSPENDED', null, null, null)).toBe(TODAY_SUSPENDED);
+    expect(selectTemplate('ACCOUNT_SUSPENDED', null, null, null, null, null, null)).toBe(TODAY_SUSPENDED);
+    expect(getMessageForAction('ACCOUNT_SUSPENDED')).toBe(TODAY_SUSPENDED);
+    expect(renderComposeTemplate('ACCOUNT_SUSPENDED')).toBe(TODAY_SUSPENDED);
+  });
+
+  it("ACCOUNT_SUSPENDED falls back to today's wording when the end time does not parse", () => {
+    expect(selectTemplate('ACCOUNT_SUSPENDED', null, null, null, null, null, 'garbage')).toBe(TODAY_SUSPENDED);
+  });
+
+  it('ACCOUNT_SUSPENSION_CHANGED states the new end time', () => {
+    const msg = selectTemplate('ACCOUNT_SUSPENSION_CHANGED', null, null, null, null, null, END);
+    expect(msg?.startsWith('Your suspension now ends on Tuesday 24 November 2026 at 14:00 UTC.')).toBe(true);
+    expect(msg).not.toContain('divine.video/video/');
+  });
+
+  it('ACCOUNT_SUSPENSION_CHANGED has no message without a valid end time', () => {
+    expect(selectTemplate('ACCOUNT_SUSPENSION_CHANGED', null, null, null)).toBeNull();
+    expect(selectTemplate('ACCOUNT_SUSPENSION_CHANGED', null, null, null, null, null, 'garbage')).toBeNull();
+    expect(getMessageForAction('ACCOUNT_SUSPENSION_CHANGED')).toBeNull();
+  });
+
+  it('keeps the new template out of the manual compose list', () => {
+    expect(COMPOSE_TEMPLATES.map(t => t.key)).not.toContain('ACCOUNT_SUSPENSION_CHANGED');
+  });
+
+  describe('sendModerationDM passes options.endsAt to the template', () => {
+    // A full rate-limit window stops sendModerationDM right after it builds the
+    // message and before it gift-wraps (real wrapEvent wedges the pool). So the
+    // reason tells us whether a message was built: 'Unknown action' means the
+    // template returned null, 'Rate limited' means it returned text.
+    // Fail-safe if the rate limit ever stops tripping: DM_RELAY_URLS contains
+    // any publish to a loopback port nothing listens on, and a recording
+    // WebSocket answers instead of a real one. No socket may be opened at all.
+    const recipient = 'b'.repeat(64);
+    let ws;
+    beforeEach(() => { ws = installRecordingWebSocket(); });
+    afterEach(() => {
+      ws.restore();
+      expect(ws.sockets).toEqual([]);
+    });
+    function rateLimitedEnv() {
+      const now = Math.floor(Date.now() / 1000);
+      return {
+        NOSTR_PRIVATE_KEY: testHex,
+        DM_RELAY_URLS: 'ws://127.0.0.1:1',
+        MODERATION_KV: createMockKV({
+          [`dm-ratelimit:${recipient}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
+        }),
+      };
+    }
+
+    it('builds ACCOUNT_SUSPENSION_CHANGED when endsAt is given', async () => {
+      const result = await sendModerationDM(recipient, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null, { endsAt: END });
+      expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+    });
+
+    it('has no ACCOUNT_SUSPENSION_CHANGED message without endsAt', async () => {
+      const result = await sendModerationDM(recipient, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null);
+      expect(result).toEqual({ sent: false, reason: 'Unknown action: ACCOUNT_SUSPENSION_CHANGED' });
+    });
   });
 });
