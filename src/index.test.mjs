@@ -71,6 +71,79 @@ vi.mock('./moderation/private-report-intake.mjs', async (importOriginal) => {
 });
 
 import worker from './index.mjs';
+import { guardRelayPublishes } from './test/helpers.mjs';
+
+// No test in this file may publish to a real relay (see guardRelayPublishes).
+const relayGuard = guardRelayPublishes();
+
+// A fake relay for tests that publish. It acks every EVENT and ends every REQ
+// at once (both synchronously inside send: a queued reply wedges the pool on
+// this path), and records each published event with its relay URL. The
+// READY_STATE_* statics are copied for the reason guardRelayPublishes gives.
+function installFakeRelay() {
+  const published = [];
+  const previous = globalThis.WebSocket;
+  class FakeRelaySocket {
+    constructor(url) {
+      this.url = String(url);
+      this._cbs = {};
+      queueMicrotask(() => this._cbs.open && this._cbs.open({}));
+    }
+    addEventListener(type, cb) { this._cbs[type] = cb; }
+    send(data) {
+      const msg = JSON.parse(data);
+      let reply = null;
+      if (msg[0] === 'EVENT') {
+        published.push({ url: this.url, kind: msg[1].kind });
+        reply = ['OK', msg[1].id, true, ''];
+      } else if (msg[0] === 'REQ') {
+        reply = ['EOSE', msg[1]];
+      }
+      if (reply && this._cbs.message) this._cbs.message({ data: JSON.stringify(reply) });
+    }
+    close() {}
+  }
+  for (const k of ['READY_STATE_CONNECTING', 'READY_STATE_OPEN', 'READY_STATE_CLOSING', 'READY_STATE_CLOSED']) {
+    FakeRelaySocket[k] = previous[k];
+  }
+  globalThis.WebSocket = FakeRelaySocket;
+  return { published, restore() { globalThis.WebSocket = previous; } };
+}
+
+// Loopback containment for the DM path: with DM_RELAY_URLS set, dm-sender skips
+// relay discovery and publishes only here. Port 1 has no listener (unlike 4444,
+// where a developer's local relay may be running), so a test that loses its
+// fake relay fails instead of writing anywhere; the fake answers instead.
+const LOCAL_DM_RELAY = 'ws://127.0.0.1:1';
+
+describe('relay publish guard', () => {
+  it('drops and reports an EVENT sent to a non-loopback relay', () => {
+    // .invalid never resolves (RFC 2606), so nothing leaves the machine even
+    // if this socket tries to connect.
+    const ws = new WebSocket('wss://relay.invalid');
+    try {
+      ws.send(JSON.stringify(['EVENT', { id: '0'.repeat(64) }]));
+      expect(relayGuard.blocked).toEqual(['wss://relay.invalid']);
+    } finally {
+      relayGuard.clear(); // this test's block was intended
+      try { ws.close(); } catch { /* not yet open */ }
+    }
+  });
+
+  it('drops every non-read frame form: binary, AUTH, BOM-prefixed, escaped', () => {
+    const ws = new WebSocket('wss://relay.invalid');
+    try {
+      ws.send(new TextEncoder().encode(JSON.stringify(['EVENT', { id: '0'.repeat(64) }])));
+      ws.send(JSON.stringify(['AUTH', { id: '0'.repeat(64) }]));
+      ws.send('\uFEFF' + JSON.stringify(['EVENT', { id: '0'.repeat(64) }]));
+      ws.send('["\\u0045VENT",{}]');
+      expect(relayGuard.blocked).toEqual(Array(4).fill('wss://relay.invalid'));
+    } finally {
+      relayGuard.clear(); // this test's blocks were intended
+      try { ws.close(); } catch { /* not yet open */ }
+    }
+  });
+});
 
 const SHA256 = 'a'.repeat(64);
 
@@ -3310,12 +3383,12 @@ describe('DM exclusion for QUARANTINE via admin moderate', () => {
   it('attempts DM when action is PERMANENT_BAN with NOSTR_PRIVATE_KEY set', async () => {
     const uploaderPubkey = 'ab'.repeat(32);
     const kvStore = new Map();
-    let dmImportAttempted = false;
 
     const env = {
       ALLOW_DEV_ACCESS: 'true',
       SERVICE_API_TOKEN: 'test-service-token',
       NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+      DM_RELAY_URLS: LOCAL_DM_RELAY,
       BLOSSOM_DB: createDbMock({
         moderationResults: new Map([[SHA256, {
           sha256: SHA256,
@@ -3339,16 +3412,14 @@ describe('DM exclusion for QUARANTINE via admin moderate', () => {
       MODERATION_QUEUE: { async send() {} },
     };
 
-    // Track whether the DM code path is entered by watching for relay WebSocket connections
     const origFetch = globalThis.fetch;
-    globalThis.fetch = async (url, init) => {
-      if (typeof url === 'string' && url.startsWith('wss:')) {
-        dmImportAttempted = true;
-      }
-      return new Response('{}', { status: 200 });
-    };
+    let relay;
 
     try {
+      globalThis.fetch = async () => new Response('{}', { status: 200 });
+      // The DM is real (built, gift-wrapped, published), but only to the fake
+      // loopback relay: never to a public one.
+      relay = installFakeRelay();
       const response = await worker.fetch(
         new Request(`https://moderation.admin.divine.video/admin/api/moderate/${SHA256}`, {
           method: 'POST',
@@ -3360,11 +3431,12 @@ describe('DM exclusion for QUARANTINE via admin moderate', () => {
 
       expect(response.status).toBe(200);
       const body = await response.json();
-      // dm_sent depends on whether sendModerationDM succeeds against the mock,
-      // but the key contrast is: QUARANTINE above → dm_sent:false,
-      // PERMANENT_BAN here → DM code path entered (dm_sent:true or throws trying)
+      // The key contrast: QUARANTINE above → dm_sent:false,
+      // PERMANENT_BAN here → the DM was sent (to the fake relay).
       expect(body.dm_sent).toBe(true);
+      expect(relay.published.map(p => [p.url, p.kind])).toEqual([[LOCAL_DM_RELAY, 1059]]);
     } finally {
+      relay?.restore();
       globalThis.fetch = origFetch;
     }
   });
@@ -6240,27 +6312,32 @@ describe('POST /api/v1/notify', () => {
   it('sends DM for valid request with NOSTR_PRIVATE_KEY configured', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
-      NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8)
+      NOSTR_PRIVATE_KEY: 'deadbeef'.repeat(8),
+      DM_RELAY_URLS: LOCAL_DM_RELAY
     });
 
-    // sendModerationDM will attempt WebSocket connections to relays.
-    // Mock fetch/WebSocket to prevent real connections. The DM sender
-    // catches all errors internally and returns { sent: false, reason }.
-    const response = await worker.fetch(
-      new Request('http://localhost/api/v1/notify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'PERMANENT_BAN', reason: 'test' })
-      }),
-      env
-    );
+    let relay;
+    try {
+      // The DM is real (built, gift-wrapped, published), but only to the fake
+      // loopback relay: never to a public one.
+      relay = installFakeRelay();
+      const response = await worker.fetch(
+        new Request('http://localhost/api/v1/notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, action: 'PERMANENT_BAN', reason: 'test' })
+        }),
+        env
+      );
 
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(body.success).toBe(true);
-    // dm_sent may be true or false depending on relay connectivity,
-    // but the endpoint should not error
-    expect(typeof body.dm_sent).toBe('boolean');
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.success).toBe(true);
+      expect(body.dm_sent).toBe(true);
+      expect(relay.published.map(p => [p.url, p.kind])).toEqual([[LOCAL_DM_RELAY, 1059]]);
+    } finally {
+      relay?.restore();
+    }
   });
 });
 

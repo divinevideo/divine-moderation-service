@@ -4,6 +4,8 @@
 // ABOUTME: Shared test helpers and mock factories for divine-moderation-service tests
 // ABOUTME: Provides KV, Queue mock builders and test data generators
 
+import { afterEach, beforeEach, expect } from 'vitest';
+
 /**
  * Build a mock KV namespace that captures operations.
  */
@@ -83,4 +85,81 @@ export function createRequest(method, path, { body, headers } = {}) {
     init.headers.set('Content-Type', 'application/json');
   }
   return new Request(url, init);
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
+function isLoopbackRelay(url) {
+  try {
+    const u = new URL(url);
+    return (u.protocol === 'ws:' || u.protocol === 'wss:') && LOOPBACK_HOSTS.has(u.hostname);
+  } catch {
+    return false;
+  }
+}
+// Allowlist, not a blocklist: only a read (REQ) or its CLOSE, exactly as
+// JSON.stringify writes them, may reach a non-loopback relay. EVENT, AUTH,
+// binary, non-string, BOM-prefixed or escaped forms are all dropped.
+const isReadFrame = (data) => typeof data === 'string' && /^\["(?:REQ|CLOSE)",/.test(data);
+
+/**
+ * Fail any test in the calling file that writes to a real relay.
+ *
+ * Call once at the top level of a test file. Tests once gift-wrapped DMs with a
+ * throwaway key and published them to public relays, including the production
+ * one, on every run. The real WebSocket is reachable from this runtime and the
+ * DM sender swallows socket errors, so a leak shows up as nothing but a log
+ * line. Before each test this wraps WebSocket so that any frame bound for a
+ * non-loopback relay other than a read (REQ) or its CLOSE is dropped, never
+ * sent, and after the test it fails if any was. Reads pass through: some tests
+ * still read from the production relay, which is a separate problem from
+ * writing to it. A test that installs its own fake WebSocket replaces the guard
+ * for its duration.
+ *
+ * The guard is a Proxy over the real class, not a replacement: the pool's own
+ * RPC reads WebSocket.READY_STATE_OPEN from the global and silently drops every
+ * message if it is missing, which wedges the run. Any fake WebSocket needs the
+ * READY_STATE_* statics for the same reason.
+ *
+ * @returns {{ readonly blocked: string[], clear(): void }} relay URLs whose
+ *   frames were dropped in the current test (for the guard's own test)
+ */
+export function guardRelayPublishes() {
+  let blocked = [];
+  let realWebSocket;
+  beforeEach(() => {
+    blocked = [];
+    realWebSocket = globalThis.WebSocket;
+    const proxy = new Proxy(realWebSocket, {
+      construct(target, args, newTarget) {
+        const url = String(args[0]);
+        const ws = Reflect.construct(target, [url, ...args.slice(1)], newTarget === proxy ? target : newTarget);
+        if (isLoopbackRelay(url)) return ws;
+        const realSend = ws.send.bind(ws);
+        const guardedSend = (data) => {
+          if (!isReadFrame(data)) {
+            blocked.push(url);
+            return; // dropped: never reaches the relay
+          }
+          realSend(data);
+        };
+        Object.defineProperty(ws, 'send', { value: guardedSend, configurable: true });
+        if (ws.send !== guardedSend) {
+          // The override did not take, so nothing can be sent safely.
+          ws.close();
+          blocked.push(url);
+          throw new Error(`guardRelayPublishes: could not guard a WebSocket to ${url}`);
+        }
+        return ws;
+      },
+    });
+    globalThis.WebSocket = proxy;
+  });
+  afterEach(() => {
+    globalThis.WebSocket = realWebSocket;
+    expect(blocked, 'test tried to write to a real relay').toEqual([]);
+  });
+  return {
+    get blocked() { return blocked; },
+    clear() { blocked = []; },
+  };
 }
