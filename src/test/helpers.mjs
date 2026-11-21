@@ -5,6 +5,7 @@
 // ABOUTME: Provides KV, Queue mock builders and test data generators
 
 import { afterEach, beforeEach, expect } from 'vitest';
+import { useWebSocketImplementation } from 'nostr-tools/relay';
 
 /**
  * Build a mock KV namespace that captures operations.
@@ -102,7 +103,8 @@ function isLoopbackRelay(url) {
 const isReadFrame = (data) => typeof data === 'string' && /^\["(?:REQ|CLOSE)",/.test(data);
 
 /**
- * Fail any test in the calling file that writes to a real relay.
+ * Block writes to non-loopback relays through the global WebSocket or the
+ * nostr-tools Relay transport in the calling test file.
  *
  * Call once at the top level of a test file. Tests once gift-wrapped DMs with a
  * throwaway key and published them to public relays, including the production
@@ -153,8 +155,11 @@ export function guardRelayPublishes() {
       },
     });
     globalThis.WebSocket = proxy;
+    // Relay caches its constructor at module load, before the global is wrapped.
+    useWebSocketImplementation(proxy);
   });
   afterEach(() => {
+    useWebSocketImplementation(realWebSocket);
     globalThis.WebSocket = realWebSocket;
     expect(blocked, 'test tried to write to a real relay').toEqual([]);
   });

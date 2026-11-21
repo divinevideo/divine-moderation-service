@@ -6,6 +6,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { Relay } from 'nostr-tools/relay';
 
 vi.mock('./admin/zerotrust.mjs', () => ({
   getZeroTrustVerifier: () => ({
@@ -117,6 +118,12 @@ function installFakeRelay() {
 const LOCAL_DM_RELAY = 'ws://127.0.0.1:1';
 
 describe('relay publish guard', () => {
+  it('gives nostr-tools Relay the same guarded socket constructor', () => {
+    // Relay stores its constructor on the instance. Check the wiring without
+    // connecting; the following tests exercise the guarded constructor itself.
+    expect(new Relay('wss://relay.invalid')._WebSocket).toBe(globalThis.WebSocket);
+  });
+
   it('drops and reports an EVENT sent to a non-loopback relay', () => {
     // .invalid never resolves (RFC 2606), so nothing leaves the machine even
     // if this socket tries to connect.
