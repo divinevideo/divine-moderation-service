@@ -24,7 +24,10 @@ import {
   publishToRelays,
 } from './dm-sender.mjs';
 import { isContained, parseRelayOverride } from './relay-override.mjs';
-import { createMockKV } from '../test/helpers.mjs';
+import { createMockKV, guardRelayPublishes } from '../test/helpers.mjs';
+
+// No test in this file may publish to a real relay (see guardRelayPublishes).
+guardRelayPublishes();
 
 // Generate a stable test key in hex format (matching production usage)
 const testSecretKey = generateSecretKey();
@@ -364,6 +367,11 @@ function installRecordingWebSocket() {
     send() {}
     close() {}
   }
+  // The pool's own RPC reads WebSocket.READY_STATE_OPEN from the global and
+  // drops every message without it (see guardRelayPublishes).
+  for (const k of ['READY_STATE_CONNECTING', 'READY_STATE_OPEN', 'READY_STATE_CLOSING', 'READY_STATE_CLOSED']) {
+    FakeWS[k] = original[k];
+  }
   globalThis.WebSocket = FakeWS;
   return {
     sockets,
@@ -691,15 +699,27 @@ describe('DM Sender - Error Handling', () => {
     };
     const env = {
       NOSTR_PRIVATE_KEY: testHex,
-      MODERATION_KV: mockKV
+      MODERATION_KV: mockKV,
+      // Contained: publish only here (nothing listens on port 1), never to the
+      // production relay or the public defaults.
+      DM_RELAY_URLS: 'ws://127.0.0.1:1',
       // No BLOSSOM_DB — will skip D1 logging
     };
     const ctx = { waitUntil: vi.fn() };
+    // A real x-only pubkey, so the DM is actually wrapped and the relay leg is
+    // reached ('b'.repeat(64) is not a curve point: wrapEvent threw first and
+    // this test never touched a relay). Every socket errors on connect.
+    const recipient = getPublicKey(generateSecretKey());
+    const ws = installRecordingWebSocket();
 
-    // This will fail on WebSocket connect but should catch gracefully
-    const result = await sendModerationDM('b'.repeat(64), 'c'.repeat(64), 'PERMANENT_BAN', 'test reason', env, ctx);
-    // Should not throw — either succeeds or returns failure gracefully
-    expect(result).toBeDefined();
+    try {
+      const result = await sendModerationDM(recipient, 'c'.repeat(64), 'PERMANENT_BAN', 'test reason', env, ctx);
+      // Fails gracefully rather than throwing.
+      expect(result).toMatchObject({ sent: false, reason: 'All relay publishes failed' });
+      expect(ws.sockets).toEqual(['ws://127.0.0.1:1']);
+    } finally {
+      ws.restore();
+    }
   });
 });
 
