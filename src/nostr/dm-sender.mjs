@@ -24,6 +24,15 @@ const DIVINE_RELAY = 'wss://relay.divine.video';
 const RATE_LIMIT_WINDOW_SEC = 60;
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_TTL_SEC = 120;
+// The account notices sendModerationDM sends without checking the rate limit.
+// Listed by name rather than matched by prefix, so a new ACCOUNT_* template
+// stays rate limited unless someone adds it here.
+const RATE_LIMIT_EXEMPT_ACTIONS = new Set([
+  'ACCOUNT_SUSPENDED',
+  'ACCOUNT_SUSPENSION_CHANGED',
+  'ACCOUNT_BANNED',
+  'ACCOUNT_RESTORED',
+]);
 const RELAY_TIMEOUT_MS = 5000;
 
 // --- Message Templates ---
@@ -734,11 +743,11 @@ export async function sendModerationDM(recipientPubkey, sha256, action, reason, 
       };
     }
 
-    // Account notices (suspended/banned/restored/suspension changed) skip the
-    // check: a burst of content-action DMs must not swallow the one message
-    // telling someone their account changed. They are still recorded below, so
-    // content DMs sent after one count it toward the window as before.
-    if (!action.startsWith('ACCOUNT_')) {
+    // Account notices skip the check: a burst of content-action DMs must not
+    // swallow the one message telling someone their account changed. They are
+    // still recorded below, so content DMs sent after one count it toward the
+    // window as before.
+    if (!RATE_LIMIT_EXEMPT_ACTIONS.has(action)) {
       const withinLimit = await checkRateLimit(recipientPubkey, env);
       if (!withinLimit) {
         return { sent: false, reason: 'Rate limited' };
