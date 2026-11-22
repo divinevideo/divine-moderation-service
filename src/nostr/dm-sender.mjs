@@ -195,7 +195,8 @@ const CATEGORY_TEMPLATES = {
  * @param {string|null} title - Content title for identification (e.g., "My cool video")
  * @param {string|null} publishedAt - ISO date when content was published
  * @param {string|null} endsAt - ISO-8601 suspension end; read only by ACCOUNT_SUSPENDED and ACCOUNT_SUSPENSION_CHANGED
- * @returns {string|null} Message text or null if action has no template
+ * @returns {string|null} Message text, or null if action has no template or its template has
+ *   nothing to say (ACCOUNT_SUSPENSION_CHANGED without a valid endsAt)
  */
 export function selectTemplate(action, reason, categories, sha256, title = null, publishedAt = null, endsAt = null) {
   // Account-level actions (ACCOUNT_BANNED / ACCOUNT_SUSPENDED /
@@ -715,7 +716,12 @@ export async function sendModerationDM(recipientPubkey, sha256, action, reason, 
     // Build message: prefer category-specific template, fall back to generic
     const message = selectTemplate(action, reason, categories, sha256, title, publishedAt, endsAt);
     if (!message) {
-      return { sent: false, reason: `Unknown action: ${action}` };
+      // A known action can still build nothing: ACCOUNT_SUSPENSION_CHANGED has
+      // no message without a parseable endsAt.
+      return {
+        sent: false,
+        reason: Object.hasOwn(TEMPLATES, action) ? `${action}: no message without a valid endsAt` : `Unknown action: ${action}`,
+      };
     }
 
     // Check rate limit

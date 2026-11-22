@@ -1324,8 +1324,9 @@ describe('timed suspension messages', () => {
   describe('sendModerationDM passes options.endsAt to the template', () => {
     // A full rate-limit window stops sendModerationDM right after it builds the
     // message and before it gift-wraps (real wrapEvent wedges the pool). So the
-    // reason tells us whether a message was built: 'Unknown action' means the
-    // template returned null, 'Rate limited' means it returned text.
+    // reason tells us whether a message was built: 'no message without a valid
+    // endsAt' means the template returned null, 'Rate limited' means it
+    // returned text.
     // Fail-safe if the rate limit ever stops tripping: DM_RELAY_URLS contains
     // any publish to a loopback port nothing listens on, and a recording
     // WebSocket answers instead of a real one. No socket may be opened at all.
@@ -1352,9 +1353,16 @@ describe('timed suspension messages', () => {
       expect(result).toEqual({ sent: false, reason: 'Rate limited' });
     });
 
-    it('has no ACCOUNT_SUSPENSION_CHANGED message without endsAt', async () => {
-      const result = await sendModerationDM(recipient, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null);
-      expect(result).toEqual({ sent: false, reason: 'Unknown action: ACCOUNT_SUSPENSION_CHANGED' });
+    it('has no ACCOUNT_SUSPENSION_CHANGED message without a valid endsAt, and says why', async () => {
+      for (const options of [undefined, {}, { endsAt: 'garbage' }]) {
+        const result = await sendModerationDM(recipient, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null, options);
+        expect(result, JSON.stringify(options)).toEqual({ sent: false, reason: 'ACCOUNT_SUSPENSION_CHANGED: no message without a valid endsAt' });
+      }
+    });
+
+    it('still reports an action with no template as unknown', async () => {
+      const result = await sendModerationDM(recipient, null, 'NOT_AN_ACTION', null, rateLimitedEnv(), null);
+      expect(result).toEqual({ sent: false, reason: 'Unknown action: NOT_AN_ACTION' });
     });
   });
 });
