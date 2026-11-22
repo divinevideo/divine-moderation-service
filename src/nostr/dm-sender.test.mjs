@@ -23,6 +23,7 @@ import {
   renderComposeTemplate,
   publishToRelays,
   formatEndTime,
+  parseIsoInstant,
 } from './dm-sender.mjs';
 import { isContained, parseRelayOverride } from './relay-override.mjs';
 import { createMockKV } from '../test/helpers.mjs';
@@ -1278,6 +1279,13 @@ describe('timed suspension messages', () => {
 
   it('accepts 29 February in a leap year', () => {
     expect(formatEndTime('2028-02-29T12:00:00Z')).toBe('Tuesday 29 February 2028 at 12:00 UTC');
+  });
+
+  it('checks years 0-99 as written, not as 1900-1999', () => {
+    // Year 0 is a leap year; 1900, which Date.UTC would substitute, is not.
+    expect(parseIsoInstant('0000-02-29T00:00:00Z')).toBe(Date.parse('0000-02-29T00:00:00Z'));
+    expect(parseIsoInstant('0001-02-29T00:00:00Z')).toBeNull();
+    expect(parseIsoInstant('1900-02-29T00:00:00Z')).toBeNull();
   });
 
   it('refuses non-string end times', () => {

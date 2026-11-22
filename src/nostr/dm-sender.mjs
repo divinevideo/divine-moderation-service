@@ -59,10 +59,13 @@ const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-
 export function parseIsoInstant(value) {
   const match = typeof value === 'string' ? ISO_INSTANT.exec(value) : null;
   if (!match) return null;
-  // The calendar date as written must exist: Date.UTC rolls an impossible day
-  // over, so a round-trip that changes month or day means it was not real.
+  // The calendar date as written must exist: setUTCFullYear rolls an impossible
+  // day over, so a round-trip that changes month or day means it was not real.
+  // Not Date.UTC, which reads years 0-99 as 1900-1999 and so would refuse
+  // 0000-02-29, a real leap day, because 1900 is not a leap year.
   const [, y, m, d] = match.map(Number);
-  const day = new Date(Date.UTC(y, m - 1, d));
+  const day = new Date(0);
+  day.setUTCFullYear(y, m - 1, d);
   // Month alone is enough: any day overflow rolls into the next month, and month 00/13 is already rejected by Date.parse.
   if (day.getUTCMonth() !== m - 1) return null;
   const ms = Date.parse(value);
