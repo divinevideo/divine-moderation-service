@@ -45,7 +45,7 @@ import { notifyBlossom } from './blossom-client.mjs';
 import { handleSyncDelete } from './creator-delete/sync-endpoint.mjs';
 import { handleStatusQuery } from './creator-delete/status-endpoint.mjs';
 import { runCreatorDeleteCron } from './creator-delete/cron.mjs';
-import { sendModeratorReply, sendCommunityStrikeWarning, getCommunityStrikeWarningMessage, getModeratorKeys } from './nostr/dm-sender.mjs';
+import { sendModeratorReply, sendCommunityStrikeWarning, getCommunityStrikeWarningMessage, getModeratorKeys, parseIsoInstant } from './nostr/dm-sender.mjs';
 import { runCommunityLabelSweep } from './community-labels/sweep.mjs';
 import { isEnabled as communityLabelsEnabled, SINCE_POLL_LIMIT as COMMUNITY_SINCE_POLL_LIMIT } from './community-labels/config.mjs';
 import { isDivineIdentity } from './community-labels/identity.mjs';
@@ -4620,8 +4620,20 @@ async function runMigration() {
       }
 
       try {
-        const body = await request.json();
-        const { recipientPubkey, action, reason, sha256, eventId } = body;
+        // A body that doesn't parse is a caller bug like any bad field below, so
+        // it gets a 400, not the catch-all 500 carrying the parser's message.
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        // A JSON null has no fields, so it fails the recipientPubkey check
+        // instead of throwing while being destructured.
+        const { recipientPubkey, action, reason, sha256, eventId, endsAt } = body ?? {};
 
         if (!isValidPubkey(recipientPubkey)) {
           return new Response(JSON.stringify({ error: 'Valid recipientPubkey (64-char hex) required' }), {
@@ -4637,7 +4649,7 @@ async function runMigration() {
           });
         }
 
-        const validNotifyActions = ['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED', 'REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'];
+        const validNotifyActions = ['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE', 'ACCOUNT_SUSPENDED', 'ACCOUNT_SUSPENSION_CHANGED', 'ACCOUNT_BANNED', 'ACCOUNT_RESTORED', 'REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'];
         if (!validNotifyActions.includes(action)) {
           return new Response(JSON.stringify({
             error: `Invalid action. Must be one of: ${validNotifyActions.join(', ')}`
@@ -4646,6 +4658,26 @@ async function runMigration() {
             headers: { 'Content-Type': 'application/json' }
           });
         }
+
+        // Optional suspension end time. Refuse a bad value rather than send a
+        // message with a wrong date or none: relay-manager always sends a valid
+        // ISO-8601 instant, so a 400 is a caller bug and shows in its logs.
+        // JSON null counts as absent (an open-ended suspension has no end).
+        const hasEndsAt = endsAt !== undefined && endsAt !== null;
+        if (hasEndsAt && parseIsoInstant(endsAt) === null) {
+          return new Response(JSON.stringify({ error: 'endsAt must be an ISO-8601 date-time with a zone (Z or an offset like -05:00), e.g. 2026-11-24T14:00:00Z' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        if (action === 'ACCOUNT_SUSPENSION_CHANGED' && !hasEndsAt) {
+          return new Response(JSON.stringify({ error: 'endsAt required for ACCOUNT_SUSPENSION_CHANGED' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        // Only the suspension messages read an end time.
+        const forwardEndsAt = hasEndsAt && (action === 'ACCOUNT_SUSPENDED' || action === 'ACCOUNT_SUSPENSION_CHANGED');
 
         if (!env.NOSTR_PRIVATE_KEY) {
           console.warn('[API] /api/v1/notify called but NOSTR_PRIVATE_KEY not configured');
@@ -4661,11 +4693,12 @@ async function runMigration() {
           action,
           reason || null,
           env,
-          null
+          null,
+          forwardEndsAt ? { endsAt } : {}
         );
 
         const authSource = authSourceFromVerification(verification);
-        console.log(`[API] /api/v1/notify: action=${action} recipient=${recipientPubkey.substring(0, 16)}... dm_sent=${dmResult.sent} (auth: ${authSource})${eventId ? ` eventId=${eventId}` : ''}`);
+        console.log(`[API] /api/v1/notify: action=${action} recipient=${recipientPubkey.substring(0, 16)}... dm_sent=${dmResult.sent} ends_at_present=${hasEndsAt} (auth: ${authSource})${eventId ? ` eventId=${eventId}` : ''}`);
 
         return new Response(JSON.stringify({
           success: true,

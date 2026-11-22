@@ -45,6 +45,60 @@ function formatDate(dateStr) {
   } catch { return dateStr; }
 }
 
+// An ISO-8601 instant: a full date and time with an explicit zone (Z or an
+// offset). Date.parse alone is not enough: V8 reads 'hello 2' as 1 February
+// 2001, a zone-less string as local time, and 30 February as 2 March, and any
+// of those would put a wrong date in a user's message.
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Parse an ISO-8601 instant to epoch milliseconds.
+ * @param {unknown} value
+ * @returns {number|null} null unless value is a parseable ISO-8601 instant string
+ */
+export function parseIsoInstant(value) {
+  const match = typeof value === 'string' ? ISO_INSTANT.exec(value) : null;
+  if (!match) return null;
+  // The calendar date as written must exist: setUTCFullYear rolls an impossible
+  // day over, so a round-trip that changes month or day means it was not real.
+  // Not Date.UTC, which reads years 0-99 as 1900-1999 and so would refuse
+  // 0000-02-29, a real leap day, because 1900 is not a leap year.
+  const [, y, m, d] = match.map(Number);
+  const day = new Date(0);
+  day.setUTCFullYear(y, m - 1, d);
+  // Month alone is enough: a day overflow rolls into the next month, and month
+  // 00 or 13 rolls into another year.
+  if (day.getUTCMonth() !== m - 1) return null;
+  // Date.parse returns NaN for what the pattern allows but no clock has: hour
+  // 25, minute or second 60, an offset like +24:00. NaN must not reach a message.
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/**
+ * Format a suspension end time for a user message, e.g.
+ * "Tuesday 24 November 2026 at 14:00 UTC". A part-minute end is rounded up to
+ * the next whole minute, so the message never names a time before the true end.
+ * Uses getUTC* and fixed English names rather than Intl, whose separators vary
+ * between runtimes; day, written-out month and year is unambiguous to any reader.
+ * @param {string} iso - ISO-8601 instant
+ * @returns {string|null} null when the value doesn't parse
+ */
+export function formatEndTime(iso) {
+  const ms = parseIsoInstant(iso);
+  if (ms === null) return null;
+  // Date.parse truncates sub-millisecond digits. On an apparent minute
+  // boundary those digits can still make the instant part of that minute.
+  const truncatedFraction = ms % 60000 === 0 && /\.\d{3}\d*[1-9]/.test(iso);
+  const d = new Date(Math.ceil((ms + (truncatedFraction ? 1 : 0)) / 60000) * 60000);
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} at ${hh}:${mm} UTC`;
+}
+
 const TEMPLATES = {
   PERMANENT_BAN: (reason, sha256, title, publishedAt) =>
     `${contentSubject(title)}${postedDate(publishedAt)} was removed because it was found to ${reason}.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n${contentLink(sha256)}\n${FOOTER}`,
@@ -61,8 +115,23 @@ const TEMPLATES = {
 
   // Account-level suspension — no content link, not content-specific.
   // Used by relay-manager when banning a user's pubkey.
-  ACCOUNT_SUSPENDED: () =>
-    `Your account has been suspended for violating Divine's content policies.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n\n${FOOTER}`,
+  // Account templates take the end time as their 5th parameter. getMessageForAction
+  // passes only 4, so it keeps today's wording; without a parseable end time the
+  // text is unchanged from before timed suspensions.
+  ACCOUNT_SUSPENDED: (_reason, _sha256, _title, _publishedAt, endsAt) => {
+    const when = endsAt ? formatEndTime(endsAt) : null;
+    return `Your account has been suspended${when ? ` until ${when}` : ''} for violating Divine's content policies.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n\n${FOOTER}`;
+  },
+
+  // A running suspension's end time changed. Requires a parseable end time:
+  // with none there is nothing true to say, so there is no message. Not in
+  // COMPOSE_TEMPLATES, since a hand-composed message has no end time.
+  ACCOUNT_SUSPENSION_CHANGED: (_reason, _sha256, _title, _publishedAt, endsAt) => {
+    const when = endsAt ? formatEndTime(endsAt) : null;
+    return when
+      ? `Your suspension now ends on ${when}.\n\nIf you believe this was a mistake, you can reply to this message to appeal.\n\n${FOOTER}`
+      : null;
+  },
 
   // Account-level permanent ban: no content link, not content-specific.
   // Distinct from ACCOUNT_SUSPENDED: signals the action is permanent.
@@ -126,7 +195,7 @@ const CATEGORY_TEMPLATES = {
 /**
  * Select a category-specific template for a moderation action.
  * Falls back to generic reason if no category match.
- * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*). ACCOUNT_* actions short-circuit category logic.
+ * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_SUSPENSION_CHANGED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*). ACCOUNT_* actions short-circuit category logic.
  * @param {string|null} reason - Ignored when category matches. When used as fallback,
  *   must be a sentence completion after "was found to" (e.g., "violate content policies").
  *   Caller-provided freeform reasons are overridden by per-action defaults when no category matches.
@@ -134,15 +203,18 @@ const CATEGORY_TEMPLATES = {
  * @param {string|null} sha256 - Content hash for divine.video link
  * @param {string|null} title - Content title for identification (e.g., "My cool video")
  * @param {string|null} publishedAt - ISO date when content was published
- * @returns {string|null} Message text or null if action has no template
+ * @param {string|null} endsAt - ISO-8601 suspension end; read only by ACCOUNT_SUSPENDED and ACCOUNT_SUSPENSION_CHANGED
+ * @returns {string|null} Message text, or null if action has no template or its template has
+ *   nothing to say (ACCOUNT_SUSPENSION_CHANGED without a valid endsAt)
  */
-export function selectTemplate(action, reason, categories, sha256, title = null, publishedAt = null) {
-  // Account-level actions (ACCOUNT_BANNED / ACCOUNT_SUSPENDED / ACCOUNT_RESTORED)
-  // are not content-specific: they take no category, and category `extra` text
-  // (e.g. self-harm crisis lines) must never be spliced into an account notice.
+export function selectTemplate(action, reason, categories, sha256, title = null, publishedAt = null, endsAt = null) {
+  // Account-level actions (ACCOUNT_BANNED / ACCOUNT_SUSPENDED /
+  // ACCOUNT_SUSPENSION_CHANGED / ACCOUNT_RESTORED) are not content-specific:
+  // they take no category, and category `extra` text (e.g. self-harm crisis
+  // lines) must never be spliced into an account notice.
   if (typeof action === 'string' && action.startsWith('ACCOUNT_')) {
     const accountTemplate = TEMPLATES[action];
-    return accountTemplate ? accountTemplate() : null;
+    return accountTemplate ? accountTemplate(null, null, null, null, endsAt) : null;
   }
 
   let categoryInfo = null;
@@ -177,9 +249,10 @@ export function selectTemplate(action, reason, categories, sha256, title = null,
 
 /**
  * Get message text for a given moderation action.
- * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*)
+ * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_SUSPENSION_CHANGED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*).
+ *   Passes no end time, so ACCOUNT_SUSPENDED keeps its no-end wording and ACCOUNT_SUSPENSION_CHANGED returns null.
  * @param {string} reason
- * @returns {string|null} Message text or null if action has no template
+ * @returns {string|null} Message text, or null if action has no template or is ACCOUNT_SUSPENSION_CHANGED
  */
 export function getMessageForAction(action, reason = 'violate Divine\'s content policies', sha256 = null, title = null, publishedAt = null) {
   const template = TEMPLATES[action];
@@ -237,7 +310,8 @@ export const COMPOSE_TEMPLATES = [
  * Render a compose template to editable text. Null-safe for compose with no video.
  * @param {string} key - one of COMPOSE_TEMPLATES[].key
  * @param {{category?: string|null, sha256?: string|null, title?: string|null, publishedAt?: string|null}} [opts]
- * @returns {string|null} rendered body, or null for an unknown key
+ * @returns {string|null} rendered body, or null for an unknown key or one with no text
+ *   to render without an end time (ACCOUNT_SUSPENSION_CHANGED, deliberately not a compose key)
  */
 export function renderComposeTemplate(key, opts = {}) {
   const { category = null, sha256 = null, title = null, publishedAt = null } = opts;
@@ -616,7 +690,7 @@ function publishToSingleRelay(event, relayUrl, env) {
  *
  * @param {string} recipientPubkey - Hex pubkey of the content creator
  * @param {string} sha256 - Video hash
- * @param {string} action - PERMANENT_BAN, AGE_RESTRICTED, or QUARANTINE
+ * @param {string} action - A TEMPLATES key, e.g. PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, or an ACCOUNT_* action
  * @param {string} reason - Human-readable reason
  * @param {Object} env - Cloudflare Workers env
  * @param {Object} ctx - Execution context (for waitUntil)
@@ -624,10 +698,11 @@ function publishToSingleRelay(event, relayUrl, env) {
  * @param {string} [options.categories] - JSON string of categories from moderation result
  * @param {string} [options.title] - Content title
  * @param {string} [options.publishedAt] - ISO date when content was published
+ * @param {string} [options.endsAt] - ISO-8601 suspension end (ACCOUNT_SUSPENDED, ACCOUNT_SUSPENSION_CHANGED)
  * @returns {Promise<{ sent: boolean, reason?: string }>}
  */
 export async function sendModerationDM(recipientPubkey, sha256, action, reason, env, ctx, options = {}) {
-  const { categories = null, title = null, publishedAt = null } = options || {};
+  const { categories = null, title = null, publishedAt = null, endsAt = null } = options || {};
   try {
     // Validate inputs
     if (!recipientPubkey || typeof recipientPubkey !== 'string') {
@@ -649,9 +724,14 @@ export async function sendModerationDM(recipientPubkey, sha256, action, reason, 
     }
 
     // Build message: prefer category-specific template, fall back to generic
-    const message = selectTemplate(action, reason, categories, sha256, title, publishedAt);
+    const message = selectTemplate(action, reason, categories, sha256, title, publishedAt, endsAt);
     if (!message) {
-      return { sent: false, reason: `Unknown action: ${action}` };
+      // A known action can still build nothing: ACCOUNT_SUSPENSION_CHANGED has
+      // no message without a parseable endsAt.
+      return {
+        sent: false,
+        reason: Object.hasOwn(TEMPLATES, action) ? `${action}: no message without a valid endsAt` : `Unknown action: ${action}`,
+      };
     }
 
     // Check rate limit

@@ -6253,6 +6253,29 @@ describe('POST /api/v1/notify', () => {
     expect(body.error).toContain('PERMANENT_BAN');
   });
 
+  it('answers 400, not 500, for a body that is not a JSON object', async () => {
+    const env = createEnv({ ALLOW_DEV_ACCESS: 'true' });
+    const send = (body) => worker.fetch(
+      new Request('http://localhost/api/v1/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      }),
+      env
+    );
+
+    for (const body of ['{bad', '']) {
+      const response = await send(body);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+      expect(await response.json()).toEqual({ error: 'Invalid JSON body' });
+    }
+
+    // JSON null parses but has no fields, so the first field check refuses it.
+    const response = await send('null');
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toContain('recipientPubkey');
+  });
+
   it('returns success with dm_sent false when NOSTR_PRIVATE_KEY not configured', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
@@ -6314,6 +6337,117 @@ describe('POST /api/v1/notify', () => {
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.success).toBe(true);
+  });
+
+  describe('suspension end time (endsAt)', () => {
+    const END = '2026-11-24T14:00:00.000Z';
+    const ENDS_AT_ERROR = 'endsAt must be an ISO-8601 date-time with a zone (Z or an offset like -05:00), e.g. 2026-11-24T14:00:00Z';
+
+    // NOSTR_PRIVATE_KEY is unset, so a request that passes validation ends in
+    // the 200 "not configured" response and never reaches the DM sender. A 400
+    // here also proves validation runs before that key check.
+    async function postNotify(body) {
+      const env = createEnv({ ALLOW_DEV_ACCESS: 'true', NOSTR_PRIVATE_KEY: undefined });
+      return worker.fetch(
+        new Request('http://localhost/api/v1/notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recipientPubkey: VALID_PUBKEY, ...body })
+        }),
+        env
+      );
+    }
+
+    it('accepts ACCOUNT_SUSPENSION_CHANGED with endsAt', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENSION_CHANGED', endsAt: END });
+      expect(response.status).toBe(200);
+      expect((await response.json()).success).toBe(true);
+    });
+
+    it('rejects ACCOUNT_SUSPENSION_CHANGED without endsAt', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENSION_CHANGED' });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'endsAt required for ACCOUNT_SUSPENSION_CHANGED' });
+    });
+
+    it('rejects ACCOUNT_SUSPENSION_CHANGED with a null endsAt', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENSION_CHANGED', endsAt: null });
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toContain('endsAt required');
+    });
+
+    it('rejects an unparseable endsAt', async () => {
+      for (const endsAt of ['next tuesday', 1732456800000]) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, JSON.stringify(endsAt)).toBe(400);
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
+      }
+    });
+
+    it('rejects an endsAt that Date.parse accepts but is not an ISO-8601 instant', async () => {
+      // V8 reads 'hello 2' as 1 February 2001, and a zone-less ISO string as local time.
+      for (const endsAt of ['hello 2', '2026-11-24T14:00:00']) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, endsAt).toBe(400);
+        expect((await response.json()).error).toContain('ISO-8601');
+      }
+    });
+
+    it('rejects an endsAt naming a calendar date that does not exist', async () => {
+      // Date.parse would roll these forward (30 February becomes 2 March).
+      for (const endsAt of ['2026-02-30T00:00:00Z', '2026-04-31T00:00:00Z', '2027-02-29T00:00:00Z']) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, endsAt).toBe(400);
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
+      }
+    });
+
+    it('rejects an endsAt whose time or offset is out of range', async () => {
+      // The pattern and the calendar check pass these; only Date.parse's NaN
+      // stops them, and without it the message would state "NaN" as the end.
+      for (const endsAt of ['2026-11-24T25:00:00Z', '2026-11-24T14:60:00Z', '2026-11-24T14:00:00+24:00']) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, endsAt).toBe(400);
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
+      }
+    });
+
+    it('names the accepted form in the 400, since a date alone is ISO-8601 too', async () => {
+      // Each of these is valid ISO-8601 but not an instant this route accepts,
+      // so the error has to say what is accepted, not just "ISO-8601".
+      for (const endsAt of ['2026-11-24', '20261124T140000Z', '2026-11-24T14Z']) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, endsAt).toBe(400);
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
+      }
+    });
+
+    it('accepts an endsAt on 29 February in a leap year', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENSION_CHANGED', endsAt: '2028-02-29T12:00:00Z' });
+      expect(response.status).toBe(200);
+    });
+
+    it('rejects an unparseable endsAt on a non-suspension action too', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_RESTORED', endsAt: 'next tuesday' });
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toContain('ISO-8601');
+    });
+
+    it('accepts ACCOUNT_SUSPENDED without endsAt', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENDED' });
+      expect(response.status).toBe(200);
+      expect((await response.json()).success).toBe(true);
+    });
+
+    it('treats a null endsAt as absent on ACCOUNT_SUSPENDED', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt: null });
+      expect(response.status).toBe(200);
+    });
+
+    it('accepts ACCOUNT_SUSPENDED with endsAt', async () => {
+      const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt: END });
+      expect(response.status).toBe(200);
+    });
   });
 
   it('sends DM for valid request with NOSTR_PRIVATE_KEY configured', async () => {
