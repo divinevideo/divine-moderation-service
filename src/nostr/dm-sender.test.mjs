@@ -1361,14 +1361,16 @@ describe('timed suspension messages', () => {
   });
 
   describe('sendModerationDM passes options.endsAt to the template', () => {
-    // A full rate-limit window stops sendModerationDM right after it builds the
-    // message and before it gift-wraps (real wrapEvent wedges the pool). So the
-    // reason tells us whether a message was built: 'no message without a valid
-    // endsAt' means the template returned null, 'Rate limited' means it
-    // returned text.
-    // Fail-safe if the rate limit ever stops tripping: DM_RELAY_URLS contains
-    // any publish to a loopback port nothing listens on, and a recording
-    // WebSocket answers instead of a real one. No socket may be opened at all.
+    // Every test here starts with a full rate-limit window. The reason tells us
+    // whether a message was built: 'no message without a valid endsAt' means
+    // the template returned null, and 'Unknown action' means there was no
+    // template. Both stop before the limit is checked. Account notices skip the
+    // limit, so a built ACCOUNT_SUSPENSION_CHANGED goes on to the publish and
+    // ends at 'All relay publishes failed'.
+    // Containment: DM_RELAY_URLS sends any publish to a loopback port nothing
+    // listens on, and a recording WebSocket answers instead of a real one. The
+    // one expected socket is that publish, which its test clears; any other
+    // socket fails the afterEach.
     const recipient = 'b'.repeat(64);
     let ws;
     beforeEach(() => { ws = installRecordingWebSocket(); });
@@ -1376,22 +1378,24 @@ describe('timed suspension messages', () => {
       ws.restore();
       expect(ws.sockets).toEqual([]);
     });
-    function rateLimitedEnv() {
+    function rateLimitedEnv(pubkey = recipient) {
       const now = Math.floor(Date.now() / 1000);
       return {
         NOSTR_PRIVATE_KEY: testHex,
         DM_RELAY_URLS: 'ws://127.0.0.1:1',
         MODERATION_KV: createMockKV({
-          [`dm-ratelimit:${recipient}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
+          [`dm-ratelimit:${pubkey}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
         }),
       };
     }
 
     it('builds ACCOUNT_SUSPENSION_CHANGED when endsAt is given', async () => {
-      // Account notices skip the rate limit, so a built message goes on to
-      // the (fake, failing) publish instead of stopping at 'Rate limited'.
+      // A real pubkey ('b'.repeat(64) is not a curve point, so wrapping would
+      // throw), with its own window full. Account notices skip the rate limit,
+      // so the built message goes on to the (fake, failing) publish instead of
+      // stopping at 'Rate limited'.
       const real = getPublicKey(generateSecretKey());
-      const result = await sendModerationDM(real, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null, { endsAt: END });
+      const result = await sendModerationDM(real, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(real), null, { endsAt: END });
       expect(result).toEqual({ sent: false, reason: 'All relay publishes failed' });
       expect(ws.sockets).toEqual(['ws://127.0.0.1:1']);
       ws.sockets.length = 0; // the contained publish is the expected one
