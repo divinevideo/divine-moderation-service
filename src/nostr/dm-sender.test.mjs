@@ -1239,6 +1239,7 @@ describe('timed suspension messages', () => {
   it('rounds a part-minute end time up, never stating a minute before the true end', () => {
     expect(formatEndTime('2026-11-24T13:59:30Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
     expect(formatEndTime('2026-11-24T13:59:00.001Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+    expect(formatEndTime('2026-11-24T13:59:00.00001Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
     // Rounding up can cross midnight and the year.
     expect(formatEndTime('2026-12-31T23:59:01Z')).toBe('Friday 1 January 2027 at 00:00 UTC');
   });
@@ -1246,6 +1247,7 @@ describe('timed suspension messages', () => {
   it('leaves an end time on the whole minute unchanged', () => {
     expect(formatEndTime('2026-11-24T14:00:00Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
     expect(formatEndTime('2026-11-24T14:00:00.000Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
+    expect(formatEndTime('2026-11-24T14:00:00.00000Z')).toBe('Tuesday 24 November 2026 at 14:00 UTC');
   });
 
   it('formats an offset end time as its UTC instant', () => {

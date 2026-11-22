@@ -90,7 +90,10 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 
 export function formatEndTime(iso) {
   const ms = parseIsoInstant(iso);
   if (ms === null) return null;
-  const d = new Date(Math.ceil(ms / 60000) * 60000);
+  // Date.parse truncates sub-millisecond digits. On an apparent minute
+  // boundary those digits can still make the instant part of that minute.
+  const truncatedFraction = ms % 60000 === 0 && /\.\d{3}\d*[1-9]/.test(iso);
+  const d = new Date(Math.ceil((ms + (truncatedFraction ? 1 : 0)) / 60000) * 60000);
   const hh = String(d.getUTCHours()).padStart(2, '0');
   const mm = String(d.getUTCMinutes()).padStart(2, '0');
   return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} at ${hh}:${mm} UTC`;
