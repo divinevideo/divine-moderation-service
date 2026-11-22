@@ -1455,4 +1455,47 @@ describe('account notices are exempt from the DM rate limit', () => {
     expect(result).toEqual({ sent: false, reason: 'Rate limited' });
     expect(ws.sockets).toEqual([]);
   });
+
+  it('a sent notice is recorded, so the content DM after it counts it', async () => {
+    // Four DMs in the window. The notice makes five, so the content DM after
+    // it is limited; an unrecorded notice would leave room for it.
+    const recipient = getPublicKey(generateSecretKey());
+    const key = `dm-ratelimit:${recipient}`;
+    const now = Math.floor(Date.now() / 1000);
+    const kv = createMockKV({ [key]: JSON.stringify([now - 1, now - 2, now - 3, now - 4]) });
+    const env = { NOSTR_PRIVATE_KEY: testHex, DM_RELAY_URLS: 'ws://127.0.0.1:1', MODERATION_KV: kv };
+    // The relay must accept for the send to be recorded. This fake answers
+    // OK=true; the afterEach puts the original WebSocket back.
+    const opened = [];
+    class AcceptingWS {
+      constructor(url) {
+        opened.push(url);
+        this._cbs = {};
+        queueMicrotask(() => this._cbs.open && this._cbs.open());
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send(msg) {
+        // Acknowledge synchronously within send, like the other accepting fake
+        // in this file (a queued reply wedges the pool worker).
+        const parsed = JSON.parse(msg);
+        if (parsed[0] === 'EVENT') {
+          this._cbs.message && this._cbs.message({ data: JSON.stringify(['OK', parsed[1].id, true, '']) });
+        }
+      }
+      close() {}
+    }
+    for (const k of ['READY_STATE_CONNECTING', 'READY_STATE_OPEN', 'READY_STATE_CLOSING', 'READY_STATE_CLOSED']) {
+      AcceptingWS[k] = globalThis.WebSocket[k];
+    }
+    globalThis.WebSocket = AcceptingWS;
+
+    const notice = await sendModerationDM(recipient, null, 'ACCOUNT_BANNED', null, env, null);
+    expect(notice).toEqual({ sent: true, relaysPublished: 1 });
+    expect(opened).toEqual(['ws://127.0.0.1:1']);
+    expect(JSON.parse(kv._store.get(key))).toHaveLength(5);
+
+    const content = await sendModerationDM(recipient, 'c'.repeat(64), 'PERMANENT_BAN', 'test', env, null);
+    expect(content).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(opened).toEqual(['ws://127.0.0.1:1']);
+  });
 });
