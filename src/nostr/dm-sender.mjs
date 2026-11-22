@@ -734,10 +734,15 @@ export async function sendModerationDM(recipientPubkey, sha256, action, reason, 
       };
     }
 
-    // Check rate limit
-    const withinLimit = await checkRateLimit(recipientPubkey, env);
-    if (!withinLimit) {
-      return { sent: false, reason: 'Rate limited' };
+    // Account notices (suspended/banned/restored/suspension changed) skip the
+    // check: a burst of content-action DMs must not swallow the one message
+    // telling someone their account changed. They are still recorded below, so
+    // content DMs sent after one count it toward the window as before.
+    if (!action.startsWith('ACCOUNT_')) {
+      const withinLimit = await checkRateLimit(recipientPubkey, env);
+      if (!withinLimit) {
+        return { sent: false, reason: 'Rate limited' };
+      }
     }
 
     // Create NIP-17 gift-wrapped DM

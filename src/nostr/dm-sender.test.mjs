@@ -1388,8 +1388,13 @@ describe('timed suspension messages', () => {
     }
 
     it('builds ACCOUNT_SUSPENSION_CHANGED when endsAt is given', async () => {
-      const result = await sendModerationDM(recipient, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null, { endsAt: END });
-      expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+      // Account notices skip the rate limit, so a built message goes on to
+      // the (fake, failing) publish instead of stopping at 'Rate limited'.
+      const real = getPublicKey(generateSecretKey());
+      const result = await sendModerationDM(real, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null, { endsAt: END });
+      expect(result).toEqual({ sent: false, reason: 'All relay publishes failed' });
+      expect(ws.sockets).toEqual(['ws://127.0.0.1:1']);
+      ws.sockets.length = 0; // the contained publish is the expected one
     });
 
     it('has no ACCOUNT_SUSPENSION_CHANGED message without a valid endsAt, and says why', async () => {
@@ -1403,5 +1408,47 @@ describe('timed suspension messages', () => {
       const result = await sendModerationDM(recipient, null, 'NOT_AN_ACTION', null, rateLimitedEnv(), null);
       expect(result).toEqual({ sent: false, reason: 'Unknown action: NOT_AN_ACTION' });
     });
+  });
+});
+
+describe('account notices are exempt from the DM rate limit', () => {
+  // Five DMs in the window is the limit. Content DMs stop there; account
+  // notices must still go out. Publishes are contained to a loopback relay and
+  // answered by a recording fake WebSocket that fails every connect, so a
+  // notice that gets past the limit ends at 'All relay publishes failed' and a
+  // limited one ends at 'Rate limited' having opened no socket.
+  const END_AT = '2026-11-24T14:00:00.000Z';
+  let ws;
+  beforeEach(() => { ws = installRecordingWebSocket(); });
+  afterEach(() => { ws.restore(); });
+
+  function fullWindowEnv(recipient) {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      NOSTR_PRIVATE_KEY: testHex,
+      DM_RELAY_URLS: 'ws://127.0.0.1:1',
+      MODERATION_KV: createMockKV({
+        [`dm-ratelimit:${recipient}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
+      }),
+    };
+  }
+
+  it.each([
+    ['ACCOUNT_SUSPENDED', { endsAt: END_AT }],
+    ['ACCOUNT_BANNED', {}],
+    ['ACCOUNT_RESTORED', {}],
+    ['ACCOUNT_SUSPENSION_CHANGED', { endsAt: END_AT }],
+  ])('%s is sent when the recipient already has 5 DMs in the window', async (action, options) => {
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, null, action, null, fullWindowEnv(recipient), null, options);
+    expect(result).toEqual({ sent: false, reason: 'All relay publishes failed' });
+    expect(ws.sockets).toEqual(['ws://127.0.0.1:1']);
+  });
+
+  it.each(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE'])('%s content DM is still rate limited', async (action) => {
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, 'c'.repeat(64), action, 'test', fullWindowEnv(recipient), null);
+    expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(ws.sockets).toEqual([]);
   });
 });
