@@ -4620,8 +4620,20 @@ async function runMigration() {
       }
 
       try {
-        const body = await request.json();
-        const { recipientPubkey, action, reason, sha256, eventId, endsAt } = body;
+        // A body that doesn't parse is a caller bug like any bad field below, so
+        // it gets a 400, not the catch-all 500 carrying the parser's message.
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return new Response(JSON.stringify({ error: 'Invalid JSON body' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        // A JSON null has no fields, so it fails the recipientPubkey check
+        // instead of throwing while being destructured.
+        const { recipientPubkey, action, reason, sha256, eventId, endsAt } = body ?? {};
 
         if (!isValidPubkey(recipientPubkey)) {
           return new Response(JSON.stringify({ error: 'Valid recipientPubkey (64-char hex) required' }), {

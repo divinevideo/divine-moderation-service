@@ -6174,6 +6174,29 @@ describe('POST /api/v1/notify', () => {
     expect(body.error).toContain('PERMANENT_BAN');
   });
 
+  it('answers 400, not 500, for a body that is not a JSON object', async () => {
+    const env = createEnv({ ALLOW_DEV_ACCESS: 'true' });
+    const send = (body) => worker.fetch(
+      new Request('http://localhost/api/v1/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      }),
+      env
+    );
+
+    for (const body of ['{bad', '']) {
+      const response = await send(body);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+      expect(await response.json()).toEqual({ error: 'Invalid JSON body' });
+    }
+
+    // JSON null parses but has no fields, so the first field check refuses it.
+    const response = await send('null');
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toContain('recipientPubkey');
+  });
+
   it('returns success with dm_sent false when NOSTR_PRIVATE_KEY not configured', async () => {
     const env = createEnv({
       ALLOW_DEV_ACCESS: 'true',
