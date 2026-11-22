@@ -4665,7 +4665,7 @@ async function runMigration() {
         // JSON null counts as absent (an open-ended suspension has no end).
         const hasEndsAt = endsAt !== undefined && endsAt !== null;
         if (hasEndsAt && parseIsoInstant(endsAt) === null) {
-          return new Response(JSON.stringify({ error: 'endsAt must be an ISO-8601 date' }), {
+          return new Response(JSON.stringify({ error: 'endsAt must be an ISO-8601 date-time with a zone (Z or an offset like -05:00), e.g. 2026-11-24T14:00:00Z' }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' }
           });

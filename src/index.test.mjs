@@ -6262,6 +6262,7 @@ describe('POST /api/v1/notify', () => {
 
   describe('suspension end time (endsAt)', () => {
     const END = '2026-11-24T14:00:00.000Z';
+    const ENDS_AT_ERROR = 'endsAt must be an ISO-8601 date-time with a zone (Z or an offset like -05:00), e.g. 2026-11-24T14:00:00Z';
 
     // NOSTR_PRIVATE_KEY is unset, so a request that passes validation ends in
     // the 200 "not configured" response and never reaches the DM sender. A 400
@@ -6300,7 +6301,7 @@ describe('POST /api/v1/notify', () => {
       for (const endsAt of ['next tuesday', 1732456800000]) {
         const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
         expect(response.status, JSON.stringify(endsAt)).toBe(400);
-        expect(await response.json()).toEqual({ error: 'endsAt must be an ISO-8601 date' });
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
       }
     });
 
@@ -6318,7 +6319,17 @@ describe('POST /api/v1/notify', () => {
       for (const endsAt of ['2026-02-30T00:00:00Z', '2026-04-31T00:00:00Z', '2027-02-29T00:00:00Z']) {
         const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
         expect(response.status, endsAt).toBe(400);
-        expect(await response.json()).toEqual({ error: 'endsAt must be an ISO-8601 date' });
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
+      }
+    });
+
+    it('names the accepted form in the 400, since a date alone is ISO-8601 too', async () => {
+      // Each of these is valid ISO-8601 but not an instant this route accepts,
+      // so the error has to say what is accepted, not just "ISO-8601".
+      for (const endsAt of ['2026-11-24', '20261124T140000Z', '2026-11-24T14Z']) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, endsAt).toBe(400);
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
       }
     });
 
