@@ -1456,6 +1456,14 @@ describe('account notices are exempt from the DM rate limit', () => {
     expect(ws.sockets).toEqual([]);
   });
 
+  // /api/v1/notify also accepts these, and they reach sendModerationDM too.
+  it.each(['REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'])('%s is still rate limited', async (action) => {
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, 'c'.repeat(64), action, null, fullWindowEnv(recipient), null);
+    expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(ws.sockets).toEqual([]);
+  });
+
   it('an action that is not a string is rate limited instead of throwing', async () => {
     // A one-element array used as a property key becomes 'PERMANENT_BAN', so
     // the template is found and a message built. The exemption check after
