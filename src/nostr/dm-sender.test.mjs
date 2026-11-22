@@ -1361,14 +1361,16 @@ describe('timed suspension messages', () => {
   });
 
   describe('sendModerationDM passes options.endsAt to the template', () => {
-    // A full rate-limit window stops sendModerationDM right after it builds the
-    // message and before it gift-wraps (real wrapEvent wedges the pool). So the
-    // reason tells us whether a message was built: 'no message without a valid
-    // endsAt' means the template returned null, 'Rate limited' means it
-    // returned text.
-    // Fail-safe if the rate limit ever stops tripping: DM_RELAY_URLS contains
-    // any publish to a loopback port nothing listens on, and a recording
-    // WebSocket answers instead of a real one. No socket may be opened at all.
+    // Every test here starts with a full rate-limit window. The reason tells us
+    // whether a message was built: 'no message without a valid endsAt' means
+    // the template returned null, and 'Unknown action' means there was no
+    // template. Both stop before the limit is checked. Account notices skip the
+    // limit, so a built ACCOUNT_SUSPENSION_CHANGED goes on to the publish and
+    // ends at 'All relay publishes failed'.
+    // Containment: DM_RELAY_URLS sends any publish to a loopback port nothing
+    // listens on, and a recording WebSocket answers instead of a real one. The
+    // one expected socket is that publish, which its test clears; any other
+    // socket fails the afterEach.
     const recipient = 'b'.repeat(64);
     let ws;
     beforeEach(() => { ws = installRecordingWebSocket(); });
@@ -1376,20 +1378,27 @@ describe('timed suspension messages', () => {
       ws.restore();
       expect(ws.sockets).toEqual([]);
     });
-    function rateLimitedEnv() {
+    function rateLimitedEnv(pubkey = recipient) {
       const now = Math.floor(Date.now() / 1000);
       return {
         NOSTR_PRIVATE_KEY: testHex,
         DM_RELAY_URLS: 'ws://127.0.0.1:1',
         MODERATION_KV: createMockKV({
-          [`dm-ratelimit:${recipient}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
+          [`dm-ratelimit:${pubkey}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
         }),
       };
     }
 
     it('builds ACCOUNT_SUSPENSION_CHANGED when endsAt is given', async () => {
-      const result = await sendModerationDM(recipient, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(), null, { endsAt: END });
-      expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+      // A real pubkey ('b'.repeat(64) is not a curve point, so wrapping would
+      // throw), with its own window full. Account notices skip the rate limit,
+      // so the built message goes on to the (fake, failing) publish instead of
+      // stopping at 'Rate limited'.
+      const real = getPublicKey(generateSecretKey());
+      const result = await sendModerationDM(real, null, 'ACCOUNT_SUSPENSION_CHANGED', null, rateLimitedEnv(real), null, { endsAt: END });
+      expect(result).toEqual({ sent: false, reason: 'All relay publishes failed' });
+      expect(ws.sockets).toEqual(['ws://127.0.0.1:1']);
+      ws.sockets.length = 0; // the contained publish is the expected one
     });
 
     it('has no ACCOUNT_SUSPENSION_CHANGED message without a valid endsAt, and says why', async () => {
@@ -1403,5 +1412,108 @@ describe('timed suspension messages', () => {
       const result = await sendModerationDM(recipient, null, 'NOT_AN_ACTION', null, rateLimitedEnv(), null);
       expect(result).toEqual({ sent: false, reason: 'Unknown action: NOT_AN_ACTION' });
     });
+  });
+});
+
+describe('account notices are exempt from the DM rate limit', () => {
+  // Five DMs in the window is the limit. Content DMs stop there; account
+  // notices must still go out. Publishes are contained to a loopback relay and
+  // answered by a recording fake WebSocket that fails every connect, so a
+  // notice that gets past the limit ends at 'All relay publishes failed' and a
+  // limited one ends at 'Rate limited' having opened no socket.
+  const END_AT = '2026-11-24T14:00:00.000Z';
+  let ws;
+  beforeEach(() => { ws = installRecordingWebSocket(); });
+  afterEach(() => { ws.restore(); });
+
+  function fullWindowEnv(recipient) {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      NOSTR_PRIVATE_KEY: testHex,
+      DM_RELAY_URLS: 'ws://127.0.0.1:1',
+      MODERATION_KV: createMockKV({
+        [`dm-ratelimit:${recipient}`]: JSON.stringify([now - 1, now - 2, now - 3, now - 4, now - 5]),
+      }),
+    };
+  }
+
+  it.each([
+    ['ACCOUNT_SUSPENDED', { endsAt: END_AT }],
+    ['ACCOUNT_BANNED', {}],
+    ['ACCOUNT_RESTORED', {}],
+    ['ACCOUNT_SUSPENSION_CHANGED', { endsAt: END_AT }],
+  ])('%s is sent when the recipient already has 5 DMs in the window', async (action, options) => {
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, null, action, null, fullWindowEnv(recipient), null, options);
+    expect(result).toEqual({ sent: false, reason: 'All relay publishes failed' });
+    expect(ws.sockets).toEqual(['ws://127.0.0.1:1']);
+  });
+
+  it.each(['PERMANENT_BAN', 'AGE_RESTRICTED', 'QUARANTINE'])('%s content DM is still rate limited', async (action) => {
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, 'c'.repeat(64), action, 'test', fullWindowEnv(recipient), null);
+    expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(ws.sockets).toEqual([]);
+  });
+
+  // /api/v1/notify also accepts these, and they reach sendModerationDM too.
+  it.each(['REPORT_OUTCOME_ACTION', 'REPORT_OUTCOME_NO_ACTION'])('%s is still rate limited', async (action) => {
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, 'c'.repeat(64), action, null, fullWindowEnv(recipient), null);
+    expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(ws.sockets).toEqual([]);
+  });
+
+  it('an action that is not a string is rate limited instead of throwing', async () => {
+    // A one-element array used as a property key becomes 'PERMANENT_BAN', so
+    // the template is found and a message built. The exemption check after
+    // that must not call string methods on the action.
+    const recipient = getPublicKey(generateSecretKey());
+    const result = await sendModerationDM(recipient, 'c'.repeat(64), ['PERMANENT_BAN'], 'test', fullWindowEnv(recipient), null);
+    expect(result).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(ws.sockets).toEqual([]);
+  });
+
+  it('a sent notice is recorded, so the content DM after it counts it', async () => {
+    // Four DMs in the window. The notice makes five, so the content DM after
+    // it is limited; an unrecorded notice would leave room for it.
+    const recipient = getPublicKey(generateSecretKey());
+    const key = `dm-ratelimit:${recipient}`;
+    const now = Math.floor(Date.now() / 1000);
+    const kv = createMockKV({ [key]: JSON.stringify([now - 1, now - 2, now - 3, now - 4]) });
+    const env = { NOSTR_PRIVATE_KEY: testHex, DM_RELAY_URLS: 'ws://127.0.0.1:1', MODERATION_KV: kv };
+    // The relay must accept for the send to be recorded. This fake answers
+    // OK=true; the afterEach puts the original WebSocket back.
+    const opened = [];
+    class AcceptingWS {
+      constructor(url) {
+        opened.push(url);
+        this._cbs = {};
+        queueMicrotask(() => this._cbs.open && this._cbs.open());
+      }
+      addEventListener(type, cb) { this._cbs[type] = cb; }
+      send(msg) {
+        // Acknowledge synchronously within send, like the other accepting fake
+        // in this file (a queued reply wedges the pool worker).
+        const parsed = JSON.parse(msg);
+        if (parsed[0] === 'EVENT') {
+          this._cbs.message && this._cbs.message({ data: JSON.stringify(['OK', parsed[1].id, true, '']) });
+        }
+      }
+      close() {}
+    }
+    for (const k of ['READY_STATE_CONNECTING', 'READY_STATE_OPEN', 'READY_STATE_CLOSING', 'READY_STATE_CLOSED']) {
+      AcceptingWS[k] = globalThis.WebSocket[k];
+    }
+    globalThis.WebSocket = AcceptingWS;
+
+    const notice = await sendModerationDM(recipient, null, 'ACCOUNT_BANNED', null, env, null);
+    expect(notice).toEqual({ sent: true, relaysPublished: 1 });
+    expect(opened).toEqual(['ws://127.0.0.1:1']);
+    expect(JSON.parse(kv._store.get(key))).toHaveLength(5);
+
+    const content = await sendModerationDM(recipient, 'c'.repeat(64), 'PERMANENT_BAN', 'test', env, null);
+    expect(content).toEqual({ sent: false, reason: 'Rate limited' });
+    expect(opened).toEqual(['ws://127.0.0.1:1']);
   });
 });
