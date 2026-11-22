@@ -6323,6 +6323,16 @@ describe('POST /api/v1/notify', () => {
       }
     });
 
+    it('rejects an endsAt whose time or offset is out of range', async () => {
+      // The pattern and the calendar check pass these; only Date.parse's NaN
+      // stops them, and without it the message would state "NaN" as the end.
+      for (const endsAt of ['2026-11-24T25:00:00Z', '2026-11-24T14:60:00Z', '2026-11-24T14:00:00+24:00']) {
+        const response = await postNotify({ action: 'ACCOUNT_SUSPENDED', endsAt });
+        expect(response.status, endsAt).toBe(400);
+        expect(await response.json()).toEqual({ error: ENDS_AT_ERROR });
+      }
+    });
+
     it('names the accepted form in the 400, since a date alone is ISO-8601 too', async () => {
       // Each of these is valid ISO-8601 but not an instant this route accepts,
       // so the error has to say what is accepted, not just "ISO-8601".

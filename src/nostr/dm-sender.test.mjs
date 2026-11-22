@@ -1263,8 +1263,17 @@ describe('timed suspension messages', () => {
   });
 
   it('refuses an ISO-shaped string whose month does not exist', () => {
-    // Date.parse returns NaN for month 13.
+    // The month check refuses it: month 13 rolls into the next year.
     expect(formatEndTime('2026-13-01T00:00:00Z')).toBeNull();
+  });
+
+  it('refuses a time or offset no clock has, which only Date.parse catches', () => {
+    // Each matches the pattern and names a real date. Without the NaN check
+    // formatEndTime would print "undefined NaN undefined NaN at NaN:NaN UTC".
+    for (const value of ['2026-11-24T25:00:00Z', '2026-11-24T14:60:00Z', '2026-11-24T14:00:60Z', '2026-11-24T14:00:00+24:00']) {
+      expect(parseIsoInstant(value), value).toBeNull();
+      expect(formatEndTime(value), value).toBeNull();
+    }
   });
 
   it('refuses a calendar date that does not exist instead of rolling it over', () => {

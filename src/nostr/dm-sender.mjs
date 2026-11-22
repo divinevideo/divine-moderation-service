@@ -66,8 +66,11 @@ export function parseIsoInstant(value) {
   const [, y, m, d] = match.map(Number);
   const day = new Date(0);
   day.setUTCFullYear(y, m - 1, d);
-  // Month alone is enough: any day overflow rolls into the next month, and month 00/13 is already rejected by Date.parse.
+  // Month alone is enough: a day overflow rolls into the next month, and month
+  // 00 or 13 rolls into another year.
   if (day.getUTCMonth() !== m - 1) return null;
+  // Date.parse returns NaN for what the pattern allows but no clock has: hour
+  // 25, minute or second 60, an offset like +24:00. NaN must not reach a message.
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? null : ms;
 }
