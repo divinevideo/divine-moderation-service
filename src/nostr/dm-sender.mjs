@@ -249,7 +249,7 @@ export function selectTemplate(action, reason, categories, sha256, title = null,
  * @param {string} action - A TEMPLATES key (PERMANENT_BAN, AGE_RESTRICTED, QUARANTINE, ACCOUNT_SUSPENDED, ACCOUNT_SUSPENSION_CHANGED, ACCOUNT_BANNED, ACCOUNT_RESTORED, REPORT_OUTCOME_*).
  *   Passes no end time, so ACCOUNT_SUSPENDED keeps its no-end wording and ACCOUNT_SUSPENSION_CHANGED returns null.
  * @param {string} reason
- * @returns {string|null} Message text or null if action has no template
+ * @returns {string|null} Message text, or null if action has no template or is ACCOUNT_SUSPENSION_CHANGED
  */
 export function getMessageForAction(action, reason = 'violate Divine\'s content policies', sha256 = null, title = null, publishedAt = null) {
   const template = TEMPLATES[action];
@@ -307,7 +307,8 @@ export const COMPOSE_TEMPLATES = [
  * Render a compose template to editable text. Null-safe for compose with no video.
  * @param {string} key - one of COMPOSE_TEMPLATES[].key
  * @param {{category?: string|null, sha256?: string|null, title?: string|null, publishedAt?: string|null}} [opts]
- * @returns {string|null} rendered body, or null for an unknown key
+ * @returns {string|null} rendered body, or null for an unknown key or one with no text
+ *   to render without an end time (ACCOUNT_SUSPENSION_CHANGED, deliberately not a compose key)
  */
 export function renderComposeTemplate(key, opts = {}) {
   const { category = null, sha256 = null, title = null, publishedAt = null } = opts;
