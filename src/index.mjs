@@ -182,6 +182,7 @@ function isApiSurfacePath(pathname) {
     || pathname === '/health'
     || pathname === '/test-moderate'
     || pathname === '/test-kv'
+    || pathname === '/check-results'
     || pathname.startsWith('/check-result/')
     || pathname.startsWith('/api/v1/')
     || pathname.startsWith('/api/delete/')
@@ -1759,33 +1760,46 @@ async function handleLegacyStatus(sha256, env) {
   });
 }
 
-async function handlePublicCheckResult(url, env) {
-  const rawSha256 = url.pathname.split('/')[2];
-  if (!rawSha256 || !/^[0-9a-f]{64}$/i.test(rawSha256)) {
-    return corsResponse(jsonResponse(400, { error: 'Invalid sha256' }));
-  }
+const MAX_BULK_CHECK_RESULTS = 50;
+const CHECK_RESULT_CACHE_CONTROL = 'public, max-age=60, s-maxage=300, stale-while-revalidate=60';
+const CHECK_RESULT_UNKNOWN_CACHE_CONTROL = 'public, max-age=15, s-maxage=30, stale-while-revalidate=30';
 
-  const sha256 = rawSha256.toLowerCase();
-  const d1Result = await env.BLOSSOM_DB.prepare(`
-    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
-    FROM moderation_results
-    WHERE sha256 = ?
-  `).bind(sha256).first();
+function getPublicResultCache() {
+  return typeof caches !== 'undefined' && caches?.default ? caches.default : null;
+}
 
+function publicCheckResultCacheKey(origin, sha256) {
+  return new Request(`${origin}/check-result/${sha256}`, { method: 'GET' });
+}
+
+function publicBulkCheckResultsCacheKey(origin, sortedHashes) {
+  return new Request(`${origin}/check-results?sha256=${sortedHashes.join(',')}`, { method: 'GET' });
+}
+
+function purgePublicCheckResultCache(sha256, ctx) {
+  if (!sha256 || !/^[0-9a-f]{64}$/i.test(sha256)) return;
+  const cache = getPublicResultCache();
+  if (!cache) return;
+  const key = publicCheckResultCacheKey(`https://${API_HOSTNAME}`, sha256.toLowerCase());
+  const work = cache.delete(key).catch((error) => {
+    console.warn('[Cache] Failed to purge /check-result cache:', error?.message || error);
+  });
+  if (ctx?.waitUntil) ctx.waitUntil(work);
+}
+
+function formatPublicCheckResult(sha256, d1Result) {
   if (!d1Result) {
-    return corsResponse(new Response(JSON.stringify({
+    return {
       sha256,
       status: 'unknown',
       moderated: false,
       blocked: false,
       age_restricted: false
-    }, null, 2), {
-      headers: { 'Content-Type': 'application/json' }
-    }));
+    };
   }
 
   const action = d1Result.action;
-  return corsResponse(new Response(JSON.stringify({
+  return {
     sha256,
     status: action.toLowerCase(),
     moderated: true,
@@ -1801,9 +1815,149 @@ async function handlePublicCheckResult(url, env) {
     moderated_at: d1Result.moderated_at,
     reviewed_by: d1Result.reviewed_by,
     reviewed_at: d1Result.reviewed_at
-  }, null, 2), {
-    headers: { 'Content-Type': 'application/json' }
+  };
+}
+
+async function handlePublicCheckResult(url, env, ctx) {
+  const rawSha256 = url.pathname.split('/')[2];
+  if (!rawSha256 || !/^[0-9a-f]{64}$/i.test(rawSha256)) {
+    return corsResponse(jsonResponse(400, { error: 'Invalid sha256' }));
+  }
+
+  const sha256 = rawSha256.toLowerCase();
+  const cache = ctx?.waitUntil ? getPublicResultCache() : null;
+  const cacheKey = cache ? publicCheckResultCacheKey(url.origin, sha256) : null;
+  if (cache && cacheKey) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      return corsResponse(cached);
+    }
+  }
+
+  const d1Result = await env.BLOSSOM_DB.prepare(`
+    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
+    FROM moderation_results
+    WHERE sha256 = ?
+  `).bind(sha256).first();
+
+  const payload = formatPublicCheckResult(sha256, d1Result);
+  const cacheControl = d1Result ? CHECK_RESULT_CACHE_CONTROL : CHECK_RESULT_UNKNOWN_CACHE_CONTROL;
+  const response = corsResponse(new Response(JSON.stringify(payload, null, 2), {
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': cacheControl
+    }
   }));
+
+  if (cache && cacheKey) {
+    ctx.waitUntil(cache.put(cacheKey, response.clone()).catch((error) => {
+      console.warn('[Cache] Failed to store /check-result cache:', error?.message || error);
+    }));
+  }
+
+  return response;
+}
+
+async function parseBulkCheckHashes(request, url) {
+  let rawHashes = [];
+  if (request.method === 'GET') {
+    const params = url.searchParams.getAll('sha256');
+    for (const value of params) {
+      for (const piece of value.split(',')) {
+        const trimmed = piece.trim();
+        if (trimmed) rawHashes.push(trimmed);
+      }
+    }
+  } else if (request.method === 'POST') {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return { error: 'Invalid JSON body' };
+    }
+    if (!body || !Array.isArray(body.sha256s)) {
+      return { error: 'Expected JSON body with sha256s array' };
+    }
+    rawHashes = body.sha256s;
+  } else {
+    return { status: 405, error: 'Method not allowed' };
+  }
+
+  if (rawHashes.length === 0) {
+    return { error: 'At least one sha256 is required' };
+  }
+
+  const normalized = [];
+  for (const raw of rawHashes) {
+    if (typeof raw !== 'string' || !/^[0-9a-f]{64}$/i.test(raw.trim())) {
+      return { error: 'Invalid sha256' };
+    }
+    normalized.push(raw.trim().toLowerCase());
+  }
+
+  const sorted = [...new Set(normalized)].sort();
+  if (sorted.length > MAX_BULK_CHECK_RESULTS) {
+    return { error: `At most ${MAX_BULK_CHECK_RESULTS} unique sha256 hashes allowed` };
+  }
+  return { hashes: sorted };
+}
+
+async function handlePublicCheckResults(request, url, env, ctx) {
+  const parsed = await parseBulkCheckHashes(request, url);
+  if (parsed.error) {
+    return corsResponse(jsonResponse(parsed.status || 400, { error: parsed.error }));
+  }
+
+  const { hashes } = parsed;
+  const isGet = request.method === 'GET';
+  const cache = isGet && ctx?.waitUntil ? getPublicResultCache() : null;
+  const cacheKey = cache ? publicBulkCheckResultsCacheKey(url.origin, hashes) : null;
+  if (cache && cacheKey) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      return corsResponse(cached);
+    }
+  }
+
+  const placeholders = hashes.map(() => '?').join(', ');
+  const queryResult = await env.BLOSSOM_DB.prepare(`
+    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
+    FROM moderation_results
+    WHERE sha256 IN (${placeholders})
+  `).bind(...hashes).all();
+
+  const rowsByHash = new Map();
+  for (const row of queryResult?.results || []) {
+    if (typeof row?.sha256 === 'string') {
+      rowsByHash.set(row.sha256.toLowerCase(), row);
+    }
+  }
+
+  const results = {};
+  let allModerated = true;
+  for (const hash of hashes) {
+    const row = rowsByHash.get(hash) || null;
+    if (!row) allModerated = false;
+    results[hash] = formatPublicCheckResult(hash, row);
+  }
+
+  const cacheControl = !isGet
+    ? 'no-store'
+    : (allModerated ? CHECK_RESULT_CACHE_CONTROL : CHECK_RESULT_UNKNOWN_CACHE_CONTROL);
+  const response = corsResponse(new Response(JSON.stringify({ results }), {
+    headers: {
+      'Content-Type': 'application/json',
+      'Cache-Control': cacheControl
+    }
+  }));
+
+  if (cache && cacheKey) {
+    ctx.waitUntil(cache.put(cacheKey, response.clone()).catch((error) => {
+      console.warn('[Cache] Failed to store /check-results cache:', error?.message || error);
+    }));
+  }
+
+  return response;
 }
 
 // Only same-origin admin page paths are safe re-auth redirect targets. Reject
@@ -1922,11 +2076,18 @@ export default {
       return hostMismatchResponse(requestId, hostname, url.pathname, expectedHost);
     }
 
+    if (url.pathname === '/check-results') {
+      if (request.method === 'OPTIONS') {
+        return corsResponse(new Response(null, { status: 204 }));
+      }
+      return handlePublicCheckResults(request, url, env, ctx);
+    }
+
     if (url.pathname.startsWith('/check-result/')) {
       if (request.method === 'OPTIONS') {
         return corsResponse(new Response(null, { status: 204 }));
       }
-      return handlePublicCheckResult(url, env);
+      return handlePublicCheckResult(url, env, ctx);
     }
 
     await initUploaderEnforcementTable(env.BLOSSOM_DB);
@@ -2702,6 +2863,8 @@ export default {
       } else if (action === 'PERMANENT_BAN') {
         await env.MODERATION_KV.put(`permanent-ban:${sha256}`, kvPayload);
       }
+
+      purgePublicCheckResultCache(sha256, ctx);
 
       // Notify Blossom of the moderation decision.
       const blossomResult = await notifyBlossom(sha256, action, env);
@@ -3661,6 +3824,7 @@ export default {
       // If force=true, delete existing result to allow re-moderation
       if (force) {
         await env.BLOSSOM_DB.prepare('DELETE FROM moderation_results WHERE sha256 = ?').bind(sha256).run();
+        purgePublicCheckResultCache(sha256, ctx);
         console.log(`[TEST] Force re-moderation: deleted existing result for ${sha256}`);
       }
 
@@ -5228,7 +5392,7 @@ async function runMigration() {
       }
     }
 
-    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\nGET  /api/v1/moderation/vocabulary\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
+    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\nGET  /check-results?sha256={h1},{h2}\nPOST /check-results {"sha256s":["..."]}\nGET  /api/v1/moderation/vocabulary\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
       headers: { 'Content-Type': 'text/plain' }
     });
   },

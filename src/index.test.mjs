@@ -239,6 +239,13 @@ function createDbMock({
           return null;
         },
         async all() {
+          if (sql.includes('FROM moderation_results') && sql.includes('WHERE sha256 IN')) {
+            return {
+              results: bindings
+                .map((hash) => moderationResults.get(hash))
+                .filter(Boolean)
+            };
+          }
           if (sql.includes('FROM moderation_results') && /ORDER BY\s+(?:m\.)?moderated_at/i.test(sql)) {
             return { results: moderationListRows };
           }
@@ -313,12 +320,166 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('public, max-age=60, s-maxage=300, stale-while-revalidate=60');
     await expect(response.json()).resolves.toMatchObject({
       sha256: SHA256,
       moderated: true,
       action: 'SAFE',
       status: 'safe'
     });
+  });
+
+  it('serves bulk moderation checks via GET and POST in a single D1 query and caches GET edge responses', async () => {
+    const hashA = '1'.repeat(64);
+    const hashB = '2'.repeat(64);
+    const hashUnknown = '3'.repeat(64);
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([
+          [hashA, {
+            sha256: hashA,
+            action: 'SAFE',
+            provider: 'hiveai',
+            scores: JSON.stringify({ nudity: 0.01 }),
+            categories: JSON.stringify(['safe']),
+            moderated_at: '2026-03-07T00:00:00.000Z',
+            reviewed_by: null,
+            reviewed_at: null
+          }],
+          [hashB, {
+            sha256: hashB,
+            action: 'AGE_RESTRICTED',
+            provider: 'manual',
+            scores: null,
+            categories: JSON.stringify(['nsfw']),
+            moderated_at: '2026-03-07T00:00:00.000Z',
+            reviewed_by: 'admin',
+            reviewed_at: '2026-03-08T00:00:00.000Z'
+          }]
+        ]),
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+
+    const waitUntilPromises = [];
+    const ctx = { waitUntil(promise) { waitUntilPromises.push(promise); } };
+
+    // GET with unsorted mixed-case duplicates hits D1 once and caches under the canonical sorted key.
+    const getResponse = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-results?sha256=${hashB.toUpperCase()},${hashA},${hashB}`),
+      env,
+      ctx
+    );
+    await Promise.all(waitUntilPromises.splice(0));
+
+    expect(getResponse.status).toBe(200);
+    expect(getResponse.headers.get('Cache-Control')).toBe('public, max-age=60, s-maxage=300, stale-while-revalidate=60');
+    expect(preparedSql).toHaveLength(1);
+    await expect(getResponse.json()).resolves.toMatchObject({
+      results: {
+        [hashA]: { sha256: hashA, moderated: true, action: 'SAFE', blocked: false, age_restricted: false },
+        [hashB]: { sha256: hashB, moderated: true, action: 'AGE_RESTRICTED', blocked: false, age_restricted: true }
+      }
+    });
+
+    // Second GET with opposite order hits caches.default with zero additional D1 queries.
+    const cachedGet = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-results?sha256=${hashA},${hashB}`),
+      env,
+      ctx
+    );
+    expect(cachedGet.status).toBe(200);
+    expect(preparedSql).toHaveLength(1);
+
+    // Unknown hash lowers TTL to the short unknown Cache-Control.
+    const unknownGet = await worker.fetch(
+      new Request(`https://moderation-api.divine.video/check-results?sha256=${hashA},${hashUnknown}`),
+      env
+    );
+    expect(unknownGet.status).toBe(200);
+    expect(unknownGet.headers.get('Cache-Control')).toBe('public, max-age=15, s-maxage=30, stale-while-revalidate=30');
+    await expect(unknownGet.json()).resolves.toMatchObject({
+      results: {
+        [hashA]: { moderated: true, action: 'SAFE' },
+        [hashUnknown]: { sha256: hashUnknown, status: 'unknown', moderated: false, blocked: false, age_restricted: false }
+      }
+    });
+
+    // POST returns no-store and supports JSON body lookup.
+    const postResponse = await worker.fetch(
+      new Request('https://moderation-api.divine.video/check-results', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sha256s: [hashA, hashUnknown] })
+      }),
+      env
+    );
+    expect(postResponse.status).toBe(200);
+    expect(postResponse.headers.get('Cache-Control')).toBe('no-store');
+    await expect(postResponse.json()).resolves.toMatchObject({
+      results: {
+        [hashA]: { action: 'SAFE' },
+        [hashUnknown]: { status: 'unknown', moderated: false }
+      }
+    });
+
+    // Rejects invalid, empty, >50 hashes, and wrong host without touching D1.
+    const beforeErrors = preparedSql.length;
+    const badHash = await worker.fetch(new Request('https://moderation-api.divine.video/check-results?sha256=not-a-hash'), env);
+    const emptyList = await worker.fetch(new Request('https://moderation-api.divine.video/check-results'), env);
+    const tooMany = Array.from({ length: 51 }, (_, i) => i.toString(16).padStart(64, '0'));
+    const overflow = await worker.fetch(
+      new Request('https://moderation-api.divine.video/check-results', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sha256s: tooMany })
+      }),
+      env
+    );
+    const adminHost = await worker.fetch(
+      new Request(`https://moderation.admin.divine.video/check-results?sha256=${hashA}`),
+      env
+    );
+    expect(badHash.status).toBe(400);
+    expect(emptyList.status).toBe(400);
+    expect(overflow.status).toBe(400);
+    expect(adminHost.status).toBe(404);
+    expect(preparedSql).toHaveLength(beforeErrors);
+  });
+
+  it('caches single /check-result/:sha256 at the edge when ctx is provided', async () => {
+    const cachedHash = '4'.repeat(64);
+    const preparedSql = [];
+    const env = createEnv({
+      BLOSSOM_DB: createDbMock({
+        moderationResults: new Map([[cachedHash, {
+          sha256: cachedHash,
+          action: 'SAFE',
+          provider: 'hiveai',
+          scores: null,
+          categories: null,
+          moderated_at: '2026-03-07T00:00:00.000Z',
+          reviewed_by: null,
+          reviewed_at: null
+        }]]),
+        onPrepare(sql) {
+          preparedSql.push(sql);
+        }
+      })
+    });
+    const waitUntilPromises = [];
+    const ctx = { waitUntil(promise) { waitUntilPromises.push(promise); } };
+
+    const first = await worker.fetch(new Request(`https://moderation-api.divine.video/check-result/${cachedHash}`), env, ctx);
+    await Promise.all(waitUntilPromises.splice(0));
+    const second = await worker.fetch(new Request(`https://moderation-api.divine.video/check-result/${cachedHash}`), env, ctx);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(preparedSql).toHaveLength(1);
   });
 
   it('serves public moderation status without schema initialization', async () => {
@@ -373,6 +534,7 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('public, max-age=60, s-maxage=300, stale-while-revalidate=60');
     await expect(response.json()).resolves.toMatchObject({
       sha256: SHA256,
       moderated: true,
