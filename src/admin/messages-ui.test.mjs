@@ -452,9 +452,10 @@ describe('messages UI — filter chips and No reply needed', () => {
     }
   });
 
-  it('switching chips refreshes the counts along with the list', () => {
+  it('switching chips refreshes the counts along with the list', async () => {
     let counts = 0;
     let lists = 0;
+    let autoFills = 0;
     let stored;
     const setFilter = new Function('return (' + sliceFn('function setFilter(') + ')')();
     const saved = {};
@@ -463,15 +464,17 @@ describe('messages UI — filter chips and No reply needed', () => {
       document: { getElementById: () => ({ innerHTML: '' }) },
       fetchFilterCounts: () => { counts++; },
       fetchConversations: () => { lists++; return Promise.resolve(); },
-      maybeAutoFillConversations() {}, FILTER_STORAGE_KEY: 'k',
+      maybeAutoFillConversations() { autoFills++; }, FILTER_STORAGE_KEY: 'k',
     };
     for (const [k, v] of Object.entries(stubs)) { saved[k] = globalThis[k]; globalThis[k] = v; }
     try {
       setFilter('waiting');
-      expect([counts, lists]).toEqual([1, 1]);
+      // The list promise schedules auto-fill; keep its globals until it runs.
+      await Promise.resolve();
+      expect([counts, lists, autoFills]).toEqual([1, 1, 1]);
       expect(stored).toBe('waiting'); // remembered for this tab only
       setFilter('waiting'); // re-selecting the active chip does nothing
-      expect([counts, lists]).toEqual([1, 1]);
+      expect([counts, lists, autoFills]).toEqual([1, 1, 1]);
     } finally {
       for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete globalThis[k]; else globalThis[k] = v; }
     }

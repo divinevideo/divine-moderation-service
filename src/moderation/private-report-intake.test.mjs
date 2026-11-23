@@ -419,25 +419,22 @@ describe('private report intake', () => {
       });
     }
 
-    // What real fetch does on abort once headers are in: the body stream
-    // errors. A body that never finishes must still be cut off by the timeout,
-    // which therefore has to keep running until the body has been read.
-    function stalledBodyResponse(signal) {
-      const body = new ReadableStream({
-        start(controller) {
-          signal.addEventListener('abort', () => controller.error(new DOMException('The operation was aborted', 'AbortError')));
-        },
-      });
-      return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
-
     it('times out a response whose body never finishes', async () => {
       vi.spyOn(console, 'warn').mockImplementation(() => {});
-      relayAdmin.fetch.mockImplementation(async (url, init) => stalledBodyResponse(init.signal));
+      const readBody = vi.fn((signal) => new Promise((resolve, reject) => {
+        signal.throwIfAborted();
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }));
+      // Headers have arrived, but reading the body fails only on abort.
+      relayAdmin.fetch.mockImplementation(async (_url, { signal }) => ({
+        status: 200,
+        text: () => readBody(signal),
+      }));
       await recordPrivateReportIntake(db, intakeRow());
 
       const summary = await deliverPendingPrivateReports(deliveryEnv(), { nowMs: NOW_MS, timeoutMs: 50 });
 
+      expect(readBody).toHaveBeenCalledTimes(1);
       expect(summary).toMatchObject({ attempted: 1, retrying: 1, delivered: 0 });
       const [row] = await rows();
       expect(row.status).toBe('pending');
