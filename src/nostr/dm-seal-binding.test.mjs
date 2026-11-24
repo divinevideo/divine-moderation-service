@@ -142,11 +142,8 @@ function relayServing(giftWraps) {
 /**
  * Run one sync against a stubbed relay.
  *
- * The stub is installed and removed inside this call rather than in an
- * afterEach hook: @cloudflare/vitest-pool-workers talks to the vitest host
- * over a WebSocket, so leaving a stubbed global installed when the test
- * function returns takes down the pool's own RPC channel (the run dies with
- * `Timeout calling "onTaskUpdate"` and reports no results at all).
+ * The stub is installed and removed inside this call, so the stubbed global
+ * never outlives the sync it serves.
  */
 async function syncOverRelay(giftWraps, moderatorEnv) {
   const OriginalWebSocket = globalThis.WebSocket;

@@ -62,7 +62,7 @@ npm run lint       # custom repo lint pass
 npm run tail       # tail production logs
 ```
 
-Tests are written with Vitest on `@cloudflare/vitest-pool-workers`. Every source module has a colocated `*.test.mjs`.
+Tests are written with Vitest on `@cloudflare/vitest-plugin`. Every source module has a colocated `*.test.mjs`.
 
 ## Configuration
 

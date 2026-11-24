@@ -117,10 +117,9 @@ const isReadFrame = (data) => typeof data === 'string' && /^\["(?:REQ|CLOSE)",/.
  * writing to it. A test that installs its own fake WebSocket replaces the guard
  * for its duration.
  *
- * The guard is a Proxy over the real class, not a replacement: the pool's own
- * RPC reads WebSocket.READY_STATE_OPEN from the global and silently drops every
- * message if it is missing, which wedges the run. Any fake WebSocket needs the
- * READY_STATE_* statics for the same reason.
+ * The guard is a Proxy over the real class, not a replacement, so reads (REQ
+ * and CLOSE) still go out on a real socket and every static, READY_STATE_*
+ * included, passes through unchanged.
  *
  * @returns {{ readonly blocked: string[], clear(): void }} relay URLs whose
  *   frames were dropped in the current test (for the guard's own test)

@@ -351,11 +351,10 @@ describe('DM Sender - discoverUserRelays', () => {
   });
 });
 
-// vitest-pool-workers does not reliably honor vi.stubGlobal('WebSocket').
-// Assigning globalThis.WebSocket and using reserved-domain hosts is the
-// pattern the rest of this file already uses: 127.0.0.1 and relay.divine.video
-// construct a real socket and wedge the worker RPC (CI Test on this PR hung
-// for 60s after the contained happy-path test, then died on onTaskUpdate).
+// Tests that use this fake point at a loopback port or a reserved example
+// domain, so a fake they miss still never reaches a public relay. (Under the
+// old single-worker pool a real socket to 127.0.0.1 or relay.divine.video also
+// wedged the worker RPC: CI hung for 60s, then died on onTaskUpdate.)
 function installRecordingWebSocket() {
   const sockets = [];
   const original = globalThis.WebSocket;
@@ -369,8 +368,7 @@ function installRecordingWebSocket() {
     send() {}
     close() {}
   }
-  // The pool's own RPC reads WebSocket.READY_STATE_OPEN from the global and
-  // drops every message without it (see guardRelayPublishes).
+  // Copied so the fake matches the real class; nothing here depends on them.
   for (const k of ['READY_STATE_CONNECTING', 'READY_STATE_OPEN', 'READY_STATE_CLOSING', 'READY_STATE_CLOSED']) {
     FakeWS[k] = original[k];
   }
@@ -596,10 +594,10 @@ describe('DM Sender - DM_RELAY_URLS override', () => {
       // the production relay to the list at all three call sites passed the full
       // 1579-test suite. Assert the transport, not the answer.
       //
-      // Use reserved-domain hosts. A real constructor against 127.0.0.1 or
-      // relay.divine.video wedges vitest-pool-workers even when the test
-      // intended to fake WebSocket (CI Test on this head: worker onTaskUpdate
-      // timeout after the real sockets logged their errors).
+      // Use reserved-domain hosts, so a fake this test misses never opens a
+      // real socket to 127.0.0.1 or relay.divine.video. (Under the old
+      // single-worker pool such sockets also wedged the run: CI timed out on
+      // onTaskUpdate after the real sockets logged their errors.)
       const ws = installRecordingWebSocket();
       try {
         const env = {
@@ -1019,8 +1017,9 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
   let env;
   let loggedInserts;
 
-  // Gift-wrap seam: a plain event (real wrapEvent's per-call crypto wedges the
-  // pool). Its id is echoed back by the fake publish socket below.
+  // Gift-wrap seam: a plain event, so the send needs no per-call crypto (under
+  // the old single-worker pool, real wrapEvent's crypto wedged it). Its id is
+  // echoed back by the fake publish socket below.
   const fakeWrap = () => ({
     id: 'e'.repeat(64),
     kind: 1059,
@@ -1032,8 +1031,8 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
   });
 
   // Capture the real dm-store INSERT so we can read the audit message_type
-  // without mocking the module (a mocked dynamic import wedges the pool
-  // worker's RPC in this environment).
+  // without mocking the module (under the old single-worker pool, a mocked
+  // dynamic import wedged the worker's RPC).
   function capturingDb() {
     return {
       prepare(sql) {
@@ -1060,9 +1059,9 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
     // WebSocket, and swap in a publish socket that acknowledges the wrapped
     // event.
     // Use the reserved-domain relay the working publishToRelays test uses:
-    // under vitest-pool-workers, constructing a socket to the real
-    // relay.divine.video host wedges the worker's RPC even with a fake
-    // WebSocket, whereas relay.example.com resolves nowhere and stays local.
+    // relay.example.com resolves nowhere and stays local. (Under the old
+    // single-worker pool, a socket to the real relay.divine.video host wedged
+    // the worker's RPC even with a fake WebSocket.)
     env = {
       NOSTR_PRIVATE_KEY: testHex,
       BLOSSOM_DB: capturingDb(),
@@ -1077,8 +1076,8 @@ describe('community-warning vs moderator-reply audit trail (#180)', () => {
       }
       addEventListener(type, cb) { this._cbs[type] = cb; }
       send(msg) {
-        // Acknowledge synchronously within send (a queued reply wedges the
-        // pool worker for this send path).
+        // Acknowledge synchronously within send (under the old single-worker
+        // pool, a queued reply wedged this send path).
         const parsed = JSON.parse(msg);
         if (parsed[0] === 'EVENT') {
           this._cbs.message
@@ -1494,7 +1493,8 @@ describe('account notices are exempt from the DM rate limit', () => {
       addEventListener(type, cb) { this._cbs[type] = cb; }
       send(msg) {
         // Acknowledge synchronously within send, like the other accepting fake
-        // in this file (a queued reply wedges the pool worker).
+        // in this file (under the old single-worker pool, a queued reply wedged
+        // the worker).
         const parsed = JSON.parse(msg);
         if (parsed[0] === 'EVENT') {
           this._cbs.message && this._cbs.message({ data: JSON.stringify(['OK', parsed[1].id, true, '']) });

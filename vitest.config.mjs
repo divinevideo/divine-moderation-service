@@ -2,11 +2,27 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: Vitest configuration for testing Cloudflare Workers
-// ABOUTME: Uses @cloudflare/vitest-pool-workers for Workers environment simulation
+// ABOUTME: Uses @cloudflare/vitest-plugin for Workers environment simulation
 
-import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+import { cloudflareTest } from '@cloudflare/vitest-plugin';
+import { defineConfig } from 'vitest/config';
 
-export default defineWorkersConfig({
+export default defineConfig({
+  plugins: [cloudflareTest({
+    // Tests must never reach real Cloudflare resources, even if a binding in
+    // wrangler.toml is later marked `remote = true` for `wrangler dev`.
+    remoteBindings: false,
+    wrangler: { configPath: './wrangler.toml' },
+    miniflare: {
+      // Stub the production service binding in the local Workers runtime.
+      serviceBindings: {
+        RELAY_ADMIN: () => new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        }),
+      },
+    },
+  })],
   test: {
     testTimeout: 30000,
     hookTimeout: 30000,
@@ -21,24 +37,6 @@ export default defineWorkersConfig({
       '**/.claude/worktrees/**',
       '**/.deploy-worktrees/**',
     ],
-    poolOptions: {
-      workers: {
-        singleWorker: true,
-        wrangler: { configPath: './wrangler.toml' },
-        miniflare: {
-          // The RELAY_ADMIN service binding (divine-relay-admin-api-prod) is not
-          // available in the test sandbox; provide a stub so the Workers runtime
-          // can start. Tests that exercise the binding inject their own mock
-          // RELAY_ADMIN via the env passed to worker.fetch, which takes precedence.
-          serviceBindings: {
-            RELAY_ADMIN: () => new Response(JSON.stringify({ success: true }), {
-              status: 200,
-              headers: { 'Content-Type': 'application/json' }
-            }),
-          },
-        },
-      },
-    },
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],

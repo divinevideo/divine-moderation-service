@@ -78,9 +78,10 @@ import { guardRelayPublishes } from './test/helpers.mjs';
 const relayGuard = guardRelayPublishes();
 
 // A fake relay for tests that publish. It acks every EVENT and ends every REQ
-// at once (both synchronously inside send: a queued reply wedges the pool on
-// this path), and records each published event with its relay URL. The
-// READY_STATE_* statics are copied for the reason guardRelayPublishes gives.
+// at once (both synchronously inside send; under the old single-worker pool a
+// queued reply wedged this path), and records each published event with its
+// relay URL. The READY_STATE_* statics are copied so the fake matches the real
+// class.
 function installFakeRelay() {
   const published = [];
   const previous = globalThis.WebSocket;

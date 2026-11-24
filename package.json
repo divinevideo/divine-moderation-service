@@ -17,8 +17,8 @@
     "nostr-tools": "^2.7.2"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.5.0",
-    "vitest": "^2.0.0",
+    "@cloudflare/vitest-plugin": "^1.9.0",
+    "vitest": "^4.1.12",
     "wrangler": "^4.42.2"
   }
 }
