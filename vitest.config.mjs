@@ -2,9 +2,9 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: Vitest configuration for testing Cloudflare Workers
-// ABOUTME: Uses @cloudflare/vitest-pool-workers for Workers environment simulation
+// ABOUTME: Uses @cloudflare/vitest-plugin for Workers environment simulation
 
-import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
+import { cloudflareTest } from '@cloudflare/vitest-plugin';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
