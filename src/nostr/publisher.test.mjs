@@ -580,9 +580,9 @@ describe('DM inbox relay list (kind 10050)', () => {
   it('does not advance the throttle when the home relay rejects but discovery succeeds', async () => {
     // Multi-relay path: home relay rejects (the pre-#536 state), discovery accepts.
     // Inject the connector so per-relay outcomes are deterministic and never hit the
-    // network. A module-level mock of the transport does not reliably isolate under the
-    // single-worker pool, which let this test fall through to the real network (green
-    // locally with egress, red in CI without it).
+    // network. A module-level mock of the transport did not reliably isolate under the
+    // old single-worker pool, which let this test fall through to the real network
+    // (green locally with egress, red in CI without it).
     const connect = (url) => Promise.resolve({
       publish: url === 'wss://relay.divine.video'
         ? vi.fn().mockRejectedValue(new Error('kind 10050 not in allowed_kinds'))
