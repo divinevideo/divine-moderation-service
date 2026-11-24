@@ -457,18 +457,25 @@ describe('messages UI — filter chips and No reply needed', () => {
     let lists = 0;
     let autoFills = 0;
     let stored;
+    let finishLoad;
     const setFilter = new Function('return (' + sliceFn('function setFilter(') + ')')();
     const saved = {};
     const stubs = {
       activeFilter: '', sessionStorage: { setItem: (k, v) => { stored = v; } }, renderFilterChips() {}, conversations: [],
       document: { getElementById: () => ({ innerHTML: '' }) },
       fetchFilterCounts: () => { counts++; },
-      fetchConversations: () => { lists++; return Promise.resolve(); },
+      // The list load stays in flight until the test finishes it.
+      fetchConversations: () => { lists++; return new Promise((resolve) => { finishLoad = resolve; }); },
       maybeAutoFillConversations() { autoFills++; }, FILTER_STORAGE_KEY: 'k',
     };
     for (const [k, v] of Object.entries(stubs)) { saved[k] = globalThis[k]; globalThis[k] = v; }
     try {
       setFilter('waiting');
+      // Auto-fill waits for the list load. While the load is in flight the page
+      // would bail, so nothing may auto-fill before it settles.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect([counts, lists, autoFills]).toEqual([1, 1, 0]);
+      finishLoad();
       // The list promise schedules auto-fill; keep its globals until it runs.
       await Promise.resolve();
       expect([counts, lists, autoFills]).toEqual([1, 1, 1]);
