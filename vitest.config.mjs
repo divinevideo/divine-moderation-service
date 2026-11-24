@@ -9,6 +9,9 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   plugins: [cloudflareTest({
+    // Tests must never reach real Cloudflare resources, even if a binding in
+    // wrangler.toml is later marked `remote = true` for `wrangler dev`.
+    remoteBindings: false,
     wrangler: { configPath: './wrangler.toml' },
     miniflare: {
       // Stub the production service binding in the local Workers runtime.
