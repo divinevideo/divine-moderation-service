@@ -2,7 +2,7 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: Tests for scripts/sweep-creator-deletes.mjs — pure helpers + main() with injected deps.
-// ABOUTME: Vitest runs under @cloudflare/vitest-pool-workers; nodejs_compat is on so node:child_process imports resolve.
+// ABOUTME: Vitest runs under @cloudflare/vitest-plugin; nodejs_compat is on, but it does not provide node:child_process, so defaultRunner imports it lazily.
 
 import { describe, it, expect } from 'vitest';
 import {

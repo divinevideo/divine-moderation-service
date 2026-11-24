@@ -2,7 +2,7 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
 // ABOUTME: Tests for scripts/e2e-creator-delete.mjs — pure helpers + main() with injected deps.
-// ABOUTME: Vitest runs under @cloudflare/vitest-pool-workers; nodejs_compat is on.
+// ABOUTME: Vitest runs under @cloudflare/vitest-plugin; nodejs_compat is on.
 
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi } from 'vitest';
