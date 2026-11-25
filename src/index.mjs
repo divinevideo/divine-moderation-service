@@ -1761,31 +1761,6 @@ async function handleLegacyStatus(sha256, env) {
 }
 
 const MAX_BULK_CHECK_RESULTS = 50;
-const CHECK_RESULT_CACHE_CONTROL = 'public, max-age=60, s-maxage=300, stale-while-revalidate=60';
-const CHECK_RESULT_UNKNOWN_CACHE_CONTROL = 'public, max-age=15, s-maxage=30, stale-while-revalidate=30';
-
-function getPublicResultCache() {
-  return typeof caches !== 'undefined' && caches?.default ? caches.default : null;
-}
-
-function publicCheckResultCacheKey(origin, sha256) {
-  return new Request(`${origin}/check-result/${sha256}`, { method: 'GET' });
-}
-
-function publicBulkCheckResultsCacheKey(origin, sortedHashes) {
-  return new Request(`${origin}/check-results?sha256=${sortedHashes.join(',')}`, { method: 'GET' });
-}
-
-function purgePublicCheckResultCache(sha256, ctx) {
-  if (!sha256 || !/^[0-9a-f]{64}$/i.test(sha256)) return;
-  const cache = getPublicResultCache();
-  if (!cache) return;
-  const key = publicCheckResultCacheKey(`https://${API_HOSTNAME}`, sha256.toLowerCase());
-  const work = cache.delete(key).catch((error) => {
-    console.warn('[Cache] Failed to purge /check-result cache:', error?.message || error);
-  });
-  if (ctx?.waitUntil) ctx.waitUntil(work);
-}
 
 function formatPublicCheckResult(sha256, d1Result) {
   if (!d1Result) {
@@ -1818,44 +1793,20 @@ function formatPublicCheckResult(sha256, d1Result) {
   };
 }
 
-async function handlePublicCheckResult(url, env, ctx) {
+async function handlePublicCheckResult(url, env) {
   const rawSha256 = url.pathname.split('/')[2];
   if (!rawSha256 || !/^[0-9a-f]{64}$/i.test(rawSha256)) {
     return corsResponse(jsonResponse(400, { error: 'Invalid sha256' }));
   }
 
   const sha256 = rawSha256.toLowerCase();
-  const cache = ctx?.waitUntil ? getPublicResultCache() : null;
-  const cacheKey = cache ? publicCheckResultCacheKey(url.origin, sha256) : null;
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      return corsResponse(cached);
-    }
-  }
-
   const d1Result = await env.BLOSSOM_DB.prepare(`
     SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
     FROM moderation_results
     WHERE sha256 = ?
   `).bind(sha256).first();
 
-  const payload = formatPublicCheckResult(sha256, d1Result);
-  const cacheControl = d1Result ? CHECK_RESULT_CACHE_CONTROL : CHECK_RESULT_UNKNOWN_CACHE_CONTROL;
-  const response = corsResponse(new Response(JSON.stringify(payload, null, 2), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Cache-Control': cacheControl
-    }
-  }));
-
-  if (cache && cacheKey) {
-    ctx.waitUntil(cache.put(cacheKey, response.clone()).catch((error) => {
-      console.warn('[Cache] Failed to store /check-result cache:', error?.message || error);
-    }));
-  }
-
-  return response;
+  return corsResponse(jsonResponse(200, formatPublicCheckResult(sha256, d1Result)));
 }
 
 async function parseBulkCheckHashes(request, url) {
@@ -1902,23 +1853,13 @@ async function parseBulkCheckHashes(request, url) {
   return { hashes: sorted };
 }
 
-async function handlePublicCheckResults(request, url, env, ctx) {
+async function handlePublicCheckResults(request, url, env) {
   const parsed = await parseBulkCheckHashes(request, url);
   if (parsed.error) {
     return corsResponse(jsonResponse(parsed.status || 400, { error: parsed.error }));
   }
 
   const { hashes } = parsed;
-  const isGet = request.method === 'GET';
-  const cache = isGet && ctx?.waitUntil ? getPublicResultCache() : null;
-  const cacheKey = cache ? publicBulkCheckResultsCacheKey(url.origin, hashes) : null;
-  if (cache && cacheKey) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      return corsResponse(cached);
-    }
-  }
-
   const placeholders = hashes.map(() => '?').join(', ');
   const queryResult = await env.BLOSSOM_DB.prepare(`
     SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
@@ -1934,30 +1875,11 @@ async function handlePublicCheckResults(request, url, env, ctx) {
   }
 
   const results = {};
-  let allModerated = true;
   for (const hash of hashes) {
-    const row = rowsByHash.get(hash) || null;
-    if (!row) allModerated = false;
-    results[hash] = formatPublicCheckResult(hash, row);
+    results[hash] = formatPublicCheckResult(hash, rowsByHash.get(hash));
   }
 
-  const cacheControl = !isGet
-    ? 'no-store'
-    : (allModerated ? CHECK_RESULT_CACHE_CONTROL : CHECK_RESULT_UNKNOWN_CACHE_CONTROL);
-  const response = corsResponse(new Response(JSON.stringify({ results }), {
-    headers: {
-      'Content-Type': 'application/json',
-      'Cache-Control': cacheControl
-    }
-  }));
-
-  if (cache && cacheKey) {
-    ctx.waitUntil(cache.put(cacheKey, response.clone()).catch((error) => {
-      console.warn('[Cache] Failed to store /check-results cache:', error?.message || error);
-    }));
-  }
-
-  return response;
+  return corsResponse(jsonResponse(200, { results }));
 }
 
 // Only same-origin admin page paths are safe re-auth redirect targets. Reject
@@ -2080,14 +2002,14 @@ export default {
       if (request.method === 'OPTIONS') {
         return corsResponse(new Response(null, { status: 204 }));
       }
-      return handlePublicCheckResults(request, url, env, ctx);
+      return handlePublicCheckResults(request, url, env);
     }
 
     if (url.pathname.startsWith('/check-result/')) {
       if (request.method === 'OPTIONS') {
         return corsResponse(new Response(null, { status: 204 }));
       }
-      return handlePublicCheckResult(url, env, ctx);
+      return handlePublicCheckResult(url, env);
     }
 
     await initUploaderEnforcementTable(env.BLOSSOM_DB);
@@ -2863,8 +2785,6 @@ export default {
       } else if (action === 'PERMANENT_BAN') {
         await env.MODERATION_KV.put(`permanent-ban:${sha256}`, kvPayload);
       }
-
-      purgePublicCheckResultCache(sha256, ctx);
 
       // Notify Blossom of the moderation decision.
       const blossomResult = await notifyBlossom(sha256, action, env);
@@ -3824,7 +3744,6 @@ export default {
       // If force=true, delete existing result to allow re-moderation
       if (force) {
         await env.BLOSSOM_DB.prepare('DELETE FROM moderation_results WHERE sha256 = ?').bind(sha256).run();
-        purgePublicCheckResultCache(sha256, ctx);
         console.log(`[TEST] Force re-moderation: deleted existing result for ${sha256}`);
       }
 

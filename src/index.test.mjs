@@ -320,7 +320,7 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get('Cache-Control')).toBe('public, max-age=60, s-maxage=300, stale-while-revalidate=60');
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
     await expect(response.json()).resolves.toMatchObject({
       sha256: SHA256,
       moderated: true,
@@ -329,35 +329,36 @@ describe('HTTP hostname routing', () => {
     });
   });
 
-  it('serves bulk moderation checks via GET and POST in a single D1 query and caches GET edge responses', async () => {
+  it('returns current bulk moderation decisions in one D1 query per request', async () => {
     const hashA = '1'.repeat(64);
     const hashB = '2'.repeat(64);
     const hashUnknown = '3'.repeat(64);
     const preparedSql = [];
+    const moderationResults = new Map([
+      [hashA, {
+        sha256: hashA,
+        action: 'SAFE',
+        provider: 'hiveai',
+        scores: JSON.stringify({ nudity: 0.01 }),
+        categories: JSON.stringify(['safe']),
+        moderated_at: '2026-03-07T00:00:00.000Z',
+        reviewed_by: null,
+        reviewed_at: null
+      }],
+      [hashB, {
+        sha256: hashB,
+        action: 'AGE_RESTRICTED',
+        provider: 'manual',
+        scores: null,
+        categories: JSON.stringify(['nsfw']),
+        moderated_at: '2026-03-07T00:00:00.000Z',
+        reviewed_by: 'admin',
+        reviewed_at: '2026-03-08T00:00:00.000Z'
+      }]
+    ]);
     const env = createEnv({
       BLOSSOM_DB: createDbMock({
-        moderationResults: new Map([
-          [hashA, {
-            sha256: hashA,
-            action: 'SAFE',
-            provider: 'hiveai',
-            scores: JSON.stringify({ nudity: 0.01 }),
-            categories: JSON.stringify(['safe']),
-            moderated_at: '2026-03-07T00:00:00.000Z',
-            reviewed_by: null,
-            reviewed_at: null
-          }],
-          [hashB, {
-            sha256: hashB,
-            action: 'AGE_RESTRICTED',
-            provider: 'manual',
-            scores: null,
-            categories: JSON.stringify(['nsfw']),
-            moderated_at: '2026-03-07T00:00:00.000Z',
-            reviewed_by: 'admin',
-            reviewed_at: '2026-03-08T00:00:00.000Z'
-          }]
-        ]),
+        moderationResults,
         onPrepare(sql) {
           preparedSql.push(sql);
         }
@@ -367,7 +368,7 @@ describe('HTTP hostname routing', () => {
     const waitUntilPromises = [];
     const ctx = { waitUntil(promise) { waitUntilPromises.push(promise); } };
 
-    // GET with unsorted mixed-case duplicates hits D1 once and caches under the canonical sorted key.
+    // GET normalizes and deduplicates mixed-case hashes in one D1 query.
     const getResponse = await worker.fetch(
       new Request(`https://moderation-api.divine.video/check-results?sha256=${hashB.toUpperCase()},${hashA},${hashB}`),
       env,
@@ -376,7 +377,6 @@ describe('HTTP hostname routing', () => {
     await Promise.all(waitUntilPromises.splice(0));
 
     expect(getResponse.status).toBe(200);
-    expect(getResponse.headers.get('Cache-Control')).toBe('public, max-age=60, s-maxage=300, stale-while-revalidate=60');
     expect(preparedSql).toHaveLength(1);
     await expect(getResponse.json()).resolves.toMatchObject({
       results: {
@@ -385,25 +385,28 @@ describe('HTTP hostname routing', () => {
       }
     });
 
-    // Second GET with opposite order hits caches.default with zero additional D1 queries.
-    const cachedGet = await worker.fetch(
+    moderationResults.get(hashA).action = 'PERMANENT_BAN';
+    const nextGet = await worker.fetch(
       new Request(`https://moderation-api.divine.video/check-results?sha256=${hashA},${hashB}`),
       env,
       ctx
     );
-    expect(cachedGet.status).toBe(200);
-    expect(preparedSql).toHaveLength(1);
+    expect(nextGet.status).toBe(200);
+    await expect(nextGet.json()).resolves.toMatchObject({
+      results: { [hashA]: { action: 'PERMANENT_BAN', blocked: true } }
+    });
+    expect(nextGet.headers.get('Cache-Control')).toBe('no-store');
+    expect(preparedSql).toHaveLength(2);
 
-    // Unknown hash lowers TTL to the short unknown Cache-Control.
     const unknownGet = await worker.fetch(
       new Request(`https://moderation-api.divine.video/check-results?sha256=${hashA},${hashUnknown}`),
       env
     );
     expect(unknownGet.status).toBe(200);
-    expect(unknownGet.headers.get('Cache-Control')).toBe('public, max-age=15, s-maxage=30, stale-while-revalidate=30');
+    expect(unknownGet.headers.get('Cache-Control')).toBe('no-store');
     await expect(unknownGet.json()).resolves.toMatchObject({
       results: {
-        [hashA]: { moderated: true, action: 'SAFE' },
+        [hashA]: { moderated: true, action: 'PERMANENT_BAN', blocked: true },
         [hashUnknown]: { sha256: hashUnknown, status: 'unknown', moderated: false, blocked: false, age_restricted: false }
       }
     });
@@ -421,7 +424,7 @@ describe('HTTP hostname routing', () => {
     expect(postResponse.headers.get('Cache-Control')).toBe('no-store');
     await expect(postResponse.json()).resolves.toMatchObject({
       results: {
-        [hashA]: { action: 'SAFE' },
+        [hashA]: { action: 'PERMANENT_BAN', blocked: true },
         [hashUnknown]: { status: 'unknown', moderated: false }
       }
     });
@@ -450,36 +453,24 @@ describe('HTTP hostname routing', () => {
     expect(preparedSql).toHaveLength(beforeErrors);
   });
 
-  it('caches single /check-result/:sha256 at the edge when ctx is provided', async () => {
-    const cachedHash = '4'.repeat(64);
-    const preparedSql = [];
+  it('reads the latest decision for a single hash after a moderation change', async () => {
+    const hash = '4'.repeat(64);
+    const row = { sha256: hash, action: 'SAFE' };
     const env = createEnv({
-      BLOSSOM_DB: createDbMock({
-        moderationResults: new Map([[cachedHash, {
-          sha256: cachedHash,
-          action: 'SAFE',
-          provider: 'hiveai',
-          scores: null,
-          categories: null,
-          moderated_at: '2026-03-07T00:00:00.000Z',
-          reviewed_by: null,
-          reviewed_at: null
-        }]]),
-        onPrepare(sql) {
-          preparedSql.push(sql);
-        }
-      })
+      BLOSSOM_DB: createDbMock({ moderationResults: new Map([[hash, row]]) })
     });
-    const waitUntilPromises = [];
-    const ctx = { waitUntil(promise) { waitUntilPromises.push(promise); } };
+    const cacheWrites = [];
+    const ctx = { waitUntil(promise) { cacheWrites.push(promise); } };
+    const url = `https://moderation-api.divine.video/check-result/${hash}`;
 
-    const first = await worker.fetch(new Request(`https://moderation-api.divine.video/check-result/${cachedHash}`), env, ctx);
-    await Promise.all(waitUntilPromises.splice(0));
-    const second = await worker.fetch(new Request(`https://moderation-api.divine.video/check-result/${cachedHash}`), env, ctx);
+    const first = await worker.fetch(new Request(url), env, ctx);
+    await Promise.all(cacheWrites);
+    await expect(first.json()).resolves.toMatchObject({ action: 'SAFE', blocked: false });
 
-    expect(first.status).toBe(200);
-    expect(second.status).toBe(200);
-    expect(preparedSql).toHaveLength(1);
+    row.action = 'PERMANENT_BAN';
+    const second = await worker.fetch(new Request(url), env, ctx);
+    await expect(second.json()).resolves.toMatchObject({ action: 'PERMANENT_BAN', blocked: true });
+    expect(second.headers.get('Cache-Control')).toBe('no-store');
   });
 
   it('serves public moderation status without schema initialization', async () => {
@@ -534,7 +525,7 @@ describe('HTTP hostname routing', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get('Cache-Control')).toBe('public, max-age=60, s-maxage=300, stale-while-revalidate=60');
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
     await expect(response.json()).resolves.toMatchObject({
       sha256: SHA256,
       moderated: true,
