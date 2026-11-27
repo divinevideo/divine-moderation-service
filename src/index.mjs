@@ -182,6 +182,7 @@ function isApiSurfacePath(pathname) {
     || pathname === '/health'
     || pathname === '/test-moderate'
     || pathname === '/test-kv'
+    || pathname === '/check-results'
     || pathname.startsWith('/check-result/')
     || pathname.startsWith('/api/v1/')
     || pathname.startsWith('/api/delete/')
@@ -1759,33 +1760,21 @@ async function handleLegacyStatus(sha256, env) {
   });
 }
 
-async function handlePublicCheckResult(url, env) {
-  const rawSha256 = url.pathname.split('/')[2];
-  if (!rawSha256 || !/^[0-9a-f]{64}$/i.test(rawSha256)) {
-    return corsResponse(jsonResponse(400, { error: 'Invalid sha256' }));
-  }
+const MAX_BULK_CHECK_RESULTS = 50;
 
-  const sha256 = rawSha256.toLowerCase();
-  const d1Result = await env.BLOSSOM_DB.prepare(`
-    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
-    FROM moderation_results
-    WHERE sha256 = ?
-  `).bind(sha256).first();
-
+function formatPublicCheckResult(sha256, d1Result) {
   if (!d1Result) {
-    return corsResponse(new Response(JSON.stringify({
+    return {
       sha256,
       status: 'unknown',
       moderated: false,
       blocked: false,
       age_restricted: false
-    }, null, 2), {
-      headers: { 'Content-Type': 'application/json' }
-    }));
+    };
   }
 
   const action = d1Result.action;
-  return corsResponse(new Response(JSON.stringify({
+  return {
     sha256,
     status: action.toLowerCase(),
     moderated: true,
@@ -1801,9 +1790,96 @@ async function handlePublicCheckResult(url, env) {
     moderated_at: d1Result.moderated_at,
     reviewed_by: d1Result.reviewed_by,
     reviewed_at: d1Result.reviewed_at
-  }, null, 2), {
-    headers: { 'Content-Type': 'application/json' }
-  }));
+  };
+}
+
+async function handlePublicCheckResult(url, env) {
+  const rawSha256 = url.pathname.split('/')[2];
+  if (!rawSha256 || !/^[0-9a-f]{64}$/i.test(rawSha256)) {
+    return corsResponse(jsonResponse(400, { error: 'Invalid sha256' }));
+  }
+
+  const sha256 = rawSha256.toLowerCase();
+  const d1Result = await env.BLOSSOM_DB.prepare(`
+    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
+    FROM moderation_results
+    WHERE sha256 = ?
+  `).bind(sha256).first();
+
+  return corsResponse(jsonResponse(200, formatPublicCheckResult(sha256, d1Result)));
+}
+
+async function parseBulkCheckHashes(request, url) {
+  let rawHashes = [];
+  if (request.method === 'GET') {
+    const params = url.searchParams.getAll('sha256');
+    for (const value of params) {
+      for (const piece of value.split(',')) {
+        const trimmed = piece.trim();
+        if (trimmed) rawHashes.push(trimmed);
+      }
+    }
+  } else if (request.method === 'POST') {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return { error: 'Invalid JSON body' };
+    }
+    if (!body || !Array.isArray(body.sha256s)) {
+      return { error: 'Expected JSON body with sha256s array' };
+    }
+    rawHashes = body.sha256s;
+  } else {
+    return { status: 405, error: 'Method not allowed' };
+  }
+
+  if (rawHashes.length === 0) {
+    return { error: 'At least one sha256 is required' };
+  }
+
+  const normalized = [];
+  for (const raw of rawHashes) {
+    if (typeof raw !== 'string' || !/^[0-9a-f]{64}$/i.test(raw.trim())) {
+      return { error: 'Invalid sha256' };
+    }
+    normalized.push(raw.trim().toLowerCase());
+  }
+
+  const sorted = [...new Set(normalized)].sort();
+  if (sorted.length > MAX_BULK_CHECK_RESULTS) {
+    return { error: `At most ${MAX_BULK_CHECK_RESULTS} unique sha256 hashes allowed` };
+  }
+  return { hashes: sorted };
+}
+
+async function handlePublicCheckResults(request, url, env) {
+  const parsed = await parseBulkCheckHashes(request, url);
+  if (parsed.error) {
+    return corsResponse(jsonResponse(parsed.status || 400, { error: parsed.error }));
+  }
+
+  const { hashes } = parsed;
+  const placeholders = hashes.map(() => '?').join(', ');
+  const queryResult = await env.BLOSSOM_DB.prepare(`
+    SELECT sha256, action, provider, scores, categories, moderated_at, reviewed_by, reviewed_at, videoseal
+    FROM moderation_results
+    WHERE sha256 IN (${placeholders})
+  `).bind(...hashes).all();
+
+  const rowsByHash = new Map();
+  for (const row of queryResult?.results || []) {
+    if (typeof row?.sha256 === 'string') {
+      rowsByHash.set(row.sha256.toLowerCase(), row);
+    }
+  }
+
+  const results = {};
+  for (const hash of hashes) {
+    results[hash] = formatPublicCheckResult(hash, rowsByHash.get(hash));
+  }
+
+  return corsResponse(jsonResponse(200, { results }));
 }
 
 // Only same-origin admin page paths are safe re-auth redirect targets. Reject
@@ -1920,6 +1996,13 @@ export default {
     if (!isLocalRequest && hostname === API_HOSTNAME && !isApiSurfacePath(url.pathname)) {
       const expectedHost = url.pathname.startsWith('/admin') ? ADMIN_HOSTNAME : API_HOSTNAME;
       return hostMismatchResponse(requestId, hostname, url.pathname, expectedHost);
+    }
+
+    if (url.pathname === '/check-results') {
+      if (request.method === 'OPTIONS') {
+        return corsResponse(new Response(null, { status: 204 }));
+      }
+      return handlePublicCheckResults(request, url, env);
     }
 
     if (url.pathname.startsWith('/check-result/')) {
@@ -5228,7 +5311,7 @@ async function runMigration() {
       }
     }
 
-    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\nGET  /api/v1/moderation/vocabulary\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
+    return new Response('Divine Moderation API\n\nPublic endpoints:\nGET  /health\nGET  /check-result/{sha256}\nGET  /check-results?sha256={h1},{h2}\nPOST /check-results {"sha256s":["..."]}\nGET  /api/v1/moderation/vocabulary\n\nAuthenticated endpoints:\nPOST /test-moderate {"sha256":"..."}\nGET  /api/v1/decisions\nGET  /api/v1/decisions/{sha256}\nPOST /api/v1/quarantine/{sha256}\nPOST /api/v1/moderate\nPOST /api/v1/classify\nGET  /api/v1/classifier/{sha256}\nGET  /api/v1/classifier/{sha256}/recommendations\n\nAdmin UI: https://moderation.admin.divine.video/admin', {
       headers: { 'Content-Type': 'text/plain' }
     });
   },
